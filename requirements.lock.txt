@@ -1,0 +1,50 @@
+# ADynamics Environment Dependencies
+# Auto-generated on 2026-04-22
+# Verified working versions for RTX 3090 / CUDA 12.1
+
+# ============================================================
+# Core Deep Learning Framework
+# ============================================================
+# PyTorch 2.5.1 with CUDA 12.1 support
+# Verified: CUDA Available = True, GPU = NVIDIA GeForce RTX 3090
+torch==2.5.1
+torchvision==0.20.1
+torchaudio==2.5.1
+
+# ============================================================
+# Medical Imaging
+# ============================================================
+monai==1.4.0           # Medical imaging deep learning framework
+nibabel==5.4.2         # NIfTI format I/O
+simpleitk==2.5.3       # Image registration and segmentation
+
+# ============================================================
+# Math & ODE
+# ============================================================
+torchdiffeq==0.2.5     # ODE solvers for CFM integration
+
+# ============================================================
+# Data Science & Utilities
+# ============================================================
+numpy==1.26.4         # Numerical computing (pinned <2.0 for MONAI compatibility)
+scipy==1.17.1          # Scientific computing
+pandas==3.0.2         # Data analysis
+scikit-learn==1.8.0    # Machine learning utilities
+
+# Configuration
+pyyaml==6.0.3         # YAML config files
+
+# Visualization
+matplotlib==3.10.8    # Plotting
+pillow==12.2.0        # Image processing
+
+# Progress & Logging
+tqdm==4.67.3          # Progress bars
+einops==0.8.2         # Tensor operations
+
+# ============================================================
+# Development Tools (optional)
+# ============================================================
+# pytest>=7.4.0       # Unit testing
+# black>=23.0.0        # Code formatting
+# ruff>=0.1.0         # Linting
