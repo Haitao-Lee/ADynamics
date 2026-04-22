@@ -19,7 +19,7 @@ def get_dataloader(
     data_list: List[Dict[str, Any]],
     train_transforms,
     val_transforms,
-    batch_size: int = 2,
+    batch_size: int = 8,
     num_workers: int = 4,
     val_split: float = 0.2,
     shuffle: bool = True,
@@ -102,6 +102,120 @@ def get_dataloader(
     )
 
     return train_loader, val_loader
+
+
+def get_train_val_test_dataloaders(
+    data_list: List[Dict[str, Any]],
+    train_transforms,
+    val_transforms,
+    test_transforms,
+    batch_size: int = 8,
+    num_workers: int = 4,
+    train_split: float = 0.7,
+    val_split: float = 0.15,
+    shuffle: bool = True,
+    seed: int = 42,
+) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    """
+    Create train, validation, and test DataLoaders from a list of data dictionaries.
+
+    Splits data into three sets with ratios: train:val:test = 0.7:0.15:0.15
+
+    Args:
+        data_list: List of dictionaries, each containing:
+            - "image": str, path to the NIfTI image file
+            - "label": int, disease stage label (0=NC, 1=SCD, 2=MCI, 3=AD)
+        train_transforms: MONAI transforms for training data
+        val_transforms: MONAI transforms for validation data
+        test_transforms: MONAI transforms for test data
+        batch_size: Number of samples per batch. Default: 8
+        num_workers: Number of worker processes for data loading. Default: 4
+        train_split: Fraction of data for training. Default: 0.7 (70%)
+        val_split: Fraction of data for validation. Default: 0.15 (15%)
+        shuffle: Whether to shuffle training data. Default: True
+        seed: Random seed for reproducible split. Default: 42
+
+    Returns:
+        Tuple of (train_loader, val_loader, test_loader)
+
+    Raises:
+        ValueError: If data_list is empty or splits don't sum to 1.0
+    """
+    if len(data_list) == 0:
+        raise ValueError("data_list cannot be empty")
+
+    test_split = 1.0 - train_split - val_split
+    if abs(test_split - 0.15) > 1e-6 and abs(test_split - 0.1) > 1e-6:
+        # Just check that they sum to 1
+        total = train_split + val_split + test_split
+        if abs(total - 1.0) > 1e-6:
+            raise ValueError(f"Splits must sum to 1.0, got train={train_split}, val={val_split}, test={test_split}")
+
+    # Set seed for reproducible split
+    np.random.seed(seed)
+    indices = np.random.permutation(len(data_list)).tolist()
+
+    # Calculate split indices
+    n_train = int(len(data_list) * train_split)
+    n_val = int(len(data_list) * val_split)
+
+    train_indices = indices[:n_train]
+    val_indices = indices[n_train:n_train + n_val]
+    test_indices = indices[n_train + n_val:]
+
+    # Create subsets
+    train_data = [data_list[i] for i in train_indices]
+    val_data = [data_list[i] for i in val_indices]
+    test_data = [data_list[i] for i in test_indices]
+
+    # Create MONAI datasets
+    train_dataset = CacheDataset(
+        data=train_data,
+        transform=train_transforms,
+        cache_num=len(train_data),
+        num_workers=num_workers,
+    )
+
+    val_dataset = CacheDataset(
+        data=val_data,
+        transform=val_transforms,
+        cache_num=len(val_data),
+        num_workers=num_workers,
+    )
+
+    test_dataset = CacheDataset(
+        data=test_data,
+        transform=test_transforms,
+        cache_num=len(test_data),
+        num_workers=num_workers,
+    )
+
+    # Create dataloaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+    return train_loader, val_loader, test_loader
 
 
 def create_dummy_dataset(
