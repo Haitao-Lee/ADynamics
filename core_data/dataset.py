@@ -115,11 +115,17 @@ def get_train_val_test_dataloaders(
     val_split: float = 0.15,
     shuffle: bool = True,
     seed: int = 42,
+    use_cache: bool = False,
+    cache_rate: float = 0.1,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
-    Create train, validation, and test DataLoaders from a list of data dictionaries.
+    Create train, validation, and test DataLoaders with stratified splitting.
 
-    Splits data into three sets with ratios: train:val:test = 0.7:0.15:0.15
+    Uses stratified sampling to preserve label distribution across splits,
+    preventing class imbalance in Train/Val/Test sets.
+
+    Memory-safe: Uses standard Dataset by default to avoid OOM with large datasets.
+    Optionally enable caching with a safe cache_rate.
 
     Args:
         data_list: List of dictionaries, each containing:
@@ -134,61 +140,88 @@ def get_train_val_test_dataloaders(
         val_split: Fraction of data for validation. Default: 0.15 (15%)
         shuffle: Whether to shuffle training data. Default: True
         seed: Random seed for reproducible split. Default: 42
+        use_cache: If True, use CacheDataset with cache_rate. Default: False (memory-safe)
+        cache_rate: Fraction of data to cache (0.0 to 1.0). Only used if use_cache=True.
+            Default: 0.1 (caches 10% of training data)
 
     Returns:
         Tuple of (train_loader, val_loader, test_loader)
 
     Raises:
         ValueError: If data_list is empty or splits don't sum to 1.0
+
+    Example:
+        >>> train_loader, val_loader, test_loader = get_train_val_test_dataloaders(
+        ...     data_list=data_list,
+        ...     train_transforms=train_transforms,
+        ...     val_transforms=val_transforms,
+        ...     test_transforms=test_transforms,
+        ...     batch_size=4,
+        ...     train_split=0.7,
+        ...     val_split=0.15,
+        ... )
     """
+    from sklearn.model_selection import train_test_split
+    from monai.data import Dataset
+
+    # Validate inputs
     if len(data_list) == 0:
         raise ValueError("data_list cannot be empty")
 
-    test_split = 1.0 - train_split - val_split
-    if abs(test_split - 0.15) > 1e-6 and abs(test_split - 0.1) > 1e-6:
-        # Just check that they sum to 1
-        total = train_split + val_split + test_split
-        if abs(total - 1.0) > 1e-6:
-            raise ValueError(f"Splits must sum to 1.0, got train={train_split}, val={val_split}, test={test_split}")
+    test_split = round(1.0 - train_split - val_split, 6)
+    if not (train_split + val_split + test_split == 1.0):
+        raise ValueError(
+            f"Splits must sum to 1.0, got train={train_split}, val={val_split}, test={test_split}"
+        )
 
-    # Set seed for reproducible split
-    np.random.seed(seed)
-    indices = np.random.permutation(len(data_list)).tolist()
+    # Extract labels for stratified splitting
+    labels = np.array([item["label"] for item in data_list])
 
-    # Calculate split indices
-    n_train = int(len(data_list) * train_split)
-    n_val = int(len(data_list) * val_split)
-
-    train_indices = indices[:n_train]
-    val_indices = indices[n_train:n_train + n_val]
-    test_indices = indices[n_train + n_val:]
-
-    # Create subsets
-    train_data = [data_list[i] for i in train_indices]
-    val_data = [data_list[i] for i in val_indices]
-    test_data = [data_list[i] for i in test_indices]
-
-    # Create MONAI datasets
-    train_dataset = CacheDataset(
-        data=train_data,
-        transform=train_transforms,
-        cache_num=len(train_data),
-        num_workers=num_workers,
+    # First split: separate test set from (train + val)
+    train_val_data, test_data = train_test_split(
+        data_list,
+        test_size=test_split,
+        stratify=labels,
+        random_state=seed,
     )
 
-    val_dataset = CacheDataset(
-        data=val_data,
-        transform=val_transforms,
-        cache_num=len(val_data),
-        num_workers=num_workers,
+    # Recalculate labels for remaining data
+    train_val_labels = np.array([item["label"] for item in train_val_data])
+
+    # Second split: separate train and val from remaining
+    # In the remaining data, val_ratio = val_split / (train_split + val_split)
+    val_ratio_in_remaining = round(val_split / (train_split + val_split), 6)
+    train_data, val_data = train_test_split(
+        train_val_data,
+        test_size=val_ratio_in_remaining,
+        stratify=train_val_labels,
+        random_state=seed,
     )
 
-    test_dataset = CacheDataset(
-        data=test_data,
-        transform=test_transforms,
-        cache_num=len(test_data),
-        num_workers=num_workers,
-    )
+    # Select dataset class based on use_cache flag
+    if use_cache:
+        train_dataset = CacheDataset(
+            data=train_data,
+            transform=train_transforms,
+            cache_num=max(1, int(len(train_data) * cache_rate)),
+            num_workers=num_workers,
+        )
+        val_dataset = CacheDataset(
+            data=val_data,
+            transform=val_transforms,
+            cache_num=max(1, int(len(val_data) * cache_rate)),
+            num_workers=num_workers,
+        )
+        test_dataset = CacheDataset(
+            data=test_data,
+            transform=test_transforms,
+            cache_num=max(1, int(len(test_data) * cache_rate)),
+            num_workers=num_workers,
+        )
+    else:
+        train_dataset = Dataset(data=train_data, transform=train_transforms)
+        val_dataset = Dataset(data=val_data, transform=val_transforms)
+        test_dataset = Dataset(data=test_data, transform=test_transforms)
 
     # Create dataloaders
     train_loader = DataLoader(
@@ -219,7 +252,7 @@ def get_train_val_test_dataloaders(
 
 
 def create_dummy_dataset(
-    spatial_size: Tuple[int, int, int] = (128, 128, 128),
+    spatial_size: Tuple[int, int, int] = (256, 256, 192),
     num_samples: int = 10,
 ) -> List[Dict[str, Any]]:
     """
