@@ -1,0 +1,60 @@
+# ADynamics Stage 4: Deformation Field Training Configuration
+# Deformation Generator and Spatial Transformer for Morphing
+
+# Data Configuration
+data_dir: "/path/to/preprocessed/mri/data"
+vae_checkpoint: "/path/to/checkpoints/stage1_vae/vae_best.pt"
+cfm_checkpoint: "/path/to/checkpoints/stage3_cfm/cfm_best.pt"
+output_dir: "./checkpoints/stage4_deform"
+
+# Stage 4: Deformation Generator Configuration
+deform:
+  # Latent input dimensions (from CFM evolved latent)
+  latent_channels: 64
+  latent_spatial: [8, 8, 8]
+
+  # Output deformation field dimensions (should match original MRI)
+  deform_spatial: [128, 128, 128]
+
+  # Network architecture
+  base_channels: 64
+  channel_mults: [1, 2, 4, 8]
+  num_res_blocks: 2
+
+  # Deformation field range
+  max_displacement: 10.0  # Maximum displacement in mm
+
+  # Loss weights
+  sim_weight: 1.0          # Similarity loss weight (L1/L2 between warped and target)
+  smooth_weight: 0.1        # Smoothing regularization weight
+  jacobian_weight: 0.01     # Jacobian determinant penalty (prevent folding)
+
+  # Training
+  batch_size: 4            # Small batch due to 3D images
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-5
+  epochs: 300
+
+  # ODE/CFM settings (for inference)
+  ode_steps: 20
+  ode_dt: 0.05
+
+# Validation
+val_split: 0.2
+val_interval: 10
+
+# Checkpointing
+checkpoint:
+  save_interval: 50
+  save_best: true
+  keep_last_n: 3
+
+# Logging
+logging:
+  log_interval: 10
+  tensorboard: true
+  wandb: false
+
+# Reproducibility
+seed: 42
+deterministic: true

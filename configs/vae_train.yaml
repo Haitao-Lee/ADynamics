@@ -1,0 +1,53 @@
+# ADynamics Stage 1: VAE Training Configuration
+# Conditional Flow Matching for AD MRI Disease Progression Modeling
+
+# Data Configuration
+data_dir: "/path/to/preprocessed/mri/data"
+output_dir: "./checkpoints/stage1_vae"
+
+# Model Architecture
+spatial_size: [128, 128, 128]  # Target spatial dimensions [D, H, W]
+in_channels: 1                  # T1-weighted MRI (single channel)
+latent_channels: 64            # Latent space channels (balance between reconstruction quality and VRAM)
+
+# VAE Specific
+kl_weight: 0.0001              # Weight for KL divergence term (balance reconstruction vs latent regularisation)
+
+# Training Hyperparameters
+batch_size: 2                   # Small batch size due to 3D MRI memory constraints
+learning_rate: 1.0e-4           # AdamW learning rate
+weight_decay: 1.0e-5            # AdamW weight decay
+epochs: 300                     # Total training epochs
+
+# Optimizer
+optimizer:
+  type: "AdamW"
+  lr: 1.0e-4
+  weight_decay: 1.0e-5
+  betas: [0.9, 0.999]
+
+# Learning Rate Scheduler
+scheduler:
+  type: "CosineAnnealingLR"
+  T_max: 300
+  eta_min: 1.0e-6
+
+# Validation
+val_split: 0.2                  # Fraction of data for validation
+val_interval: 10                # Validate every N epochs
+
+# Checkpointing
+checkpoint:
+  save_interval: 50            # Save checkpoint every N epochs
+  save_best: true               # Save best model based on val loss
+  keep_last_n: 3               # Keep only last N checkpoints
+
+# Logging
+logging:
+  log_interval: 10             # Log training stats every N batches
+  tensorboard: true             # Enable TensorBoard logging
+  wandb: false                 # Optional Weights & Biases integration
+
+# Reproducibility
+seed: 42
+deterministic: true            # Ensure reproducible results (may impact performance)

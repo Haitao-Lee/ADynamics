@@ -1,0 +1,71 @@
+# ADynamics Stage 2 & 3: Classifier + CFM Training Configuration
+# Disease Stage Classification and Conditional Flow Matching
+
+# Data Configuration
+data_dir: "/path/to/preprocessed/mri/data"
+vae_checkpoint: "/path/to/checkpoints/stage1_vae/vae_best.pt"
+output_dir: "./checkpoints/stage2_cfm"
+
+# Stage 2: Classifier Configuration
+classifier:
+  latent_dim: 524288           # Flattened latent dimension (C * D' * H' * W')
+  hidden_dim: 1024             # Hidden layer dimension
+  num_classes: 4               # NC, SCD, MCI, AD
+  dropout: 0.3                 # Dropout rate for regularization
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-5
+  epochs: 200
+
+# Stage 3: CFM Vector Field Configuration
+cfm:
+  # Latent space dimensions (from VAE encoder output)
+  latent_channels: 64          # Channels in latent space
+  latent_spatial: [8, 8, 8]   # Spatial dimensions of latent
+
+  # Time conditioning (MLP for FiLM)
+  time_embed_dim: 128         # Time embedding dimension
+  time_hidden_dim: 256        # Time MLP hidden dimension
+
+  # Clinical condition conditioning (MLP for FiLM)
+  cond_embed_dim: 64          # Condition embedding dimension (e.g., age)
+  cond_hidden_dim: 128        # Condition MLP hidden dimension
+  num_conditions: 1           # Number of conditions (e.g., 1 for age only)
+
+  # Network architecture
+  base_channels: 64           # Base channels for U-Net
+  channel_mults: [1, 2, 4]    # Channel multipliers for each level
+  num_res_blocks: 2           # Res blocks per level
+
+  # Training
+  batch_size: 32              # Can be larger since operating in latent space
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-5
+  epochs: 500
+
+  # ODE settings
+  ode_steps: 20               # Number of Euler integration steps for inference
+  ode_dt: 0.05                # Time step for Euler integration
+
+  # Loss weights
+  velocity_loss_weight: 1.0
+  smoothness_loss_weight: 0.01  # For deformation smoothness (if using deform output)
+
+# Validation
+val_split: 0.2
+val_interval: 10
+
+# Checkpointing
+checkpoint:
+  save_interval: 50
+  save_best: true
+  keep_last_n: 3
+
+# Logging
+logging:
+  log_interval: 10
+  tensorboard: true
+  wandb: false
+
+# Reproducibility
+seed: 42
+deterministic: true
