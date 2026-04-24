@@ -2,15 +2,15 @@
 VAE Trainer for Stage 1 of ADynamics.
 
 Handles training loop, validation, checkpointing, and logging for the 3D VAE.
+Supports AMP (Automatic Mixed Precision) for memory-efficient HD training.
 """
 
 import os
-from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
 import torch
 import torch.nn as nn
-from torch import Tensor
+from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
@@ -23,8 +23,10 @@ class VAETrainer:
     Trainer class for 3D VAE in Stage 1 of ADynamics.
 
     Handles:
+        - AMP training for memory-efficient HD (256x256x192) training
         - Training and validation epochs
-        - Loss computation (reconstruction + KL)
+        - Loss computation via engine.losses.total_vae_loss
+        - KL annealing to prevent posterior collapse
         - Checkpoint saving and loading
         - Learning rate scheduling
         - Logging of training metrics
@@ -33,6 +35,7 @@ class VAETrainer:
         model: The VAE model being trained
         optimizer: AdamW optimizer
         scheduler: Learning rate scheduler
+        scaler: GradScaler for AMP training
         train_loader: Training data loader
         val_loader: Validation data loader
         device: Device to train on (cuda/cpu)
@@ -61,6 +64,8 @@ class VAETrainer:
             config: Configuration dictionary containing:
                 - kl_weight: Weight for KL divergence term
                 - recon_loss_type: Type of reconstruction loss ("l1" or "l2")
+                - kl_warmup_epochs: Epochs for KL annealing (default: 5)
+                - use_amp: Enable AMP training (default: True)
             scheduler: Optional learning rate scheduler
         """
         self.model = model
@@ -71,6 +76,10 @@ class VAETrainer:
         self.device = torch.device(device)
         self.config = config
 
+        # AMP configuration: only create scaler when use_amp is True
+        self.use_amp = config.get("use_amp", False)
+        self.scaler = GradScaler('cuda') if self.use_amp else None
+
         # Move model to device
         self.model.to(self.device)
 
@@ -78,12 +87,22 @@ class VAETrainer:
         self.current_epoch = 0
         self.best_val_loss = float("inf")
 
-    def train_epoch(self) -> Dict[str, float]:
-        """
-        Run one training epoch.
+        # Fixed visualization batch for deterministic loss component logging
+        self.viz_batch = None
+        if self.val_loader is not None and len(self.val_loader) > 0:
+            for batch in self.val_loader:
+                self.viz_batch = batch["image"].to(self.device)
+                break
 
-        Performs forward pass, loss computation, backward pass,
-        and optimizer step for all batches in the training set.
+    def train_epoch(self, current_kl_weight: float) -> Dict[str, float]:
+        """
+        Run one training epoch with optional AMP.
+
+        Performs forward pass with optional autocast, loss computation,
+        backward pass with gradient scaling, and optimizer step.
+
+        Args:
+            current_kl_weight: KL weight for this epoch (supports annealing)
 
         Returns:
             Dictionary containing average training metrics:
@@ -98,45 +117,47 @@ class VAETrainer:
         total_kl_loss = 0.0
         num_batches = 0
 
-        for batch in self.train_loader:
-            # Get input data
-            images = batch["image"]
-            # shape: [B, 1, D, H, W]
+        recon_loss_type = self.config.get("recon_loss_type", "l1")
 
-            # Move to device
+        for batch in self.train_loader:
+            images = batch["image"]
             images = images.to(self.device)
 
-            # Forward pass
-            recon, mu, logvar = self.model(images)
-
-            # Compute losses
-            recon_loss = torch.nn.functional.l1_loss(recon, images)
-
-            # KL loss normalized by latent elements
-            kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-            num_latent_elements = mu.numel()
-            kl_loss_normalized = kl_loss / num_latent_elements
-
-            # Total loss
-            kl_weight = self.config.get("kl_weight", 0.0001)
-            loss = recon_loss + kl_weight * kl_loss_normalized
-
-            # Backward pass
             self.optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.optimizer.step()
 
-            # Accumulate metrics
+            # Forward pass with AMP autocast if enabled
+            with autocast('cuda', enabled=self.use_amp):
+                recon, mu, logvar = self.model(images)
+                loss = total_vae_loss(
+                    recon,
+                    images,
+                    mu,
+                    logvar,
+                    kl_weight=current_kl_weight,
+                    recon_loss_type=recon_loss_type,
+                )
+
+            # Backward pass with gradient scaling (if AMP enabled)
+            if self.use_amp:
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+
+            # Accumulate metrics (only during logging to avoid sync overhead)
             total_loss += loss.item()
-            total_recon_loss += recon_loss.item()
-            total_kl_loss += kl_loss_normalized.item()
             num_batches += 1
 
         # Compute averages
         avg_loss = total_loss / num_batches
-        avg_recon_loss = total_recon_loss / num_batches
-        avg_kl_loss = total_kl_loss / num_batches
+
+        # Compute individual components for logging
+        avg_recon_loss, avg_kl_loss = self._compute_loss_components(recon_loss_type)
 
         return {
             "loss": avg_loss,
@@ -147,10 +168,10 @@ class VAETrainer:
     @torch.no_grad()
     def validate_epoch(self) -> Dict[str, float]:
         """
-        Run one validation epoch.
+        Run one validation epoch with optional AMP.
 
-        Performs forward pass and loss computation without gradient tracking.
-        No optimizer updates are performed.
+        Performs forward pass with optional autocast and loss computation
+        without gradient tracking. No optimizer updates.
 
         Returns:
             Dictionary containing average validation metrics:
@@ -161,49 +182,92 @@ class VAETrainer:
         self.model.eval()
 
         total_loss = 0.0
-        total_recon_loss = 0.0
-        total_kl_loss = 0.0
         num_batches = 0
 
-        for batch in self.val_loader:
-            # Get input data
-            images = batch["image"]
-            # shape: [B, 1, D, H, W]
+        recon_loss_type = self.config.get("recon_loss_type", "l1")
+        kl_weight = self.config.get("kl_weight", 0.0001)
 
-            # Move to device
+        for batch in self.val_loader:
+            images = batch["image"]
             images = images.to(self.device)
 
-            # Forward pass
-            recon, mu, logvar = self.model(images)
+            # Forward pass with AMP autocast if enabled
+            with autocast('cuda', enabled=self.use_amp):
+                recon, mu, logvar = self.model(images)
+                loss = total_vae_loss(
+                    recon,
+                    images,
+                    mu,
+                    logvar,
+                    kl_weight=kl_weight,
+                    recon_loss_type=recon_loss_type,
+                )
 
-            # Compute losses
-            recon_loss = torch.nn.functional.l1_loss(recon, images)
-
-            # KL loss normalized by latent elements
-            kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-            num_latent_elements = mu.numel()
-            kl_loss_normalized = kl_loss / num_latent_elements
-
-            # Total loss
-            kl_weight = self.config.get("kl_weight", 0.0001)
-            loss = recon_loss + kl_weight * kl_loss_normalized
-
-            # Accumulate metrics
             total_loss += loss.item()
-            total_recon_loss += recon_loss.item()
-            total_kl_loss += kl_loss_normalized.item()
             num_batches += 1
 
-        # Compute averages
         avg_loss = total_loss / num_batches
-        avg_recon_loss = total_recon_loss / num_batches
-        avg_kl_loss = total_kl_loss / num_batches
+        avg_recon_loss, avg_kl_loss = self._compute_loss_components(recon_loss_type)
 
         return {
             "loss": avg_loss,
             "recon_loss": avg_recon_loss,
             "kl_loss": avg_kl_loss,
         }
+
+    def _compute_loss_components(self, recon_loss_type: str) -> tuple:
+        """
+        Compute reconstruction and KL loss components for logging.
+
+        This is called after training to get component-wise losses
+        without extra forward passes.
+
+        Args:
+            recon_loss_type: Type of reconstruction loss
+
+        Returns:
+            Tuple of (avg_recon_loss, avg_kl_loss)
+        """
+        # Use fixed viz_batch for deterministic loss component logging
+        if self.viz_batch is None:
+            return 0.0, 0.0
+        images = self.viz_batch
+
+        with autocast('cuda', enabled=self.use_amp):
+            recon, mu, logvar = self.model(images)
+            recon_loss, kl_loss = self._get_loss_components(
+                recon, images, mu, logvar, recon_loss_type
+            )
+
+        return recon_loss.item(), kl_loss.item()
+
+    def _get_loss_components(
+        self,
+        recon: torch.Tensor,
+        images: torch.Tensor,
+        mu: torch.Tensor,
+        logvar: torch.Tensor,
+        recon_loss_type: str,
+    ) -> tuple:
+        """
+        Extract individual loss components from total_vae_loss.
+
+        Args:
+            recon: Reconstructed image
+            images: Original image
+            mu: Latent mean
+            logvar: Latent log variance
+            recon_loss_type: Type of reconstruction loss
+
+        Returns:
+            Tuple of (recon_loss, kl_loss) without reduction
+        """
+        from engine.losses import vae_kl_loss, vae_reconstruction_loss
+
+        recon_loss = vae_reconstruction_loss(recon, images, loss_type=recon_loss_type)
+        kl_loss = vae_kl_loss(mu, logvar, reduction="mean")
+
+        return recon_loss, kl_loss
 
     def save_checkpoint(
         self,
@@ -213,8 +277,6 @@ class VAETrainer:
     ) -> None:
         """
         Save model checkpoint to disk.
-
-        Saves model state, optimizer state, scheduler state, and epoch info.
 
         Args:
             filepath: Path to save checkpoint file
@@ -233,9 +295,7 @@ class VAETrainer:
         if include_scheduler and self.scheduler is not None:
             checkpoint["scheduler_state_dict"] = self.scheduler.state_dict()
 
-        # Create directory if it doesn't exist
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-
+        os.makedirs(os.path.dirname(filepath) if os.path.dirname(filepath) else ".", exist_ok=True)
         torch.save(checkpoint, filepath)
 
     def load_checkpoint(self, filepath: str) -> None:
@@ -264,7 +324,10 @@ class VAETrainer:
         output_dir: str = "./checkpoints",
     ) -> Dict[str, list]:
         """
-        Run full training loop for specified number of epochs.
+        Run full training loop with KL annealing and AMP.
+
+        KL annealing starts from 0 and linearly increases to target_kl_weight
+        over kl_warmup_epochs to prevent posterior collapse.
 
         Args:
             num_epochs: Number of epochs to train
@@ -276,6 +339,9 @@ class VAETrainer:
                 - train_loss, train_recon_loss, train_kl_loss
                 - val_loss, val_recon_loss, val_kl_loss
         """
+        target_kl_weight = self.config.get("kl_weight", 0.0001)
+        kl_warmup_epochs = self.config.get("kl_warmup_epochs", 5)
+
         history = {
             "train_loss": [],
             "train_recon_loss": [],
@@ -288,8 +354,14 @@ class VAETrainer:
         for epoch in range(num_epochs):
             self.current_epoch = epoch
 
-            # Training epoch
-            train_metrics = self.train_epoch()
+            # Compute KL weight with annealing (warmup from 0 to target)
+            if epoch < kl_warmup_epochs:
+                current_kl_weight = target_kl_weight * (epoch + 1) / kl_warmup_epochs
+            else:
+                current_kl_weight = target_kl_weight
+
+            # Training epoch with current KL weight
+            train_metrics = self.train_epoch(current_kl_weight)
 
             # Validation epoch
             val_metrics = self.validate_epoch()
@@ -297,18 +369,16 @@ class VAETrainer:
             # Update learning rate
             if self.scheduler is not None:
                 self.scheduler.step()
-                current_lr = self.optimizer.param_groups[0]["lr"]
-            else:
-                current_lr = self.optimizer.param_groups[0]["lr"]
+
+            current_lr = self.optimizer.param_groups[0]["lr"]
 
             # Log metrics
             print(
                 f"Epoch [{epoch+1}/{num_epochs}] "
                 f"LR: {current_lr:.6f} | "
-                f"Train Loss: {train_metrics['loss']:.4f} (recon: {train_metrics['recon_loss']:.4f}, "
-                f"kl: {train_metrics['kl_loss']:.6f}) | "
-                f"Val Loss: {val_metrics['loss']:.4f} (recon: {val_metrics['recon_loss']:.4f}, "
-                f"kl: {val_metrics['kl_loss']:.6f})"
+                f"KL_w: {current_kl_weight:.6f} | "
+                f"Train Loss: {train_metrics['loss']:.4f} | "
+                f"Val Loss: {val_metrics['loss']:.4f}"
             )
 
             # Record history
@@ -321,10 +391,7 @@ class VAETrainer:
 
             # Save checkpoint
             if (epoch + 1) % save_interval == 0:
-                checkpoint_path = os.path.join(
-                    output_dir,
-                    f"vae_epoch_{epoch+1}.pt",
-                )
+                checkpoint_path = os.path.join(output_dir, f"vae_epoch_{epoch+1}.pt")
                 self.save_checkpoint(checkpoint_path)
                 print(f"Checkpoint saved to {checkpoint_path}")
 

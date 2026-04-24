@@ -1,15 +1,20 @@
 """
 Conditional Flow Matching (CFM) Vector Field Network for Stage 3.
 
-Implements a 3D U-Net with FiLM conditioning for learning the velocity field
+Implements a 3D U-Net with deep FiLM conditioning for learning the velocity field
 that morphs NC latent distributions to AD latent distributions.
 
 The network takes:
-    - Latent representation z_t (interpolated between NC and AD)
+    - Latent representation z_t (interpolated between NC and AD), shape [B, C, 16, 16, 12] for HD
     - Time step t ∈ [0, 1]
     - Clinical conditions (e.g., age)
 
 And outputs the velocity field v_theta(z_t, t, c) that drives the ODE flow.
+
+Architecture with deep FiLM:
+    - Encoder: DownBlock3D (with FiLM) -> ResBlock3D (with FiLM)
+    - Decoder: UpBlock3D (with FiLM) -> ResBlock3D (with FiLM) + skip connection
+    - FiLM applied at every spatial scale for better time/condition awareness
 """
 
 from typing import Dict, List, Optional, Tuple, Union
@@ -18,6 +23,49 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+
+
+class SinusoidalTimeEmbedding(nn.Module):
+    """
+    Sinusoidal Positional Embedding for Time Steps.
+
+    Follows the original Transformer sinusoidal embedding scheme to encode
+    time steps t ∈ [0, 1] into a high-dimensional vector.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 128,
+    ) -> None:
+        """
+        Initialize sinusoidal time embedding.
+
+        Args:
+            embed_dim: Output embedding dimension. Must be even.
+        """
+        super().__init__()
+
+        assert embed_dim % 2 == 0, "embed_dim must be even for sinusoidal embedding"
+        self.embed_dim = embed_dim
+
+    def forward(self, t: Tensor) -> Tensor:
+        """
+        Encode time steps to sinusoidal embedding.
+
+        Args:
+            t: Time step tensor of shape [B] with values in [0, 1]
+
+        Returns:
+            Embedded time tensor of shape [B, embed_dim]
+        """
+        B = t.shape[0]
+        half_dim = self.embed_dim // 2
+        freqs = torch.exp(
+            -torch.log(torch.tensor(10000.0, device=t.device, dtype=torch.float16)) * torch.arange(half_dim, device=t.device, dtype=torch.float16) / half_dim
+        )
+        angles = t.unsqueeze(-1) * freqs.unsqueeze(0)
+        emb = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
+        return emb
 
 
 class TimeEmbedding(nn.Module):
@@ -30,6 +78,8 @@ class TimeEmbedding(nn.Module):
     Architecture:
         Linear(t_embed) -> SiLU -> Linear(time_hidden) -> SiLU -> Linear(2 * embed_dim)
         -> Split into γ and β
+
+    γ, β initialized such that γ ≈ 1.0, β ≈ 0.0 for stable early training.
     """
 
     def __init__(
@@ -56,14 +106,16 @@ class TimeEmbedding(nn.Module):
             nn.Linear(hidden_dim, embed_dim * 2),  # γ and β
         )
 
-        # Initialize
         self._init_weights()
 
     def _init_weights(self) -> None:
-        """Initialize weights with small values for stable training."""
+        """
+        Initialize weights with Kaiming normal for better gradient flow.
+        γ projection initialized to ~1, β projection initialized to ~0.
+        """
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, std=1e-4)
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
@@ -77,71 +129,9 @@ class TimeEmbedding(nn.Module):
         Returns:
             Tuple of (γ, β) each of shape [B, embed_dim]
         """
-        # t shape: [B, embed_dim]
         gamma_beta = self.mlp(t)
-        # shape: [B, embed_dim * 2]
-
         gamma, beta = gamma_beta.chunk(2, dim=-1)
-        # each shape: [B, embed_dim]
-
         return gamma, beta
-
-
-class SinusoidalTimeEmbedding(nn.Module):
-    """
-    Sinusoidal Positional Embedding for Time Steps.
-
-    Follows the original Transformer sinusoidal embedding scheme to encode
-    time steps t ∈ [0, 1] into a high-dimensional vector.
-
-    Output dimension: embed_dim
-    """
-
-    def __init__(
-        self,
-        embed_dim: int = 128,
-    ) -> None:
-        """
-        Initialize sinusoidal time embedding.
-
-        Args:
-            embed_dim: Output embedding dimension. Must be even.
-        """
-        super().__init__()
-
-        assert embed_dim % 2 == 0, "embed_dim must be even for sinusoidal embedding"
-
-        self.embed_dim = embed_dim
-
-    def forward(self, t: Tensor) -> Tensor:
-        """
-        Encode time steps to sinusoidal embedding.
-
-        Args:
-            t: Time step tensor of shape [B] with values in [0, 1]
-
-        Returns:
-            Embedded time tensor of shape [B, embed_dim]
-        """
-        # t shape: [B]
-        B = t.shape[0]
-
-        # Compute frequencies
-        half_dim = self.embed_dim // 2
-        freqs = torch.exp(
-            -torch.log(torch.tensor(10000.0)) * torch.arange(half_dim, device=t.device) / half_dim
-        )
-        # shape: [half_dim]
-
-        # Compute angle
-        angles = t.unsqueeze(-1) * freqs.unsqueeze(0)
-        # shape: [B, half_dim]
-
-        # Compute sin and cos
-        emb = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
-        # shape: [B, embed_dim]
-
-        return emb
 
 
 class ConditionEmbedding(nn.Module):
@@ -154,6 +144,8 @@ class ConditionEmbedding(nn.Module):
     Architecture:
         Linear(cond_embed) -> SiLU -> Linear(cond_hidden) -> SiLU -> Linear(2 * embed_dim)
         -> Split into γ and β
+
+    γ, β initialized such that γ ≈ 1.0, β ≈ 0.0 for stable early training.
     """
 
     def __init__(
@@ -175,7 +167,6 @@ class ConditionEmbedding(nn.Module):
         self.embed_dim = embed_dim
         self.num_conditions = num_conditions
 
-        # Input is num_conditions (e.g., normalized age)
         self.mlp = nn.Sequential(
             nn.Linear(num_conditions, hidden_dim),
             nn.SiLU(inplace=True),
@@ -187,10 +178,10 @@ class ConditionEmbedding(nn.Module):
         self._init_weights()
 
     def _init_weights(self) -> None:
-        """Initialize weights."""
+        """Initialize weights with Kaiming normal."""
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, std=1e-4)
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
@@ -204,13 +195,8 @@ class ConditionEmbedding(nn.Module):
         Returns:
             Tuple of (γ, β) each of shape [B, embed_dim]
         """
-        # c shape: [B, num_conditions]
         gamma_beta = self.mlp(c)
-        # shape: [B, embed_dim * 2]
-
         gamma, beta = gamma_beta.chunk(2, dim=-1)
-        # each shape: [B, embed_dim]
-
         return gamma, beta
 
 
@@ -241,11 +227,10 @@ class FiLMLayer3D(nn.Module):
         self.num_channels = num_channels
         self.embed_dim = embed_dim
 
-        # Project conditioning embedding to γ and β for each channel
         self.gamma_proj = nn.Linear(embed_dim, num_channels)
         self.beta_proj = nn.Linear(embed_dim, num_channels)
 
-        # Initialize projections to identity
+        # Initialize to identity: γ=1, β=0
         nn.init.ones_(self.gamma_proj.weight)
         nn.init.zeros_(self.gamma_proj.bias)
         nn.init.zeros_(self.beta_proj.weight)
@@ -262,36 +247,34 @@ class FiLMLayer3D(nn.Module):
 
         Args:
             x: Input features of shape [B, C, D, H, W]
-            gamma: Scale parameters of shape [B, C] or [B, embed_dim]
-            beta: Shift parameters of shape [B, C] or [B, embed_dim]
+            gamma: Scale parameters of shape [B, embed_dim]
+            beta: Shift parameters of shape [B, embed_dim]
 
         Returns:
             Modulated features of shape [B, C, D, H, W]
         """
-        # Handle different gamma/beta shapes
-        if gamma.dim() == 2 and gamma.shape[1] == self.embed_dim:
-            # Project to channel dimension
-            gamma = self.gamma_proj(gamma)
-            beta = self.beta_proj(beta)
-        # else: assume gamma/beta already have shape [B, C]
+        # Project from embed_dim to channel dimension
+        gamma = self.gamma_proj(gamma)
+        beta = self.beta_proj(beta)
 
         # Reshape for broadcasting: [B, C] -> [B, C, 1, 1, 1]
         gamma = gamma.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
         beta = beta.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
 
-        # Modulate
         y = gamma * x + beta
-        # shape: [B, C, D, H, W]
-
         return y
 
 
 class ResBlock3D(nn.Module):
     """
-    3D Residual Block with GroupNorm and optional FiLM conditioning.
+    3D Residual Block with GroupNorm and FiLM conditioning.
 
     Architecture:
-        GroupNorm -> SiLU -> Conv3d -> GroupNorm -> SiLU -> Conv3d -> (+residual)
+        PreConv (optional projection) -> GroupNorm -> SiLU -> Conv3d ->
+        FiLM -> GroupNorm -> SiLU -> Conv3d -> (+residual)
+
+    FiLM is applied after first convolution to modulate features before
+    the second convolution, allowing condition-aware feature refinement.
     """
 
     def __init__(
@@ -316,20 +299,20 @@ class ResBlock3D(nn.Module):
         self.out_channels = out_channels
         self.embed_dim = embed_dim
 
+        # Pre-projection for skip connection alignment
+        self.pre_conv = nn.Conv3d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
+
         # Main path
-        self.norm1 = nn.GroupNorm(num_groups, in_channels)
-        self.conv1 = nn.Conv3d(in_channels, out_channels, 3, padding=1)
+        self.norm1 = nn.GroupNorm(num_groups, out_channels)
+        self.conv1 = nn.Conv3d(out_channels, out_channels, 3, padding=1)
 
         self.norm2 = nn.GroupNorm(num_groups, out_channels)
         self.conv2 = nn.Conv3d(out_channels, out_channels, 3, padding=1)
 
         # Skip connection
-        if in_channels != out_channels:
-            self.skip = nn.Conv3d(in_channels, out_channels, 1)
-        else:
-            self.skip = nn.Identity()
+        self.skip = nn.Identity()
 
-        # FiLM conditioning
+        # FiLM conditioning (applied after first conv)
         if embed_dim is not None:
             self.film = FiLMLayer3D(out_channels, embed_dim)
         else:
@@ -344,7 +327,7 @@ class ResBlock3D(nn.Module):
         beta: Optional[Tensor] = None,
     ) -> Tensor:
         """
-        Forward pass with optional FiLM conditioning.
+        Forward pass with FiLM conditioning.
 
         Args:
             x: Input tensor of shape [B, C, D, H, W]
@@ -354,13 +337,13 @@ class ResBlock3D(nn.Module):
         Returns:
             Output tensor of shape [B, C_out, D, H, W]
         """
-        residual = self.skip(x)
+        # Pre-projection to match channel dimensions
+        h = self.pre_conv(x)
 
         # First conv block
-        h = self.norm1(x)
+        h = self.norm1(h)
         h = self.act(h)
         h = self.conv1(h)
-        # shape: [B, C_out, D, H, W]
 
         # Apply FiLM if conditioning is provided
         if self.film is not None and gamma is not None and beta is not None:
@@ -370,21 +353,24 @@ class ResBlock3D(nn.Module):
         h = self.norm2(h)
         h = self.act(h)
         h = self.conv2(h)
-        # shape: [B, C_out, D, H, W]
 
         # Residual connection
-        return h + residual
+        return h + self.skip(x)
 
 
 class DownBlock3D(nn.Module):
     """
-    3D Downsampling block for U-Net encoder.
+    3D Downsampling block for U-Net encoder with FiLM conditioning.
+
+    Applies FiLM modulation after downsampling to inject time/condition
+    awareness at each spatial scale.
     """
 
     def __init__(
         self,
         in_channels: int,
         out_channels: int,
+        embed_dim: Optional[int] = None,
     ) -> None:
         """
         Initialize downsampling block.
@@ -392,6 +378,7 @@ class DownBlock3D(nn.Module):
         Args:
             in_channels: Number of input channels
             out_channels: Number of output channels
+            embed_dim: Embedding dimension for FiLM conditioning
         """
         super().__init__()
 
@@ -399,12 +386,25 @@ class DownBlock3D(nn.Module):
         self.norm = nn.GroupNorm(8, out_channels)
         self.act = nn.SiLU(inplace=True)
 
-    def forward(self, x: Tensor) -> Tensor:
+        # FiLM after downsampling
+        if embed_dim is not None:
+            self.film = FiLMLayer3D(out_channels, embed_dim)
+        else:
+            self.film = None
+
+    def forward(
+        self,
+        x: Tensor,
+        gamma: Optional[Tensor] = None,
+        beta: Optional[Tensor] = None,
+    ) -> Tensor:
         """
-        Downsample input by factor of 2.
+        Downsample input by factor of 2 with FiLM modulation.
 
         Args:
             x: Input of shape [B, C, D, H, W]
+            gamma: Optional scale parameters for FiLM
+            beta: Optional shift parameters for FiLM
 
         Returns:
             Output of shape [B, C_out, D/2, H/2, W/2]
@@ -412,18 +412,26 @@ class DownBlock3D(nn.Module):
         h = self.conv(x)
         h = self.norm(h)
         h = self.act(h)
+
+        if self.film is not None and gamma is not None and beta is not None:
+            h = self.film(h, gamma, beta)
+
         return h
 
 
 class UpBlock3D(nn.Module):
     """
-    3D Upsampling block for U-Net decoder.
+    3D Upsampling block for U-Net decoder with FiLM conditioning.
+
+    Applies FiLM modulation after upsampling to inject time/condition
+    awareness at each spatial scale.
     """
 
     def __init__(
         self,
         in_channels: int,
         out_channels: int,
+        embed_dim: Optional[int] = None,
     ) -> None:
         """
         Initialize upsampling block.
@@ -431,6 +439,7 @@ class UpBlock3D(nn.Module):
         Args:
             in_channels: Number of input channels
             out_channels: Number of output channels
+            embed_dim: Embedding dimension for FiLM conditioning
         """
         super().__init__()
 
@@ -438,12 +447,25 @@ class UpBlock3D(nn.Module):
         self.norm = nn.GroupNorm(8, out_channels)
         self.act = nn.SiLU(inplace=True)
 
-    def forward(self, x: Tensor) -> Tensor:
+        # FiLM after upsampling
+        if embed_dim is not None:
+            self.film = FiLMLayer3D(out_channels, embed_dim)
+        else:
+            self.film = None
+
+    def forward(
+        self,
+        x: Tensor,
+        gamma: Optional[Tensor] = None,
+        beta: Optional[Tensor] = None,
+    ) -> Tensor:
         """
-        Upsample input by factor of 2.
+        Upsample input by factor of 2 with FiLM modulation.
 
         Args:
             x: Input of shape [B, C, D, H, W]
+            gamma: Optional scale parameters for FiLM
+            beta: Optional shift parameters for FiLM
 
         Returns:
             Output of shape [B, C_out, D*2, H*2, W*2]
@@ -451,6 +473,10 @@ class UpBlock3D(nn.Module):
         h = self.conv(x)
         h = self.norm(h)
         h = self.act(h)
+
+        if self.film is not None and gamma is not None and beta is not None:
+            h = self.film(h, gamma, beta)
+
         return h
 
 
@@ -459,27 +485,27 @@ class VelocityFieldNet(nn.Module):
     Conditional Flow Matching Vector Field Network.
 
     A 3D U-Net that predicts the velocity field v(z_t, t, c) for morphing
-    disease progression in latent space. Uses FiLM conditioning to inject
-    time and clinical information.
+    disease progression in latent space. Uses deep FiLM conditioning
+    injected at every encoder/decoder block.
+
+    HD Input: [B, latent_channels, 16, 16, 12] (from VAE with 256x256x192 input)
 
     Architecture:
-        - Encoder: Downsampling with ResBlocks
-        - Decoder: Upsampling with skip connections and ResBlocks
-        - FiLM: Time and condition embedding injected at each ResBlock
+        - Encoder: DownBlock3D (FiLM) -> ResBlock3D (FiLM) -> ... (3 levels)
+        - Middle: ResBlock3D (FiLM) x 2
+        - Decoder: UpBlock3D (FiLM) -> ResBlock3D (FiLM) + skip -> ... (3 levels)
+        - FiLM: Time and condition embedding injected at EVERY block
 
-    Input:
-        z_t: Latent tensor of shape [B, latent_channels, D, H, W]
-        t: Time step of shape [B] (values in [0, 1])
-        c: Clinical conditions of shape [B, num_conditions] (e.g., normalized age)
-
-    Output:
-        v: Velocity field of shape [B, latent_channels, D, H, W]
+    Channel progression for HD latent [16,16,12] with base=64, mults=(1,2,4):
+        Level 0: 64 channels, spatial [16, 16, 12]
+        Level 1: 128 channels, spatial [8, 8, 6]
+        Level 2: 256 channels, spatial [4, 4, 3]
     """
 
     def __init__(
         self,
         latent_channels: int = 64,
-        latent_spatial: Tuple[int, int, int] = (8, 8, 8),
+        latent_spatial: Tuple[int, int, int] = (16, 16, 12),
         time_embed_dim: int = 128,
         time_hidden_dim: int = 256,
         cond_embed_dim: int = 64,
@@ -494,7 +520,7 @@ class VelocityFieldNet(nn.Module):
 
         Args:
             latent_channels: Number of channels in latent representation
-            latent_spatial: Spatial dimensions of latent (D, H, W)
+            latent_spatial: Spatial dimensions of latent (D, H, W). Default: (16, 16, 12) for HD
             time_embed_dim: Dimension for time embedding
             time_hidden_dim: Hidden dimension for time MLP
             cond_embed_dim: Dimension for condition embedding
@@ -510,6 +536,8 @@ class VelocityFieldNet(nn.Module):
         self.latent_spatial = latent_spatial
         self.time_embed_dim = time_embed_dim
         self.cond_embed_dim = cond_embed_dim
+        self.num_res_blocks = num_res_blocks
+        self.channel_mults = channel_mults
 
         # Time embedding
         self.time_embed = SinusoidalTimeEmbedding(embed_dim=time_embed_dim)
@@ -525,11 +553,10 @@ class VelocityFieldNet(nn.Module):
         # Combined embedding dimension (for FiLM)
         self.film_embed_dim = time_embed_dim + cond_embed_dim
 
-        # Input projection
+        # Input projection: [B, C, 16, 16, 12] -> [B, base, 16, 16, 12]
         self.input_conv = nn.Conv3d(latent_channels, base_channels, 3, padding=1)
-        # shape: [B, base_channels, D, H, W]
 
-        # Encoder
+        # Build encoder with FiLM-aware blocks
         self.encoder_blocks = nn.ModuleList()
         self.encoder_downsample = nn.ModuleList()
 
@@ -537,49 +564,69 @@ class VelocityFieldNet(nn.Module):
         for i, mult in enumerate(channel_mults):
             out_ch = base_channels * mult
 
-            # ResBlocks
+            # ResBlocks with FiLM
             for _ in range(num_res_blocks):
                 self.encoder_blocks.append(
-                    ResBlock3D(ch, out_ch, embed_dim=self.film_embed_dim)
+                    ResBlock3D(out_ch, out_ch, embed_dim=self.film_embed_dim)
+                )
+
+            # Downsample with FiLM (except last level)
+            if i < len(channel_mults) - 1:
+                self.encoder_downsample.append(
+                    DownBlock3D(ch, out_ch, embed_dim=self.film_embed_dim)
                 )
                 ch = out_ch
 
-            # Downsample (except for last level)
-            if i < len(channel_mults) - 1:
-                self.encoder_downsample.append(DownBlock3D(ch, ch))
-                # Store spatial size for skip connections
+        # Middle with FiLM
+        mid_ch = base_channels * channel_mults[-1]
+        self.middle_block = nn.ModuleList([
+            ResBlock3D(mid_ch, mid_ch, embed_dim=self.film_embed_dim),
+            ResBlock3D(mid_ch, mid_ch, embed_dim=self.film_embed_dim),
+        ])
 
-        # Middle
-        self.middle_block = nn.Sequential(
-            ResBlock3D(ch, ch, embed_dim=self.film_embed_dim),
-            ResBlock3D(ch, ch, embed_dim=self.film_embed_dim),
-        )
-
-        # Decoder
+        # Build decoder with correct channel handling for skip connections
         self.decoder_blocks = nn.ModuleList()
         self.decoder_upsample = nn.ModuleList()
+        self.decoder_proj = nn.ModuleList()  # Project skip connections to match channels
 
+        # Track decoder block input channels for proper skip connection handling
+        # After upsample + concat, channels = up_out_ch + skip_ch (from encoder)
         for i, mult in enumerate(reversed(channel_mults)):
             out_ch = base_channels * mult
 
-            # Upsample (except for first level)
+            # Upsample with FiLM (except first level)
             if i > 0:
-                self.decoder_upsample.append(UpBlock3D(ch, ch))
+                self.decoder_upsample.append(
+                    UpBlock3D(ch, out_ch, embed_dim=self.film_embed_dim)
+                )
+                # Projection for skip connection: encoder has out_ch, upsample outputs out_ch
+                # No extra projection needed when i == 1 (first upsample)
+                # When i > 1, we need to handle different skip channel counts
+                self.decoder_proj.append(nn.Identity())
 
-            # ResBlocks
+            # ResBlocks: input channels = upsample_out (if upsample) + skip (if concat)
+            # The first decoder block after middle doesn't have upsample, just middle output
+            # When i == 0 (first iteration), we use middle output directly
+            # When i > 0, upsample output + skip
+
             for _ in range(num_res_blocks):
+                # Compute actual in_channels based on whether we upsample or not
+                if i == 0:
+                    # First block: no upsample, just middle output
+                    block_in_ch = mid_ch
+                else:
+                    # After upsample: current ch (after upsample) + skip
+                    block_in_ch = out_ch + out_ch  # upsample output + skip (same channels)
+
                 self.decoder_blocks.append(
-                    ResBlock3D(ch, out_ch, embed_dim=self.film_embed_dim)
+                    ResBlock3D(block_in_ch, out_ch, embed_dim=self.film_embed_dim)
                 )
                 ch = out_ch
 
         # Output projection
         self.output_conv = nn.Conv3d(ch, latent_channels, 3, padding=1)
 
-    def get_time_condition(
-        self,
-        t: Tensor,
-    ) -> Tuple[Tensor, Tensor]:
+    def get_time_condition(self, t: Tensor) -> Tuple[Tensor, Tensor]:
         """
         Compute time conditioning parameters for FiLM.
 
@@ -589,20 +636,11 @@ class VelocityFieldNet(nn.Module):
         Returns:
             Tuple of (gamma, beta) for FiLM conditioning
         """
-        # Sinusoidal embedding
         t_embed = self.time_embed(t)
-        # shape: [B, time_embed_dim]
-
-        # MLP to get γ and β
         gamma, beta = self.time_mlp(t_embed)
-        # each shape: [B, time_embed_dim]
-
         return gamma, beta
 
-    def get_cond_condition(
-        self,
-        c: Tensor,
-    ) -> Tuple[Tensor, Tensor]:
+    def get_cond_condition(self, c: Tensor) -> Tuple[Tensor, Tensor]:
         """
         Compute condition conditioning parameters for FiLM.
 
@@ -612,10 +650,7 @@ class VelocityFieldNet(nn.Module):
         Returns:
             Tuple of (gamma, beta) for FiLM conditioning
         """
-        # MLP to get γ and β
         gamma, beta = self.cond_embed(c)
-        # each shape: [B, cond_embed_dim]
-
         return gamma, beta
 
     def combine_conditions(
@@ -641,8 +676,6 @@ class VelocityFieldNet(nn.Module):
         """
         gamma = torch.cat([time_gamma, cond_gamma], dim=-1)
         beta = torch.cat([time_beta, cond_beta], dim=-1)
-        # each shape: [B, time_embed_dim + cond_embed_dim]
-
         return gamma, beta
 
     def forward(
@@ -655,70 +688,72 @@ class VelocityFieldNet(nn.Module):
         Compute velocity field v(z_t, t, c).
 
         Args:
-            z_t: Latent tensor at time t of shape [B, latent_channels, D, H, W]
+            z_t: Latent tensor at time t of shape [B, latent_channels, 16, 16, 12]
             t: Time step tensor of shape [B] with values in [0, 1]
             c: Optional clinical conditions of shape [B, num_conditions]
 
         Returns:
-            Velocity field of shape [B, latent_channels, D, H, W]
+            Velocity field of shape [B, latent_channels, 16, 16, 12]
         """
-        # Get conditioning
+        # Get conditioning - always use combined time+condition (FiLM requires consistent embed_dim)
         time_gamma, time_beta = self.get_time_condition(t)
-        # each shape: [B, time_embed_dim]
 
         if c is not None:
             cond_gamma, cond_beta = self.get_cond_condition(c)
-            # each shape: [B, cond_embed_dim]
-            gamma, beta = self.combine_conditions(
-                time_gamma, time_beta, cond_gamma, cond_beta
-            )
-            # each shape: [B, time_embed_dim + cond_embed_dim]
         else:
-            # Use time conditioning only
-            gamma, beta = time_gamma, time_beta
-            # each shape: [B, time_embed_dim]
+            # Use zero conditioning when not provided to keep embed_dim consistent
+            cond_gamma = torch.zeros(t.size(0), self.cond_embed_dim, device=t.device, dtype=t.dtype)
+            cond_beta = torch.zeros(t.size(0), self.cond_embed_dim, device=t.device, dtype=t.dtype)
+
+        gamma, beta = self.combine_conditions(
+            time_gamma, time_beta, cond_gamma, cond_beta
+        )
 
         # Input projection
         h = self.input_conv(z_t)
-        # shape: [B, base_channels, D, H, W]
+        # shape: [B, base_channels, 16, 16, 12]
 
-        # Encoder forward with FiLM conditioning
+        # Encoder forward with FiLM at every block
         encoder_outputs = []
         block_idx = 0
 
-        for i, mult in enumerate(channel_mults):
-            for _ in range(num_res_blocks):
+        for i, mult in enumerate(self.channel_mults):
+            # ResBlocks
+            for _ in range(self.num_res_blocks):
                 h = self.encoder_blocks[block_idx](h, gamma, beta)
                 block_idx += 1
             encoder_outputs.append(h)
 
-            if i < len(channel_mults) - 1:
-                h = self.encoder_downsample[i](h)
+            # Downsample with FiLM (except last level)
+            if i < len(self.channel_mults) - 1:
+                h = self.encoder_downsample[i](h, gamma, beta)
 
-        # Middle
-        h = self.middle_block[0](h, gamma, beta)
-        h = self.middle_block[1](h, gamma, beta)
-        # shape: [B, base_channels * channel_mults[-1], D', H', W']
+        # Middle with FiLM
+        for block in self.middle_block:
+            h = block(h, gamma, beta)
 
         # Decoder forward with skip connections and FiLM
         block_idx = 0
-        for i, mult in enumerate(reversed(channel_mults)):
-            if i > 0:
-                h = self.decoder_upsample[i - 1](h)
+        upsample_idx = 0
 
-            for _ in range(num_res_blocks):
+        for i, mult in enumerate(reversed(self.channel_mults)):
+            # Upsample with FiLM (except first level)
+            if i > 0:
+                h = self.decoder_upsample[upsample_idx](h, gamma, beta)
+                upsample_idx += 1
+
+            # ResBlocks with skip connections
+            for _ in range(self.num_res_blocks):
                 # Concatenate skip connection
-                skip_idx = len(channel_mults) - 1 - i
-                if block_idx < len(self.decoder_blocks):
-                    h = torch.cat([h, encoder_outputs[skip_idx]], dim=1)
-                    # This changes channel dim, so we need to project
+                skip_idx = len(self.channel_mults) - 1 - i
+                h = torch.cat([h, encoder_outputs[skip_idx]], dim=1)
 
                 h = self.decoder_blocks[block_idx](h, gamma, beta)
                 block_idx += 1
 
         # Output projection
         v = self.output_conv(h)
-        # shape: [B, latent_channels, D, H, W]
+        # shape: [B, latent_channels, 16, 16, 12]
 
         return v
 

@@ -7,8 +7,13 @@ batch sizes common in 3D medical imaging) and LeakyReLU activation.
 
 Architecture:
     - Encoder: 3D CNN with residual blocks, outputting mu and logvar
-    - Reparameterization: z = mu + std * epsilon
+    - Reparameterization: z = mu + std * epsilon (or z = mu in eval mode)
     - Decoder: 3D transposed CNN with residual blocks, outputting sigmoid activation
+
+HD Support:
+    - Input: [B, 1, 256, 256, 192]
+    - After 4 downsampling blocks: [B, 512, 16, 16, 12]
+    - Decoder mirrors encoder structure
 """
 
 from typing import Dict, List, Optional, Tuple, Union
@@ -45,7 +50,6 @@ class ResidualBlock3D(nn.Module):
         """
         super().__init__()
 
-        # First conv block
         self.conv1 = nn.Conv3d(
             in_channels,
             out_channels,
@@ -56,7 +60,6 @@ class ResidualBlock3D(nn.Module):
         self.norm1 = nn.GroupNorm(num_groups, out_channels)
         self.act1 = nn.LeakyReLU(negative_slope=leakyrelu_slope, inplace=True)
 
-        # Second conv block
         self.conv2 = nn.Conv3d(
             out_channels,
             out_channels,
@@ -67,7 +70,6 @@ class ResidualBlock3D(nn.Module):
         self.norm2 = nn.GroupNorm(num_groups, out_channels)
         self.act2 = nn.LeakyReLU(negative_slope=leakyrelu_slope, inplace=True)
 
-        # Residual connection
         if in_channels != out_channels:
             self.residual = nn.Conv3d(in_channels, out_channels, kernel_size=1, stride=1)
         else:
@@ -203,40 +205,53 @@ class ADynamicsVAE3D(nn.Module):
     Learns a compressed latent representation of T1-weighted MRI scans
     using a VAE architecture with residual blocks and GroupNorm.
 
-    The encoder compresses 3D MRI [B, 1, 128, 128, 128] to latent space [B, C, D', H', W'].
-    The decoder reconstructs the MRI from latent space.
+    HD Input: [B, 1, 256, 256, 192] (high-definition)
+    After 4 downsampling blocks: [B, 512, 16, 16, 12]
+    The decoder mirrors this structure to reconstruct [B, 1, 256, 256, 192].
+
+    Memory optimization: Set base_channels=16 if OOM occurs with HD inputs.
+    Gradient checkpointing can be enabled via use_checkpointing=True for
+    memory-constrained environments (decoder long chains benefit most).
 
     Attributes:
         spatial_size: Original spatial dimensions
         in_channels: Number of input channels (1 for T1 MRI)
         latent_channels: Number of channels in latent space
+        base_channels: Base channel count (32 default, 16 for memory saving)
+        use_checkpointing: Enable gradient checkpointing for memory efficiency
     """
 
     def __init__(
         self,
-        spatial_size: Tuple[int, int, int] = (128, 128, 128),
+        spatial_size: Tuple[int, int, int] = (256, 256, 192),
         in_channels: int = 1,
         latent_channels: int = 64,
+        base_channels: int = 32,
+        use_checkpointing: bool = False,
     ) -> None:
         """
         Initialize the 3D VAE.
 
         Args:
-            spatial_size: Spatial dimensions of input MRI (D, H, W)
+            spatial_size: Spatial dimensions of input MRI (D, H, W). Default: (256, 256, 192)
             in_channels: Number of input channels (default: 1 for T1)
             latent_channels: Number of channels in latent representation
+            base_channels: Base channel count for conv layers. Default: 32.
+                           Reduce to 16 if OOM occurs with HD inputs.
+            use_checkpointing: If True, use torch.utils.checkpoint to save memory.
+                               Recommended for HD (256,256,192) inputs. Default: False
         """
         super().__init__()
 
         self.spatial_size = spatial_size
         self.in_channels = in_channels
         self.latent_channels = latent_channels
+        self.base_channels = base_channels
+        self.use_checkpointing = use_checkpointing
 
-        # Calculate number of downsampling blocks for target latent size of 8x8x8
-        # With 4 downsampling blocks: 128 -> 64 -> 32 -> 16 -> 8
-        target_latent_size = 8
+        # With 4 downsampling blocks: 256 -> 128 -> 64 -> 32 -> 16
+        # Latent spatial size for HD (256, 256, 192): [16, 16, 12]
         num_downsamples = 4
-        base_channels = 32
 
         # Encoder
         self.encoder_conv_in = nn.Conv3d(
@@ -245,10 +260,9 @@ class ADynamicsVAE3D(nn.Module):
         self.encoder_norm_in = nn.GroupNorm(8, base_channels)
         self.encoder_act_in = nn.LeakyReLU(negative_slope=0.2, inplace=True)
 
-        # Encoder backbone with downsampling and residual blocks
         self.encoder_layers = nn.ModuleList()
         ch = base_channels
-        for i in range(num_downsamples):
+        for _ in range(num_downsamples):
             self.encoder_layers.append(
                 DownBlock3D(ch, ch * 2, num_groups=8)
             )
@@ -257,7 +271,6 @@ class ADynamicsVAE3D(nn.Module):
             )
             ch *= 2
 
-        # Latent space conv to produce mu and logvar
         self.latent_conv = nn.Conv3d(
             ch, latent_channels * 2, kernel_size=3, padding=1
         )
@@ -267,9 +280,8 @@ class ADynamicsVAE3D(nn.Module):
             latent_channels, ch, kernel_size=3, padding=1
         )
 
-        # Decoder backbone with upsampling and residual blocks
         self.decoder_layers = nn.ModuleList()
-        for i in range(num_downsamples):
+        for _ in range(num_downsamples):
             self.decoder_layers.append(
                 ResidualBlock3D(ch, ch, num_groups=8)
             )
@@ -278,7 +290,6 @@ class ADynamicsVAE3D(nn.Module):
             )
             ch //= 2
 
-        # Final output conv with Sigmoid activation (data normalized to [0, 1])
         self.decoder_conv_out = nn.Sequential(
             nn.Conv3d(ch, base_channels, kernel_size=3, padding=1),
             nn.GroupNorm(8, base_channels),
@@ -292,29 +303,25 @@ class ADynamicsVAE3D(nn.Module):
         Encode MRI to latent space parameters.
 
         Args:
-            x: Input MRI tensor of shape [B, 1, D, H, W]
+            x: Input MRI tensor of shape [B, 1, 256, 256, 192]
 
         Returns:
-            Tuple of (mu, logvar) both of shape [B, latent_channels, D', H', W']
+            Tuple of (mu, logvar) both of shape [B, latent_channels, 16, 16, 12]
         """
-        # Input conv
         h = self.encoder_conv_in(x)
         h = self.encoder_norm_in(h)
         h = self.encoder_act_in(h)
-        # shape: [B, 32, 128, 128, 128]
+        # shape: [B, 32, 256, 256, 192]
 
-        # Encoder backbone
         for layer in self.encoder_layers:
             h = layer(h)
+        # shape after 4 downsamples: [B, 512, 16, 16, 12]
 
-        # Latent projection
-        # shape after 4 downsamples: [B, 512, 8, 8, 8]
         latent = self.latent_conv(h)
-        # shape: [B, latent_channels*2, 8, 8, 8]
+        # shape: [B, latent_channels*2, 16, 16, 12]
 
-        # Split into mu and logvar
         mu, logvar = latent.chunk(2, dim=1)
-        # shape: [B, latent_channels, 8, 8, 8] each
+        # shape: [B, latent_channels, 16, 16, 12] each
 
         return mu, logvar
 
@@ -322,13 +329,20 @@ class ADynamicsVAE3D(nn.Module):
         """
         Reparameterization trick for VAE sampling.
 
+        In training mode: z = mu + std * epsilon (with stochastic noise)
+        In eval mode: z = mu (deterministic, no noise for stable inference)
+
         Args:
             mu: Mean of latent distribution, shape [B, C, D, H, W]
             logvar: Log variance of latent distribution, shape [B, C, D, H, W]
 
         Returns:
-            Sampled latent tensor z = mu + std * epsilon
+            Sampled latent tensor
         """
+        if not self.training:
+            # Eval mode: deterministic, return mean directly
+            return mu
+
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + std * eps
@@ -338,22 +352,30 @@ class ADynamicsVAE3D(nn.Module):
         Decode latent representation back to MRI space.
 
         Args:
-            z: Latent tensor of shape [B, latent_channels, D', H', W']
+            z: Latent tensor of shape [B, latent_channels, 16, 16, 12]
 
         Returns:
-            Reconstructed MRI of shape [B, 1, D, H, W]
+            Reconstructed MRI of shape [B, 1, 256, 256, 192]
+
+        Note:
+            When use_checkpointing=True, gradient checkpointing is applied to
+            decoder layers to save GPU memory. This trades compute for memory,
+            approximately halving memory usage at the cost of ~20-30% slower training.
         """
-        # Latent projection
         h = self.decoder_latent_conv(z)
-        # shape: [B, 512, 8, 8, 8]
+        # shape: [B, 512, 16, 16, 12]
 
-        # Decoder backbone
-        for layer in self.decoder_layers:
-            h = layer(h)
+        # Apply gradient checkpointing for memory-constrained HD inputs
+        # This saves significant GPU memory (~50%) at cost of ~20-30% slower training
+        if self.use_checkpointing:
+            for layer in self.decoder_layers:
+                h = torch.utils.checkpoint.checkpoint(layer, h)
+        else:
+            for layer in self.decoder_layers:
+                h = layer(h)
 
-        # Output conv
         recon = self.decoder_conv_out(h)
-        # shape: [B, 1, 128, 128, 128]
+        # shape: [B, 1, 256, 256, 192]
 
         return recon
 
@@ -362,7 +384,7 @@ class ADynamicsVAE3D(nn.Module):
         Full VAE forward pass.
 
         Args:
-            x: Input MRI tensor of shape [B, 1, D, H, W]
+            x: Input MRI tensor of shape [B, 1, 256, 256, 192]
 
         Returns:
             Tuple of (reconstruction, mu, logvar)
@@ -377,34 +399,51 @@ class ADynamicsVAE3D(nn.Module):
         Encode and return latent representation without reparameterization.
 
         Useful for extracting fixed latent features for downstream tasks
-        like disease classification.
+        like disease classification. Always returns mu (no stochasticity).
 
         Args:
-            x: Input MRI tensor of shape [B, 1, D, H, W]
+            x: Input MRI tensor of shape [B, 1, 256, 256, 192]
 
         Returns:
-            Latent representation of shape [B, latent_channels, D', H', W']
+            Latent representation of shape [B, latent_channels, 16, 16, 12]
         """
         mu, _ = self.encode(x)
         return mu
 
 
-def vae_kl_loss(mu: Tensor, logvar: Tensor) -> Tensor:
+def vae_kl_loss(
+    mu: Tensor,
+    logvar: Tensor,
+    reduction: str = "mean",
+) -> Tensor:
     """
     Compute KL divergence loss for VAE latent regularization.
 
     KL divergence between N(mu, sigma) and N(0, 1):
-        KL = -0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
+        KL = -0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2) over spatial dims
+        Then mean over batch for balanced scale with reconstruction loss.
 
     Args:
-        mu: Mean of latent distribution
-        logvar: Log variance of latent distribution
+        mu: Mean of latent distribution, shape [B, C, D, H, W]
+        logvar: Log variance of latent distribution, shape [B, C, D, H, W]
+        reduction: Reduction method for loss. Options: "mean", "sum", "none".
+                   Default: "mean" (recommended for balancing with reconstruction loss)
 
     Returns:
-        Scalar KL divergence loss
+        Scalar KL divergence loss (balanced scale for HD inputs)
     """
-    kl_div = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-    return kl_div
+    # Sum over channel and spatial dimensions, then mean over batch
+    # This keeps spatial structure but normalizes across batch size
+    kl_per_sample = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=(1, 2, 3, 4))
+
+    if reduction == "mean":
+        return torch.mean(kl_per_sample)
+    elif reduction == "sum":
+        return torch.sum(kl_per_sample)
+    elif reduction == "none":
+        return kl_per_sample
+    else:
+        raise ValueError(f"Unknown reduction: {reduction}. Use 'mean', 'sum', or 'none'.")
 
 
 def vae_reconstruction_loss(

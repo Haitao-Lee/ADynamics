@@ -8,6 +8,12 @@ Implements:
 Critical for medical imaging:
     - Uses align_corners=False for proper physical coordinate handling
     - Jacobian determinant penalty to prevent folding
+
+PyTorch grid_sample coordinate convention for 3D:
+    - Input tensor shape: [B, C, D, H, W] where D=depth, H=height, W=width
+    - Grid shape: [B, D, H, W, 3] where last dim is (x, y, z)
+    - x corresponds to W (width), y corresponds to H (height), z corresponds to D (depth)
+    - This means when creating meshgrid with indexing="ij", we stack [grid_w, grid_h, grid_d]
 """
 
 from typing import Optional, Tuple
@@ -25,24 +31,29 @@ class DeformationGenerator(nn.Module):
     Takes evolved latent representation z_final from CFM and generates
     a 3D displacement field that warps the NC image toward AD.
 
+    For HD inputs [256, 256, 192], base_channels is reduced to 16 to prevent OOM.
+
     Architecture:
         Latent -> 3D U-Net style upsampling -> 3-channel displacement field
 
     Output:
         displacement field of shape [B, 3, D, H, W] where:
-            channel 0 = displacement in D dimension (depth)
-            channel 1 = displacement in H dimension (height)
-            channel 2 = displacement in W dimension (width)
+            channel 0 = displacement in x direction (W dimension)
+            channel 1 = displacement in y direction (H dimension)
+            channel 2 = displacement in z direction (D dimension)
 
     The displacement is in voxel units, can be multiplied by spacing for physical units.
+
+    Initialization: Output conv initialized to near-zero for identity-like behavior
+    at early training stages, which stabilizes convergence.
     """
 
     def __init__(
         self,
         latent_channels: int = 64,
-        latent_spatial: Tuple[int, int, int] = (8, 8, 8),
-        output_spatial: Tuple[int, int, int] = (128, 128, 128),
-        base_channels: int = 64,
+        latent_spatial: Tuple[int, int, int] = (16, 16, 12),
+        output_spatial: Tuple[int, int, int] = (256, 256, 192),
+        base_channels: int = 16,
         channel_mults: Tuple[int, int, int, int] = (1, 2, 4, 8),
         num_res_blocks: int = 2,
         max_displacement: float = 10.0,
@@ -53,8 +64,8 @@ class DeformationGenerator(nn.Module):
         Args:
             latent_channels: Number of channels in latent representation
             latent_spatial: Spatial dimensions of latent (D, H, W)
-            output_spatial: Output deformation field spatial dimensions
-            base_channels: Base channel count for network
+            output_spatial: Output deformation field spatial dimensions for HD: (256, 256, 192)
+            base_channels: Base channel count. Default 16 for HD memory efficiency.
             channel_mults: Channel multipliers for each upsampling level
             num_res_blocks: Number of residual blocks per level
             max_displacement: Maximum displacement in voxels (clamping range)
@@ -67,7 +78,6 @@ class DeformationGenerator(nn.Module):
         self.max_displacement = max_displacement
 
         # Initial projection from latent to feature map
-        # Start from latent spatial size and upsampe to full size
         self.latent_proj = nn.Sequential(
             nn.Conv3d(latent_channels, base_channels * channel_mults[-1], 3, padding=1),
             nn.GroupNorm(8, base_channels * channel_mults[-1]),
@@ -84,7 +94,6 @@ class DeformationGenerator(nn.Module):
         for i, mult in enumerate(reversed(channel_mults)):
             out_ch = base_channels * mult
 
-            # Residual blocks
             for _ in range(num_res_blocks):
                 self.decoder_blocks.append(
                     nn.Sequential(
@@ -95,13 +104,13 @@ class DeformationGenerator(nn.Module):
                 )
                 ch = out_ch
 
-            # Upsample (except for last level)
-            if i < len(channel_mults) - 1:
+            if i < len(channel_mults):
                 self.decoder_upsample.append(
                     nn.ConvTranspose3d(ch, ch, 4, stride=2, padding=1)
                 )
 
         # Output head to generate 3-channel displacement
+        # Initialized to near-zero for identity-like behavior at start
         self.output_head = nn.Sequential(
             nn.GroupNorm(8, ch),
             nn.LeakyReLU(negative_slope=0.2, inplace=True),
@@ -109,46 +118,45 @@ class DeformationGenerator(nn.Module):
             nn.GroupNorm(8, base_channels),
             nn.LeakyReLU(negative_slope=0.2, inplace=True),
             nn.Conv3d(base_channels, 3, 3, padding=1),
-            # Output: [B, 3, D, H, W] displacement field
         )
+
+        # Initialize output conv to near-zero for stable initial deformation
+        self._init_output_layer()
+
+    def _init_output_layer(self) -> None:
+        """Initialize output conv to near-zero for identity-like initial behavior."""
+        for m in self.output_head.modules():
+            if isinstance(m, nn.Conv3d):
+                nn.init.zeros_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def forward(self, z_final: Tensor) -> Tensor:
         """
         Generate deformation field from evolved latent.
 
         Args:
-            z_final: Evolved latent from CFM of shape [B, latent_channels, D', H', W']
+            z_final: Evolved latent from CFM of shape [B, latent_channels, 16, 16, 12]
 
         Returns:
-            Deformation field of shape [B, 3, D, H, W]
+            Deformation field of shape [B, 3, 256, 256, 192]
             Values are clamped to [-max_displacement, max_displacement]
         """
-        # Project latent to feature space
         h = self.latent_proj(z_final)
-        # shape: [B, base_channels * channel_mults[-1], D', H', W']
 
-        # Decoder with upsampling
         block_idx = 0
         for i in range(len(self.decoder_upsample)):
-            # Upsample
             h = self.decoder_upsample[i](h)
-            # shape: [B, ch, D'*2, H'*2, W'*2]
 
-            # Apply two res blocks
             for _ in range(2):
                 h = h + self.decoder_blocks[block_idx](h)
                 block_idx += 1
 
-        # Final blocks (no more upsampling)
         for _ in range(2):
             h = h + self.decoder_blocks[block_idx](h)
             block_idx += 1
 
-        # Generate displacement
         flow = self.output_head(h)
-        # shape: [B, 3, D, H, W]
-
-        # Clamp displacement to prevent extreme deformations
         flow = torch.clamp(flow, min=-self.max_displacement, max=self.max_displacement)
 
         return flow
@@ -163,11 +171,13 @@ class SpatialTransformer(nn.Module):
     in the input image to produce the output.
 
     CRITICAL: Uses align_corners=False for proper physical coordinate handling.
-    With align_corners=False, coordinates are in [-1, 1] representing the
-    spatial extent of the input, with 0 being the center.
 
-    The deformation field flow specifies the displacement from the current
-    position in normalized coordinates [-1, 1].
+    Coordinate convention for PyTorch grid_sample:
+        - Input: [B, C, D, H, W] where D=depth, H=height, W=width
+        - Grid: [B, D, H, W, 3] where last dim is (x, y, z)
+        - x corresponds to W dimension, y corresponds to H, z corresponds to D
+        - Therefore, when creating meshgrid with indexing="ij",
+          we stack [grid_w, grid_h, grid_d] to get correct (x, y, z) order
     """
 
     def __init__(
@@ -181,9 +191,6 @@ class SpatialTransformer(nn.Module):
         Args:
             mode: Interpolation mode ("bilinear" or "nearest")
             padding_mode: Padding mode for out-of-bound coordinates
-                "border" = replicate edge values
-                "zeros" = fill with zeros
-                "reflection" = reflect values
         """
         super().__init__()
         self.mode = mode
@@ -199,11 +206,11 @@ class SpatialTransformer(nn.Module):
         Apply deformation field to image.
 
         Args:
-            image: Input image of shape [B, 1, D, H, W] or [B, C, D, H, W]
+            image: Input image of shape [B, C, D, H, W]
             flow: Deformation field of shape [B, 3, D, H, W]
-                flow[:, 0] = displacement in D dimension
-                flow[:, 1] = displacement in H dimension
-                flow[:, 2] = displacement in W dimension
+                flow[:, 0] = displacement in x (W dimension)
+                flow[:, 1] = displacement in y (H dimension)
+                flow[:, 2] = displacement in z (D dimension)
                 Values are in voxels, will be converted to normalized coords
             return_grid: Whether to return the sampling grid
 
@@ -212,52 +219,38 @@ class SpatialTransformer(nn.Module):
         """
         B, C, D, H, W = image.shape
 
-        # Create normalized sampling grid [-1, 1]
-        # With align_corners=False:
-        # -1 corresponds to -D/2, D/2, -H/2, H/2, -W/2, W/2 from center
-        # This represents the spatial extent properly
-
-        # Create base grid
+        # Create normalized base grid [-1, 1]
+        # Use linspace to create coordinate arrays
         d = torch.linspace(-1, 1, D, device=image.device, dtype=flow.dtype)
         h = torch.linspace(-1, 1, H, device=image.device, dtype=flow.dtype)
         w = torch.linspace(-1, 1, W, device=image.device, dtype=flow.dtype)
 
-        # Create meshgrid
+        # Create meshgrid with indexing="ij" for (D, H, W) order
         grid_d, grid_h, grid_w = torch.meshgrid(d, h, w, indexing="ij")
         # each shape: [D, H, W]
 
-        # Stack to create full grid
-        base_grid = torch.stack([grid_d, grid_h, grid_w], dim=-1)
-        # shape: [D, H, W, 3]
+        # Stack to [x, y, z] order = [W, H, D] for grid_sample convention
+        # PyTorch grid_sample expects last dim to be (x, y, z) where x=W, y=H, z=D
+        base_grid = torch.stack([grid_w, grid_h, grid_d], dim=-1)
+        # shape: [D, H, W, 3] where [:,:,:,0]=x=W, [:,:,:,1]=y=H, [:,:,:,2]=z=D
 
-        # Expand to batch
+        # Expand to batch: [B, D, H, W, 3]
         base_grid = base_grid.unsqueeze(0).expand(B, -1, -1, -1, -1)
-        # shape: [B, D, H, W, 3]
 
-        # Normalize flow to [-1, 1] range
-        # Flow is in voxels, need to convert to normalized coordinates
-        # Grid spacing in normalized coords is 2/(size-1) ≈ 2/size for large sizes
-        flow_d_normalized = 2.0 * flow[:, 0] / max(D - 1, 1)
-        flow_h_normalized = 2.0 * flow[:, 1] / max(H - 1, 1)
-        flow_w_normalized = 2.0 * flow[:, 2] / max(W - 1, 1)
+        # Normalize flow from voxel units to [-1, 1] range
+        # flow[:, 0] is x-displacement (W), flow[:, 1] is y-displacement (H), flow[:, 2] is z-displacement (D)
+        flow_x_norm = 2.0 * flow[:, 0] / max(W - 1, 1)
+        flow_y_norm = 2.0 * flow[:, 1] / max(H - 1, 1)
+        flow_z_norm = 2.0 * flow[:, 2] / max(D - 1, 1)
 
-        # Add displacement to base grid
-        # flow specifies where to sample FROM, so we add it to the target coordinates
+        # Add displacement: base_grid[..., 0] is x (W), base_grid[..., 1] is y (H), base_grid[..., 2] is z (D)
         sampling_grid = base_grid.clone()
-        sampling_grid[:, :, :, :, 0] = sampling_grid[:, :, :, :, 0] + flow_d_normalized
-        sampling_grid[:, :, :, :, 1] = sampling_grid[:, :, :, :, 1] + flow_h_normalized
-        sampling_grid[:, :, :, :, 2] = sampling_grid[:, :, :, :, 2] + flow_w_normalized
-        # shape: [B, D, H, W, 3]
+        sampling_grid[..., 0] = sampling_grid[..., 0] + flow_x_norm
+        sampling_grid[..., 1] = sampling_grid[..., 1] + flow_y_norm
+        sampling_grid[..., 2] = sampling_grid[..., 2] + flow_z_norm
+        # shape: [B, D, H, W, 3] - ready for grid_sample (NO permute needed!)
 
-        # grid_sample expects grid of shape [B, H_out, W_out, D_out, 3] for 4D
-        # or [B, D_out, H_out, W_out, 3] for 5D - need to permute
-        sampling_grid = sampling_grid.permute(0, 4, 1, 2, 3)
-        # shape: [B, 3, D, H, W] -> [B, 3, D, H, W] for grid_sample
-
-        # Apply spatial transformer
-        # grid_sample with align_corners=False:
-        # - The grid values are in [-1, 1] representing the normalized spatial extent
-        # - Coordinates are centered at 0, with -1 at one edge and 1 at the opposite
+        # Apply spatial transformer with align_corners=False for physical coords
         warped = F.grid_sample(
             image,
             sampling_grid,
@@ -265,7 +258,6 @@ class SpatialTransformer(nn.Module):
             padding_mode=self.padding_mode,
             align_corners=False,
         )
-        # shape: [B, C, D, H, W]
 
         if return_grid:
             return warped, sampling_grid
@@ -278,9 +270,6 @@ class SpatialTransformer(nn.Module):
     ) -> Tensor:
         """
         Apply inverse deformation (useful for registration).
-
-        The flow defines the forward displacement, so we negate it
-        to get the inverse warp.
 
         Args:
             image: Input image [B, C, D, H, W]
@@ -318,6 +307,8 @@ class CompositionTransformer(nn.Module):
 
         flow_composed(x) = flow1(x) + flow2(x + flow1(x))
 
+        With properly aligned underlying STN, no manual axis swap needed.
+
         Args:
             flow1: First flow [B, 3, D, H, W]
             flow2: Second flow [B, 3, D, H, W]
@@ -326,9 +317,7 @@ class CompositionTransformer(nn.Module):
             Composed flow [B, 3, D, H, W]
         """
         # Apply flow2 at locations displaced by flow1
-        # This requires a grid sample operation
-        warped_flow2 = self.stn(flow2.permute(0, 1, 4, 3, 2), flow1)
-        warped_flow2 = warped_flow2.permute(0, 1, 4, 3, 2)
+        warped_flow2 = self.stn(flow2, flow1)
         return flow1 + warped_flow2
 
     def forward(
@@ -385,19 +374,12 @@ def flow_to_displacement_voxel(
     Returns:
         Displacement in voxels
     """
-    # Convert normalized flow to physical displacement then to voxels
-    # Normalized coord: [-1, 1] maps to physical extent of size * spacing
-    # So normalized 2.0 corresponds to size * spacing total range
-    # And 1.0 corresponds to size * spacing / 2
-
     D, H, W = flow.shape[2], flow.shape[3], flow.shape[4]
     physical_extent = torch.tensor(
         [D * spacing[0], H * spacing[1], W * spacing[2]],
         device=flow.device,
         dtype=flow.dtype,
     )
-    # Normalization factor: with align_corners=False, grid goes from -1 to 1
-    # covering the full extent, so 2.0 in normalized coords = physical_extent
     norm_factor = physical_extent / 2.0
 
     displacement = flow * norm_factor.view(1, 3, 1, 1, 1)
@@ -409,46 +391,81 @@ def compute_determinant_jacobian(
     spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0),
 ) -> Tensor:
     """
-    Compute Jacobian determinant for a deformation field.
+    Compute Jacobian determinant for a deformation field using torch.gradient.
 
     For deformation φ(x) = x + u(x), J = I + ∂u/∂x
+
+    Uses torch.gradient for more accurate gradient computation that handles
+    boundary conditions better than manual slicing.
 
     Args:
         flow: Deformation field [B, 3, D, H, W]
         spacing: Voxel spacing for gradient computation
 
     Returns:
-        Jacobian determinant [B, D-2, H-2, W-2]
+        Jacobian determinant [B, D, H, W] (same size as input, edge handling at boundaries)
     """
     B, _, D, H, W = flow.shape
 
-    # Compute gradients using central differences
-    # u = flow (displacement)
-    # ∂u_i/∂x_j ≈ (u_i(x+Δx_j) - u_i(x-Δx_j)) / (2 * spacing_j)
+    # Use torch.gradient for accurate gradient computation
+    # gradient returns [B, 3, spatial_dims] for each spatial dimension
 
-    # Gradients for each component of displacement
-    # du/dD
-    du0_dd = (flow[:, 0, 2:, 1:-1, 1:-1] - flow[:, 0, :-2, 1:-1, 1:-1]) / (2 * spacing[0])
-    du0_dh = (flow[:, 0, 1:-1, 2:, 1:-1] - flow[:, 0, 1:-1, :-2, 1:-1]) / (2 * spacing[1])
-    du0_dw = (flow[:, 0, 1:-1, 1:-1, 2:] - flow[:, 0, 1:-1, 1:-1, :-2]) / (2 * spacing[2])
+    # Compute gradients along each dimension using torch.gradient
+    # Flow channel 0 = x displacement (W), channel 1 = y displacement (H), channel 2 = z displacement (D)
 
-    du1_dd = (flow[:, 1, 2:, 1:-1, 1:-1] - flow[:, 1, :-2, 1:-1, 1:-1]) / (2 * spacing[0])
-    du1_dh = (flow[:, 1, 1:-1, 2:, 1:-1] - flow[:, 1, 1:-1, :-2, 1:-1]) / (2 * spacing[1])
-    du1_dw = (flow[:, 1, 1:-1, 1:-1, 2:] - flow[:, 1, 1:-1, 1:-1, :-2]) / (2 * spacing[2])
+    # Gradient w.r.t. x (W dimension) - note: x coordinate index in PyTorch is the last spatial index
+    dx0, dx1, dx2 = torch.gradient(flow[:, 0], dim=(2, 3, 4), spacing=(spacing[0], spacing[1], spacing[2]))
+    # dx0 = du_x/dx (wrt D), dx1 = du_x/dy (wrt H), dx2 = du_x/dz (wrt W)
 
-    du2_dd = (flow[:, 2, 2:, 1:-1, 1:-1] - flow[:, 2, :-2, 1:-1, 1:-1]) / (2 * spacing[0])
-    du2_dh = (flow[:, 2, 1:-1, 2:, 1:-1] - flow[:, 2, 1:-1, :-2, 1:-1]) / (2 * spacing[1])
-    du2_dw = (flow[:, 2, 1:-1, 1:-1, 2:] - flow[:, 2, 1:-1, 1:-1, :-2]) / (2 * spacing[2])
+    dy0, dy1, dy2 = torch.gradient(flow[:, 1], dim=(2, 3, 4), spacing=(spacing[0], spacing[1], spacing[2]))
+    # dy0 = du_y/dx (wrt D), dy1 = du_y/dy (wrt H), dy2 = du_y/dz (wrt W)
 
-    # Jacobian: J = I + ∂u/∂x
-    # det(J) = (1 + du0_d0) * ((1 + du1_d1) * (1 + du2_d2) - du1_d2 * du2_d1)
-    #          - (du0_d1) * (du1_d0 * (1 + du2_d2) - du1_d2 * du2_d0)
-    #          + (du0_d2) * (du1_d0 * du2_d1 - (1 + du1_d1) * du2_d0)
+    dz0, dz1, dz2 = torch.gradient(flow[:, 2], dim=(2, 3, 4), spacing=(spacing[0], spacing[1], spacing[2]))
+    # dz0 = du_z/dx (wrt D), dz1 = du_z/dy (wrt H), dz2 = du_z/dz (wrt W)
+
+    # Jacobian matrix J for each spatial location:
+    # J[i,j] = ∂φ_i / ∂x_j = δ_ij + ∂u_i / ∂x_j
+    #
+    # For 3D: J = [[1+du_x/dx, du_x/dy, du_x/dz],
+    #              [du_y/dx, 1+du_y/dy, du_y/dz],
+    #              [du_z/dx, du_z/dy, 1+du_z/dz]]
+    #
+    # Where x=W, y=H, z=D in tensor indexing
+
+    # Compute determinant: det(J) = (1+dx0)*((1+dy1)*(1+dz2) - dy2*dz1)
+    #                          - dx1*(dy0*(1+dz2) - dy2*dz0)
+    #                          + dx2*(dy0*dz1 - (1+dy1)*dz0)
 
     det = (
-        (1 + du0_dd) * ((1 + du1_dh) * (1 + du2_dw) - du1_dw * du2_dh)
-        - du0_dh * (du1_dd * (1 + du2_dw) - du1_dw * du2_dd)
-        + du0_dw * (du1_dd * du2_dh - (1 + du1_dh) * du2_dd)
+        (1 + dx0) * ((1 + dy1) * (1 + dz2) - dy2 * dz1)
+        - dx1 * (dy0 * (1 + dz2) - dy2 * dz0)
+        + dx2 * (dy0 * dz1 - (1 + dy1) * dz0)
     )
 
     return det
+
+
+def compute_jacobian_penalty(
+    flow: Tensor,
+    spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+) -> Tensor:
+    """
+    Compute Jacobian determinant penalty to prevent folding.
+
+    Penalizes negative determinants which indicate folding/invalid deformations.
+
+    Args:
+        flow: Deformation field [B, 3, D, H, W]
+        spacing: Voxel spacing for gradient computation
+
+    Returns:
+        Scalar penalty loss
+    """
+    det = compute_determinant_jacobian(flow, spacing)
+
+    # Penalize negative determinants (folding regions)
+    # L_jac = mean(max(0, -det(J))^2)
+    folding_penalty = torch.clamp(-det, min=0)
+    loss = torch.mean(folding_penalty ** 2)
+
+    return loss

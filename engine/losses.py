@@ -4,7 +4,7 @@ Loss functions for ADynamics training.
 Implements VAE losses (reconstruction + KL) and CFM-related losses.
 """
 
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -36,21 +36,36 @@ def vae_reconstruction_loss(
         raise ValueError(f"Unknown loss_type: {loss_type}. Use 'l1' or 'l2'.")
 
 
-def vae_kl_loss(mu: Tensor, logvar: Tensor) -> Tensor:
+def vae_kl_loss(
+    mu: Tensor,
+    logvar: Tensor,
+    reduction: str = "mean",
+) -> Tensor:
     """
     Compute KL divergence loss for VAE latent regularization.
 
     KL divergence between N(mu, sigma) and N(0, 1):
-        KL = -0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
+        KL = -0.5 * mean(1 + log(sigma^2) - mu^2 - sigma^2)
+
+    Uses mean instead of sum to prevent overflow in FP16 mixed precision training
+    and to produce stable, scale-invariant loss values.
 
     Args:
         mu: Mean of latent distribution of shape [B, C, D, H, W]
         logvar: Log variance of latent distribution of shape [B, C, D, H, W]
+        reduction: Reduction method. "mean" (default) recommended for stability.
 
     Returns:
         Scalar KL divergence loss
     """
-    kl_div = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+    if reduction == "mean":
+        kl_div = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+    elif reduction == "sum":
+        kl_div = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+    elif reduction == "none":
+        kl_div = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+    else:
+        raise ValueError(f"Unknown reduction: {reduction}. Use 'mean', 'sum', or 'none'.")
     return kl_div
 
 
@@ -81,13 +96,9 @@ def total_vae_loss(
         Scalar total VAE loss
     """
     recon_loss = vae_reconstruction_loss(recon, target, loss_type=recon_loss_type)
-    kl_loss = vae_kl_loss(mu, logvar)
+    kl_loss = vae_kl_loss(mu, logvar, reduction="mean")
 
-    # Normalize KL by number of elements in latent for stable training
-    num_latent_elements = mu.numel()
-    kl_loss_normalized = kl_loss / num_latent_elements
-
-    total_loss = recon_loss + kl_weight * kl_loss_normalized
+    total_loss = recon_loss + kl_weight * kl_loss
     return total_loss
 
 
@@ -107,23 +118,26 @@ def cfm_loss(
 
     where z_t = (1-t)*z0 + t*z1 (linear interpolation in latent space)
 
+    Note on time parameter t:
+        This implementation uses the Independent CFM formulation where the
+        target velocity is constant (z1 - z0) independent of t. This assumes
+        a constant velocity field for optimal transport between z0 and z1.
+        The t parameter is accepted for API compatibility but is not used
+        in the current formulation.
+
     This is used in Stage 3 to train the vector field network.
 
     Args:
         v_pred: Predicted velocity field of shape [B, C, D, H, W]
         z0: Source latent (NC group) of shape [B, C, D, H, W]
         z1: Target latent (AD group) of shape [B, C, D, H, W]
-        t: Time interpolation values of shape [B, 1]. If None, uses t~U(0,1)
+        t: Time interpolation values of shape [B, 1]. Currently unused.
 
     Returns:
         Scalar CFM loss
     """
-    # Target velocity is the difference between target and source
     target_v = z1 - z0
-
-    # Compute MSE between predicted and target velocity
     loss = F.mse_loss(v_pred, target_v)
-
     return loss
 
 
@@ -146,14 +160,8 @@ def deformation_smooth_loss(
     Returns:
         Scalar smoothness loss
     """
-    # Compute spatial gradients using finite differences
-    # Flow shape: [B, 3, D, H, W] - 3 channels for x, y, z displacements
-
-    # Gradient in D dimension (depth)
     grad_d = flow[:, :, 1:, :, :] - flow[:, :, :-1, :, :]
-    # Gradient in H dimension (height)
     grad_h = flow[:, :, :, 1:, :] - flow[:, :, :, :-1, :]
-    # Gradient in W dimension (width)
     grad_w = flow[:, :, :, :, 1:] - flow[:, :, :, :, :-1]
 
     if penalty_type == "l1":
@@ -162,7 +170,7 @@ def deformation_smooth_loss(
             + torch.mean(torch.abs(grad_h))
             + torch.mean(torch.abs(grad_w))
         )
-    else:  # l2
+    else:
         loss = (
             torch.mean(grad_d**2)
             + torch.mean(grad_h**2)
@@ -191,7 +199,6 @@ def dice_loss(
     Returns:
         Scalar Dice loss
     """
-    # Flatten predictions and targets
     pred_flat = pred.view(-1)
     target_flat = target.view(-1)
 
@@ -241,31 +248,25 @@ class GradientSmoothingLoss(nn.Module):
         Returns:
             Scalar smoothing loss
         """
-        # flow shape: [B, 3, D, H, W]
+        # Compute first-order gradients using forward differences
+        # grad[d,h,w] = flow[d+1,h,w] - flow[d,h,w] etc.
+        # This is consistent and avoids the unused central difference dead code
 
-        # Compute gradients using central differences
-        # For interior points
-        grad_d = flow[:, :, 2:, 1:-1, 1:-1] - flow[:, :, :-2, 1:-1, 1:-1]
-        grad_h = flow[:, :, 1:-1, 2:, 1:-1] - flow[:, :, 1:-1, :-2, 1:-1]
-        grad_w = flow[:, :, 1:-1, 1:-1, 2:] - flow[:, :, 1:-1, 1:-1, :-2]
-
-        # Compute gradient norms for each displacement component
-        # D dimension gradient
-        grad_d_disp = flow[:, :, 1:, :, :] - flow[:, :, :-1, :, :]
-        grad_h_disp = flow[:, :, :, 1:, :] - flow[:, :, :, :-1, :]
-        grad_w_disp = flow[:, :, :, :, 1:] - flow[:, :, :, :, :-1]
+        grad_d = flow[:, :, 1:, :, :] - flow[:, :, :-1, :, :]
+        grad_h = flow[:, :, :, 1:, :] - flow[:, :, :, :-1, :]
+        grad_w = flow[:, :, :, :, 1:] - flow[:, :, :, :, :-1]
 
         if self.penalty_type == "l1":
             loss = (
-                torch.mean(torch.abs(grad_d_disp))
-                + torch.mean(torch.abs(grad_h_disp))
-                + torch.mean(torch.abs(grad_w_disp))
+                torch.mean(torch.abs(grad_d))
+                + torch.mean(torch.abs(grad_h))
+                + torch.mean(torch.abs(grad_w))
             )
-        else:  # l2
+        else:
             loss = (
-                torch.mean(grad_d_disp**2)
-                + torch.mean(grad_h_disp**2)
-                + torch.mean(grad_w_disp**2)
+                torch.mean(grad_d**2)
+                + torch.mean(grad_h**2)
+                + torch.mean(grad_w**2)
             )
 
         return loss
@@ -283,7 +284,7 @@ class NegativeJacobianPenalty(nn.Module):
     For 3D: det(J) should be > 0 for all voxels.
 
     This loss penalizes det(J) < 0 regions:
-        L_jac = max(0, -det(J))
+        L_jac = mean(max(0, -det(J))^2)
 
     This is CRITICAL for medical imaging applications to ensure
     anatomically plausible deformations.
@@ -305,7 +306,8 @@ class NegativeJacobianPenalty(nn.Module):
     def compute_jacobian_determinant(
         self,
         flow: Tensor,
-        spacing: tuple = (1.0, 1.0, 1.0),
+        spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+        is_normalized: bool = True,
     ) -> Tensor:
         """
         Compute Jacobian determinant for each voxel in the deformation field.
@@ -318,46 +320,41 @@ class NegativeJacobianPenalty(nn.Module):
                 flow[:, 0] = displacement in D dimension
                 flow[:, 1] = displacement in H dimension
                 flow[:, 2] = displacement in W dimension
-            spacing: Voxel spacing (dx, dy, dz) for gradient normalization
+            spacing: Physical voxel spacing (dx, dy, dz) in mm
+            is_normalized: If True, spacing is in grid units (2/size) for
+                          normalized flow [-1, 1]. If False, uses physical spacing.
 
         Returns:
             Jacobian determinant of shape [B, D-2, H-2, W-2]
         """
-        B, _, D, H, W = flow.shape
-        # shape: [B, 3, D, H, W]
+        # Compute gradient step size based on normalization
+        if is_normalized:
+            # Flow is in normalized coords [-1, 1], gradient step is 2/size
+            D, H, W = flow.shape[2], flow.shape[3], flow.shape[4]
+            step_d = 2.0 / max(D - 1, 1)
+            step_h = 2.0 / max(H - 1, 1)
+            step_w = 2.0 / max(W - 1, 1)
+        else:
+            # Physical spacing
+            step_d, step_h, step_w = spacing
 
-        # Compute gradients of the deformation field
-        # ∂flow_x/∂d, ∂flow_x/∂h, ∂flow_x/∂w
-        # Using central differences
+        # Central differences for gradient computation
+        dfx_dd = (flow[:, 0, 2:, 1:-1, 1:-1] - flow[:, 0, :-2, 1:-1, 1:-1]) / (2 * step_d)
+        dfx_dh = (flow[:, 0, 1:-1, 2:, 1:-1] - flow[:, 0, 1:-1, :-2, 1:-1]) / (2 * step_h)
+        dfx_dw = (flow[:, 0, 1:-1, 1:-1, 2:] - flow[:, 0, 1:-1, 1:-1, :-2]) / (2 * step_w)
 
-        # Grid for computing gradients
-        device = flow.device
+        dfy_dd = (flow[:, 1, 2:, 1:-1, 1:-1] - flow[:, 1, :-2, 1:-1, 1:-1]) / (2 * step_d)
+        dfy_dh = (flow[:, 1, 1:-1, 2:, 1:-1] - flow[:, 1, 1:-1, :-2, 1:-1]) / (2 * step_h)
+        dfy_dw = (flow[:, 1, 1:-1, 1:-1, 2:] - flow[:, 1, 1:-1, 1:-1, :-2]) / (2 * step_w)
 
-        # Compute identity Jacobian (due to x + flow)
-        # J = I + ∂flow/∂x
+        dfz_dd = (flow[:, 2, 2:, 1:-1, 1:-1] - flow[:, 2, :-2, 1:-1, 1:-1]) / (2 * step_d)
+        dfz_dh = (flow[:, 2, 1:-1, 2:, 1:-1] - flow[:, 2, 1:-1, :-2, 1:-1]) / (2 * step_h)
+        dfz_dw = (flow[:, 2, 1:-1, 1:-1, 2:] - flow[:, 2, 1:-1, 1:-1, :-2]) / (2 * step_w)
 
-        # Partial derivatives of flow_x (channel 0)
-        dfx_dd = (flow[:, 0, 2:, 1:-1, 1:-1] - flow[:, 0, :-2, 1:-1, 1:-1]) / (2 * spacing[0])
-        dfx_dh = (flow[:, 0, 1:-1, 2:, 1:-1] - flow[:, 0, 1:-1, :-2, 1:-1]) / (2 * spacing[1])
-        dfx_dw = (flow[:, 0, 1:-1, 1:-1, 2:] - flow[:, 0, 1:-1, 1:-1, :-2]) / (2 * spacing[2])
-
-        # Partial derivatives of flow_y (channel 1)
-        dfy_dd = (flow[:, 1, 2:, 1:-1, 1:-1] - flow[:, 1, :-2, 1:-1, 1:-1]) / (2 * spacing[0])
-        dfy_dh = (flow[:, 1, 1:-1, 2:, 1:-1] - flow[:, 1, 1:-1, :-2, 1:-1]) / (2 * spacing[1])
-        dfy_dw = (flow[:, 1, 1:-1, 1:-1, 2:] - flow[:, 1, 1:-1, 1:-1, :-2]) / (2 * spacing[2])
-
-        # Partial derivatives of flow_z (channel 2)
-        dfz_dd = (flow[:, 2, 2:, 1:-1, 1:-1] - flow[:, 2, :-2, 1:-1, 1:-1]) / (2 * spacing[0])
-        dfz_dh = (flow[:, 2, 1:-1, 2:, 1:-1] - flow[:, 2, 1:-1, :-2, 1:-1]) / (2 * spacing[1])
-        dfz_dw = (flow[:, 2, 1:-1, 1:-1, 2:] - flow[:, 2, 1:-1, 1:-1, :-2]) / (2 * spacing[2])
-
-        # Jacobian determinant: det(I + J_flow)
-        # J_full[i,j] = δij + ∂flow_i/∂x_j
-        # det = (1 + dfx_dx) * ((1 + dfy_dy) * (1 + dfz_dz) - dfy_dz * dfz_dy)
-        #        - dfx_dy * (dfy_dx * (1 + dfz_dz) - dfy_dz * dfz_dx)
-        #        + dfx_dz * (dfy_dx * dfz_dy - (1 + dfy_dy) * dfz_dx)
-
-        # Compute determinant
+        # Jacobian: J = I + ∂flow/∂x
+        # det(J) = (1 + dfx_dx) * ((1 + dfy_dy) * (1 + dfz_dz) - dfy_dz * dfz_dy)
+        #          - dfx_dy * (dfy_dx * (1 + dfz_dz) - dfy_dz * dfz_dx)
+        #          + dfx_dz * (dfy_dx * dfz_dy - (1 + dfy_dy) * dfz_dx)
         det = (
             (1 + dfx_dd) * ((1 + dfy_dh) * (1 + dfz_dw) - dfy_dw * dfz_dh)
             - dfx_dh * (dfy_dd * (1 + dfz_dw) - dfy_dw * dfz_dd)
@@ -366,31 +363,33 @@ class NegativeJacobianPenalty(nn.Module):
 
         return det
 
-    def forward(self, flow: Tensor, spacing: tuple = (1.0, 1.0, 1.0)) -> Tensor:
+    def forward(
+        self,
+        flow: Tensor,
+        spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+        is_normalized: bool = True,
+    ) -> Tensor:
         """
         Compute negative Jacobian penalty loss.
 
         Penalizes regions where det(J) <= 0.
 
-        L = mean(max(0, -det(J)))
+        L = mean(max(0, -det(J))^2)
 
         Args:
             flow: Deformation field of shape [B, 3, D, H, W]
-            spacing: Voxel spacing for gradient computation
+            spacing: Voxel spacing for gradient computation (used when is_normalized=False)
+            is_normalized: If True, flow is in normalized coords [-1, 1] and spacing
+                          is ignored; step size is computed from grid dimensions.
 
         Returns:
-            Scalar loss (average negative log-likelihood of valid Jacobians)
+            Scalar loss
         """
-        det = self.compute_jacobian_determinant(flow, spacing)
-        # det shape: [B, D-2, H-2, W-2]
+        det = self.compute_jacobian_determinant(flow, spacing, is_normalized)
 
-        # Penalize negative determinants
-        # Using softplus-like penalty: max(0, -det)^2 for smoother gradients
         negative_det = torch.clamp(-det, min=0.0)
         loss = torch.mean(negative_det**2)
 
-        # Also add a small penalty for determinants approaching zero
-        # This helps push all determinants positive
         near_zero_penalty = torch.clamp(self.epsilon - det, min=0.0)
         loss = loss + 0.1 * torch.mean(near_zero_penalty**2)
 
@@ -404,7 +403,8 @@ def total_deformation_loss(
     jacobian_weight: float = 0.01,
     similarity_target: Optional[Tensor] = None,
     similarity_pred: Optional[Tensor] = None,
-    spacing: tuple = (1.0, 1.0, 1.0),
+    spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+    is_normalized: bool = True,
 ) -> Tensor:
     """
     Compute total deformation loss combining multiple terms.
@@ -419,25 +419,23 @@ def total_deformation_loss(
         similarity_target: Target image for similarity [B, 1, D, H, W]
         similarity_pred: Predicted/warped image [B, 1, D, H, W]
         spacing: Voxel spacing for Jacobian computation
+        is_normalized: If True, flow is in normalized coords [-1, 1]
 
     Returns:
         Scalar total deformation loss
     """
     total_loss = 0.0
 
-    # Similarity loss
     if similarity_target is not None and similarity_pred is not None and sim_weight > 0:
         sim_loss = F.l1_loss(similarity_pred, similarity_target)
         total_loss = total_loss + sim_weight * sim_loss
 
-    # Smoothing loss
     if smooth_weight > 0:
         smooth_loss = GradientSmoothingLoss(penalty_type="l2")(flow)
         total_loss = total_loss + smooth_weight * smooth_loss
 
-    # Jacobian penalty
     if jacobian_weight > 0:
-        jac_loss = NegativeJacobianPenalty()(flow, spacing)
+        jac_loss = NegativeJacobianPenalty()(flow, spacing, is_normalized)
         total_loss = total_loss + jacobian_weight * jac_loss
 
     return total_loss

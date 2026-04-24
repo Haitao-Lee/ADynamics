@@ -2,23 +2,23 @@
 CFM Trainer for Stage 3 of ADynamics.
 
 Handles training the Velocity Field Network using Conditional Flow Matching loss.
-The trainer samples NC and AD latent pairs, interpolates them, and trains
-the network to predict the optimal transport velocity field.
+Samples NC and AD latent pairs from pre-built global pools to ensure pure
+NC->AD correspondence in every training step.
 """
 
 import os
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch import Tensor
+from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 
-from models.vector_field import VelocityFieldNet, cfm_velocity_loss
+from engine.losses import cfm_loss
+from models.vector_field import VelocityFieldNet
 
 
 class CFMTrainer:
@@ -26,18 +26,21 @@ class CFMTrainer:
     Trainer class for Conditional Flow Matching (Stage 3).
 
     Handles:
-        - Sampling z0 (NC) and z1 (AD) latent pairs
+        - Pre-pooled NC/AD latent sampling from global pools
         - Time sampling t ~ U(0, 1)
-        - Computing linear interpolation z_t = (1-t)*z0 + t*z1
-        - Computing CFM loss and training the velocity field network
+        - Linear interpolation z_t = (1-t)*z0 + t*z1
+        - CFM loss and velocity field network training
+        - AMP for memory-efficient HD training
         - Checkpointing and validation
 
     Attributes:
         model: The VelocityFieldNet being trained
         optimizer: AdamW optimizer
         scheduler: Learning rate scheduler
+        scaler: GradScaler for AMP training
         device: Device to train on (cuda/cpu)
         config: Training configuration dictionary
+        velocity_loss_weight: Weight for velocity loss
     """
 
     def __init__(
@@ -57,7 +60,8 @@ class CFMTrainer:
             device: Device to train on ("cuda" or "cpu")
             config: Configuration dictionary containing:
                 - ode_steps: Number of ODE integration steps
-                - velocity_loss_weight: Weight for velocity loss
+                - velocity_loss_weight: Weight for velocity loss (default: 1.0)
+                - use_amp: Enable AMP training (default: True)
             scheduler: Optional learning rate scheduler
         """
         self.model = model
@@ -66,61 +70,111 @@ class CFMTrainer:
         self.device = torch.device(device)
         self.config = config
 
+        # Loss weight with default value
+        self.velocity_loss_weight = config.get("velocity_loss_weight", 1.0)
+
+        # AMP configuration: only create scaler when use_amp is True
+        self.use_amp = config.get("use_amp", True)
+        self.scaler = GradScaler('cuda') if self.use_amp else None
+
         # Move model to device
         self.model.to(self.device)
+
+        # Global pools for NC and AD latents (populated before training)
+        self.nc_latent_pool: List[Tensor] = []
+        self.ad_latent_pool: List[Tensor] = []
+        self.nc_condition_pool: List[Tensor] = []
+        self.ad_condition_pool: List[Tensor] = []
 
         # Training state
         self.current_epoch = 0
         self.best_val_loss = float("inf")
 
-    def sample_latent_pairs(
+    def build_latent_pools(
         self,
-        z_all: Tensor,
-        labels: Tensor,
-        batch_size: int,
-        num_nc: Optional[int] = None,
-        num_ad: Optional[int] = None,
-    ) -> Tuple[Tensor, Tensor]:
+        latent_loader: DataLoader,
+    ) -> None:
         """
-        Sample NC and AD latent pairs for CFM training.
+        Pre-build global NC and AD latent pools before training.
 
-        Randomly samples z0 (NC) and z1 (AD) from the latent batch.
+        This ensures every sampled pair is a true NC-AD pair, eliminating
+        the risk of fallback sampling that would break CFM physics.
 
         Args:
-            z_all: All latents in batch [N, C, D, H, W]
-            labels: Disease labels [N] (0=NC, 1=SCD, 2=MCI, 3=AD)
+            latent_loader: DataLoader yielding (z, labels, conditions) tuples
+        """
+        self.nc_latent_pool = []
+        self.ad_latent_pool = []
+        self.nc_condition_pool = []
+        self.ad_condition_pool = []
+
+        self.model.eval()
+        with torch.no_grad():
+            for batch in latent_loader:
+                z = batch["latent"]
+                labels = batch["label"]
+                c = batch.get("condition", None)
+
+                # NC: label == 0
+                nc_mask = labels == 0
+                for i, is_nc in enumerate(nc_mask):
+                    if is_nc:
+                        self.nc_latent_pool.append(z[i])
+                        if c is not None:
+                            self.nc_condition_pool.append(c[i])
+
+                # AD: label == 3
+                ad_mask = labels == 3
+                for i, is_ad in enumerate(ad_mask):
+                    if is_ad:
+                        self.ad_latent_pool.append(z[i])
+                        if c is not None:
+                            self.ad_condition_pool.append(c[i])
+
+        # Move to device for faster sampling during training
+        self.nc_latent_pool = [z.to(self.device) for z in self.nc_latent_pool]
+        self.ad_latent_pool = [z.to(self.device) for z in self.ad_latent_pool]
+        self.nc_condition_pool = [c.to(self.device) for c in self.nc_condition_pool]
+        self.ad_condition_pool = [c.to(self.device) for c in self.ad_condition_pool]
+
+        print(f"Latent pools built: {len(self.nc_latent_pool)} NC, {len(self.ad_latent_pool)} AD")
+
+    def sample_latent_pairs(
+        self,
+        batch_size: int,
+    ) -> Tuple[Tensor, Tensor, Optional[Tensor], Optional[Tensor]]:
+        """
+        Sample NC and AD latent pairs from pre-built global pools.
+
+        Args:
             batch_size: Number of pairs to sample
-            num_nc: Optional number of NC samples (default: batch_size // 2)
-            num_ad: Optional number of AD samples (default: batch_size // 2)
 
         Returns:
-            Tuple of (z0 [B, C, D, H, W], z1 [B, C, D, H, W])
+            Tuple of (z0, z1, c0, c1) where:
+                - z0: NC latents [B, C, D, H, W]
+                - z1: AD latents [B, C, D, H, W]
+                - c0: NC conditions [B, num_conditions] or None
+                - c1: AD conditions [B, num_conditions] or None
         """
-        # Get NC indices (label == 0)
-        nc_mask = labels == 0
-        # Get AD indices (label == 3)
-        ad_mask = labels == 3
+        if len(self.nc_latent_pool) == 0 or len(self.ad_latent_pool) == 0:
+            raise RuntimeError(
+                "Latent pools are empty. Call build_latent_pools() before training."
+            )
 
-        nc_indices = torch.where(nc_mask)[0]
-        ad_indices = torch.where(ad_mask)[0]
+        # Random sampling from pools
+        nc_indices = torch.randint(0, len(self.nc_latent_pool), (batch_size,))
+        ad_indices = torch.randint(0, len(self.ad_latent_pool), (batch_size,))
 
-        # Fallback if not enough NC/AD samples - use any samples
-        if len(nc_indices) < 2:
-            nc_indices = torch.arange(len(labels))
-        if len(ad_indices) < 2:
-            ad_indices = torch.arange(len(labels))
+        z0 = torch.stack([self.nc_latent_pool[i] for i in nc_indices])
+        z1 = torch.stack([self.ad_latent_pool[i] for i in ad_indices])
 
-        # Sample pairs
-        num_nc = num_nc or (batch_size // 2)
-        num_ad = num_ad or (batch_size // 2)
+        c0 = None
+        c1 = None
+        if self.nc_condition_pool and self.ad_condition_pool:
+            c0 = torch.stack([self.nc_condition_pool[i] for i in nc_indices])
+            c1 = torch.stack([self.ad_condition_pool[i] for i in ad_indices])
 
-        nc_samples = nc_indices[torch.randperm(len(nc_indices))[:num_nc]]
-        ad_samples = ad_indices[torch.randperm(len(ad_indices))[:num_ad]]
-
-        z0 = z_all[nc_samples].to(self.device)
-        z1 = z_all[ad_samples].to(self.device)
-
-        return z0, z1
+        return z0, z1, c0, c1
 
     def sample_time(self, batch_size: int) -> Tensor:
         """
@@ -152,9 +206,7 @@ class CFMTrainer:
         Returns:
             Interpolated latents [B, C, D, H, W]
         """
-        # Reshape t for broadcasting: [B] -> [B, 1, 1, 1, 1]
         t = t.view(-1, 1, 1, 1, 1)
-
         z_t = (1 - t) * z0 + t * z1
         return z_t
 
@@ -162,10 +214,11 @@ class CFMTrainer:
         self,
         z0: Tensor,
         z1: Tensor,
-        c: Optional[Tensor] = None,
+        c0: Optional[Tensor] = None,
+        c1: Optional[Tensor] = None,
     ) -> Dict[str, Tensor]:
         """
-        Perform one CFM training step.
+        Perform one CFM training step with AMP.
 
         1. Sample t ~ U(0, 1)
         2. Compute z_t = (1-t)*z0 + t*z1
@@ -175,46 +228,35 @@ class CFMTrainer:
         Args:
             z0: Source latents (NC) [B, C, D, H, W]
             z1: Target latents (AD) [B, C, D, H, W]
-            c: Optional clinical conditions [B, num_conditions]
+            c0: Optional NC conditions [B, num_conditions]
+            c1: Optional AD conditions [B, num_conditions]
 
         Returns:
             Dictionary of losses
         """
         batch_size = z0.shape[0]
 
-        # Sample time
         t = self.sample_time(batch_size)
-        # shape: [B]
 
-        # Interpolate latents
+        # Use NC conditions for conditioning (or None if unavailable)
+        c = c0
+
         z_t = self.interpolate_latents(z0, z1, t)
-        # shape: [B, C, D, H, W]
 
-        # Predict velocity
         v_pred = self.model(z_t, t, c)
-        # shape: [B, C, D, H, W]
 
-        # Compute CFM loss
-        loss = cfm_velocity_loss(v_pred, z0, z1)
+        loss = cfm_loss(v_pred, z0, z1)
 
-        # Total loss
-        velocity_weight = self.config.get("velocity_loss_weight", 1.0)
-        total_loss = velocity_weight * loss
+        total_loss = self.velocity_loss_weight * loss
 
         return {
             "loss": total_loss,
             "velocity_loss": loss,
         }
 
-    def train_epoch(
-        self,
-        latent_loader: DataLoader,
-    ) -> Dict[str, float]:
+    def train_epoch(self) -> Dict[str, float]:
         """
-        Run one training epoch.
-
-        Args:
-            latent_loader: DataLoader yielding (z, labels, conditions) tuples
+        Run one training epoch with optional AMP.
 
         Returns:
             Dictionary of average training metrics
@@ -225,40 +267,38 @@ class CFMTrainer:
         total_velocity_loss = 0.0
         num_batches = 0
 
-        for batch in latent_loader:
-            # Get latent and labels
-            z = batch["latent"].to(self.device)
-            # shape: [B, C, D, H, W]
-            labels = batch["label"].to(self.device)
-            # shape: [B]
+        # Get batch size from config or use first pool size
+        batch_size = self.config.get("batch_size", 8)
 
-            # Optional conditions (e.g., age)
-            c = None
-            if "condition" in batch:
-                c = batch["condition"].to(self.device)
-                # shape: [B, num_conditions]
+        # Determine number of batches based on pool sizes
+        num_pairs = min(len(self.nc_latent_pool), len(self.ad_latent_pool))
+        num_batches_total = max(1, num_pairs // batch_size)
 
-            # Sample NC and AD pairs from the batch
-            z0, z1 = self.sample_latent_pairs(
-                z, labels, batch_size=z.shape[0]
-            )
+        for _ in range(num_batches_total):
+            z0, z1, c0, c1 = self.sample_latent_pairs(batch_size)
 
-            # Training step
-            losses = self.train_step(z0, z1, c)
-
-            # Backward pass
             self.optimizer.zero_grad()
-            losses["loss"].backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.optimizer.step()
 
-            # Accumulate
+            with autocast('cuda', enabled=self.use_amp):
+                losses = self.train_step(z0, z1, c0, c1)
+
+            if self.use_amp:
+                self.scaler.scale(losses["loss"]).backward()
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                losses["loss"].backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+
             total_loss += losses["loss"].item()
             total_velocity_loss += losses["velocity_loss"].item()
             num_batches += 1
 
-        avg_loss = total_loss / num_batches
-        avg_velocity_loss = total_velocity_loss / num_batches
+        avg_loss = total_loss / max(num_batches, 1)
+        avg_velocity_loss = total_velocity_loss / max(num_batches, 1)
 
         return {
             "loss": avg_loss,
@@ -266,15 +306,9 @@ class CFMTrainer:
         }
 
     @torch.no_grad()
-    def validate_epoch(
-        self,
-        latent_loader: DataLoader,
-    ) -> Dict[str, float]:
+    def validate_epoch(self) -> Dict[str, float]:
         """
-        Run one validation epoch.
-
-        Args:
-            latent_loader: DataLoader yielding (z, labels, conditions) tuples
+        Run one validation epoch with optional AMP.
 
         Returns:
             Dictionary of average validation metrics
@@ -285,35 +319,72 @@ class CFMTrainer:
         total_velocity_loss = 0.0
         num_batches = 0
 
-        for batch in latent_loader:
-            # Get latent and labels
-            z = batch["latent"].to(self.device)
-            labels = batch["label"].to(self.device)
+        batch_size = self.config.get("batch_size", 8)
+        num_pairs = min(len(self.nc_latent_pool), len(self.ad_latent_pool))
+        num_batches_total = max(1, num_pairs // batch_size)
 
-            # Optional conditions
-            c = None
-            if "condition" in batch:
-                c = batch["condition"].to(self.device)
+        for _ in range(num_batches_total):
+            z0, z1, c0, c1 = self.sample_latent_pairs(batch_size)
 
-            # Sample NC and AD pairs
-            z0, z1 = self.sample_latent_pairs(
-                z, labels, batch_size=z.shape[0]
-            )
-
-            # Training step (without backward)
-            losses = self.train_step(z0, z1, c)
+            with autocast('cuda', enabled=self.use_amp):
+                losses = self.train_step(z0, z1, c0, c1)
 
             total_loss += losses["loss"].item()
             total_velocity_loss += losses["velocity_loss"].item()
             num_batches += 1
 
-        avg_loss = total_loss / num_batches
-        avg_velocity_loss = total_velocity_loss / num_batches
+        avg_loss = total_loss / max(num_batches, 1)
+        avg_velocity_loss = total_velocity_loss / max(num_batches, 1)
 
         return {
             "loss": avg_loss,
             "velocity_loss": avg_velocity_loss,
         }
+
+    def integrate_ode(
+        self,
+        z0: Tensor,
+        c: Optional[Tensor] = None,
+        steps: int = 20,
+        method: str = "euler",
+    ) -> Tuple[Tensor, List[Tensor]]:
+        """
+        Integrate the learned velocity field to evolve latent from t=0 to t=1.
+
+        Currently supports Euler integration. For higher accuracy, consider
+        using torchdiffeq library with methods like 'dopri5' (Dormand-Prince)
+        or 'rk4' (Runge-Kutta 4th order).
+
+        Args:
+            z0: Initial latent [B, C, D, H, W]
+            c: Optional clinical conditions [B, num_conditions]
+            steps: Number of integration steps (for Euler)
+            method: Integration method ('euler' or 'dopri5' if torchdiffeq available)
+
+        Returns:
+            Tuple of (z_final, trajectory) where trajectory is list of z_t
+        """
+        self.model.eval()
+
+        z_t = z0.clone()
+        dt = 1.0 / steps
+        trajectory = [z_t.clone()]
+
+        with torch.no_grad():
+            if method == "euler":
+                for i in range(steps):
+                    t = torch.full((z0.shape[0],), i * dt, device=z0.device, dtype=z0.dtype)
+                    v_t = self.model(z_t, t, c)
+                    z_t = z_t + v_t * dt
+                    trajectory.append(z_t.clone())
+            else:
+                # Placeholder for torchdiffeq integration
+                # TODO: if method == "dopri5":
+                #   from torchdiffeq import dopri5_deprecated
+                #   ...
+                raise NotImplementedError(f"Integration method '{method}' not implemented. Use 'euler'.")
+
+        return z_t, trajectory
 
     def save_checkpoint(
         self,
@@ -341,7 +412,7 @@ class CFMTrainer:
         if include_scheduler and self.scheduler is not None:
             checkpoint["scheduler_state_dict"] = self.scheduler.state_dict()
 
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        os.makedirs(os.path.dirname(filepath) if os.path.dirname(filepath) else ".", exist_ok=True)
         torch.save(checkpoint, filepath)
 
     def load_checkpoint(self, filepath: str) -> None:
@@ -363,40 +434,6 @@ class CFMTrainer:
         if "scheduler_state_dict" in checkpoint and self.scheduler is not None:
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
 
-    def integrate_ode(
-        self,
-        z0: Tensor,
-        c: Optional[Tensor] = None,
-        steps: int = 20,
-    ) -> Tuple[Tensor, List[Tensor]]:
-        """
-        Euler integration of the learned velocity field.
-
-        Solves: dz/dt = v(z, t) from t=0 to t=1
-
-        Args:
-            z0: Initial latent [B, C, D, H, W]
-            c: Optional clinical conditions [B, num_conditions]
-            steps: Number of integration steps
-
-        Returns:
-            Tuple of (z_final, trajectory) where trajectory is list of z_t
-        """
-        self.model.eval()
-
-        z_t = z0.clone()
-        dt = 1.0 / steps
-        trajectory = [z_t.clone()]
-
-        with torch.no_grad():
-            for i in range(steps):
-                t = torch.full((z0.shape[0],), i * dt, device=z0.device)
-                v_t = self.model(z_t, t, c)
-                z_t = z_t + v_t * dt
-                trajectory.append(z_t.clone())
-
-        return z_t, trajectory
-
     def train(
         self,
         latent_loader_train: DataLoader,
@@ -406,10 +443,10 @@ class CFMTrainer:
         output_dir: str = "./checkpoints",
     ) -> Dict[str, List[float]]:
         """
-        Run full training loop.
+        Run full training loop with KL annealing.
 
         Args:
-            latent_loader_train: Training data loader
+            latent_loader_train: Training data loader (used to build pools)
             latent_loader_val: Validation data loader
             num_epochs: Number of epochs to train
             save_interval: Checkpoint save interval
@@ -418,6 +455,9 @@ class CFMTrainer:
         Returns:
             Training history dictionary
         """
+        # Build global latent pools before training
+        self.build_latent_pools(latent_loader_train)
+
         history = {
             "train_loss": [],
             "train_velocity_loss": [],
@@ -428,20 +468,14 @@ class CFMTrainer:
         for epoch in range(num_epochs):
             self.current_epoch = epoch
 
-            # Training epoch
-            train_metrics = self.train_epoch(latent_loader_train)
+            train_metrics = self.train_epoch()
+            val_metrics = self.validate_epoch()
 
-            # Validation epoch
-            val_metrics = self.validate_epoch(latent_loader_val)
-
-            # Update learning rate
             if self.scheduler is not None:
                 self.scheduler.step()
-                current_lr = self.optimizer.param_groups[0]["lr"]
-            else:
-                current_lr = self.optimizer.param_groups[0]["lr"]
 
-            # Log
+            current_lr = self.optimizer.param_groups[0]["lr"]
+
             print(
                 f"Epoch [{epoch+1}/{num_epochs}] "
                 f"LR: {current_lr:.6f} | "
@@ -449,22 +483,16 @@ class CFMTrainer:
                 f"Val Loss: {val_metrics['loss']:.4f} (vel: {val_metrics['velocity_loss']:.4f})"
             )
 
-            # Record history
             history["train_loss"].append(train_metrics["loss"])
             history["train_velocity_loss"].append(train_metrics["velocity_loss"])
             history["val_loss"].append(val_metrics["loss"])
             history["val_velocity_loss"].append(val_metrics["velocity_loss"])
 
-            # Save checkpoint
             if (epoch + 1) % save_interval == 0:
-                checkpoint_path = os.path.join(
-                    output_dir,
-                    f"cfm_epoch_{epoch+1}.pt",
-                )
+                checkpoint_path = os.path.join(output_dir, f"cfm_epoch_{epoch+1}.pt")
                 self.save_checkpoint(checkpoint_path)
                 print(f"Checkpoint saved to {checkpoint_path}")
 
-            # Save best model
             if val_metrics["loss"] < self.best_val_loss:
                 self.best_val_loss = val_metrics["loss"]
                 best_path = os.path.join(output_dir, "cfm_best.pt")

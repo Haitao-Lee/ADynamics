@@ -4,40 +4,43 @@ ADynamics Stage 2 & 3: Classifier + CFM Training Script
 Combines Stage 2 (Disease Classifier) and Stage 3 (Conditional Flow Matching)
 training in a single script. The script:
 1. Loads pretrained VAE encoder (frozen)
-2. Extracts latent features from MRI data
-3. Trains the Disease Classifier (Stage 2)
+2. Extracts latent features from MRI data using proper MONAI transforms
+3. Trains the Disease Classifier (Stage 2) with AdaptiveAvgPool3d
 4. Trains the Velocity Field Network (Stage 3)
 
+HD Configuration:
+    - Input spatial size: (256, 256, 192)
+    - Latent spatial size: (16, 16, 12)
+    - Uses proper RAS orientation via MONAI transforms
+
 Usage:
-    # Train both stages
     python scripts/train_stage2_cfm.py --config configs/cfm_train.yaml --stage 2
     python scripts/train_stage2_cfm.py --config configs/cfm_train.yaml --stage 3
-
-    # Train with specific VAE checkpoint
     python scripts/train_stage2_cfm.py --vae_checkpoint path/to/vae_best.pt --stage 3
-
-    # Resume training from checkpoint
-    python scripts/train_stage2_cfm.py --resume path/to/checkpoint.pt --stage 3
 """
 
 import argparse
 import os
 import sys
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
-import torch.optim as AdamW
 import yaml
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset
 
-# Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from core_data.dataset import create_dummy_dataset, get_dataloader
+from core_data.dataset import (
+    create_dummy_dataset,
+    get_train_val_test_dataloaders,
+    cleanup_dummy_dataset,
+)
 from core_data.transforms import get_train_transforms, get_val_transforms
 from engine.trainer_cfm import CFMTrainer
 from models.classifier import DiseaseClassifier, classifier_ce_loss, classifier_accuracy
@@ -45,107 +48,10 @@ from models.vae3d import ADynamicsVAE3D
 from models.vector_field import VelocityFieldNet
 
 
-class LatentDataset(Dataset):
-    """
-    Dataset that extracts latents from MRI using a frozen VAE encoder.
-
-    Stores (image_path, label, condition) and extracts latents on-the-fly
-    or caches them for faster training.
-    """
-
-    def __init__(
-        self,
-        data_list: List[Dict[str, Any]],
-        vae_model: nn.Module,
-        transform=None,
-        device: torch.device = torch.device("cpu"),
-        cache_latents: bool = False,
-    ) -> None:
-        """
-        Initialize latent dataset.
-
-        Args:
-            data_list: List of dicts with "image" (path), "label" (int), optionally "condition" (float)
-            vae_model: Frozen VAE model for encoding
-            transform: Optional MONAI transforms for preprocessing
-            device: Device to run VAE encoding
-            cache_latents: Whether to cache latents in memory
-        """
-        self.data_list = data_list
-        self.vae_model = vae_model
-        self.transform = transform
-        self.device = device
-        self.cache_latents = cache_latents
-
-        # Cache for latents
-        if cache_latents:
-            self.latent_cache = [None] * len(data_list)
-
-        # Set VAE to eval mode
-        self.vae_model.eval()
-
-    def __len__(self) -> int:
-        return len(self.data_list)
-
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        """
-        Get a sample.
-
-        Returns:
-            Dictionary with "latent", "label", and optionally "condition"
-        """
-        item = self.data_list[idx]
-
-        # Check cache
-        if self.cache_latents and self.latent_cache[idx] is not None:
-            return self.latent_cache[idx]
-
-        # Load and preprocess image
-        import nibabel as nib
-
-        nii = nib.load(item["image"])
-        image = nii.get_fdata().astype(np.float32)
-        # shape: [D, H, W]
-
-        # Add channel and batch dims
-        image = torch.from_numpy(image).unsqueeze(0).unsqueeze(0)
-        # shape: [1, 1, D, H, W]
-
-        # Apply transforms if provided
-        if self.transform is not None:
-            # For single image
-            image = self.transform({"image": image})["image"]
-
-        # Move to device and encode
-        image = image.to(self.device)
-
-        with torch.no_grad():
-            # Extract latent using VAE encoder
-            mu, _ = self.vae_model.encode(image)
-            # shape: [1, latent_channels, D', H', W']
-
-            # Use mean as latent representation
-            latent = mu[0]  # shape: [latent_channels, D', H', W']
-            label = item["label"]
-
-            # Condition (e.g., normalized age)
-            condition = item.get("condition", None)
-            if condition is not None:
-                condition = torch.tensor([condition], dtype=torch.float32)
-
-        result = {
-            "latent": latent,
-            "label": label,
-        }
-
-        if condition is not None:
-            result["condition"] = condition
-
-        # Cache if enabled
-        if self.cache_latents:
-            self.latent_cache[idx] = result
-
-        return result
+# HD configuration
+HD_SPATIAL_SIZE = (256, 256, 192)
+HD_LATENT_SPATIAL = (16, 16, 12)
+HD_LATENT_CHANNELS = 64
 
 
 class LatentDatasetPrecomputed(Dataset):
@@ -204,11 +110,42 @@ def prepare_data_list_from_directory(
         ├── SCD/
         ├── MCI/
         └── AD/
+
+    If participants.csv exists, reads real age. Otherwise uses random age with warning.
+
+    Args:
+        data_dir: Root directory containing stage subdirectories
+        extensions: File extensions to look for
+
+    Returns:
+        List of data dictionaries with "image", "label", and optionally "condition" (age)
     """
     data_dir = Path(data_dir)
     data_list = []
 
     stage_map = {"NC": 0, "SCD": 1, "MCI": 2, "AD": 3}
+
+    # Check for participants.csv
+    csv_path = data_dir / "participants.csv"
+    use_real_age = False
+    if csv_path.exists():
+        print(f"  Found participants.csv, reading real age data...")
+        try:
+            participants_df = pd.read_csv(csv_path)
+            if "age" in participants_df.columns and "filename" in participants_df.columns:
+                use_real_age = True
+                age_dict = dict(zip(participants_df["filename"], participants_df["age"]))
+            elif "age" in participants_df.columns:
+                # Use row index as filename
+                use_real_age = True
+                age_dict = {}
+                for idx, row in participants_df.iterrows():
+                    age_dict[row.get("filename", f"image_{idx}") if "filename" in participants_df.columns else str(idx)] = row["age"]
+        except Exception as e:
+            warnings.warn(f"  Could not read participants.csv: {e}, using random ages")
+            use_real_age = False
+    else:
+        warnings.warn("  No participants.csv found. Using random ages (NOT for real experiments!)")
 
     for stage_name, stage_label in stage_map.items():
         stage_dir = data_dir / stage_name
@@ -217,8 +154,15 @@ def prepare_data_list_from_directory(
 
         for ext in extensions:
             for mri_file in stage_dir.glob(f"*{ext}"):
-                # Generate dummy condition (normalized age ~70)
-                condition = np.random.normal(70, 10) / 100.0  # Normalized to ~0.7
+                if use_real_age:
+                    filename = mri_file.name
+                    if filename in age_dict:
+                        age = age_dict[filename]
+                        condition = age / 100.0
+                    else:
+                        condition = np.random.normal(70, 10) / 100.0
+                else:
+                    condition = np.random.normal(70, 10) / 100.0
 
                 data_list.append({
                     "image": str(mri_file),
@@ -232,64 +176,81 @@ def prepare_data_list_from_directory(
 def encode_dataset_to_latents(
     data_list: List[Dict[str, Any]],
     vae_model: nn.Module,
-    transform,
+    spatial_size: Tuple[int, int, int],
     device: torch.device,
     batch_size: int = 8,
+    num_workers: int = 4,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """
-    Encode entire dataset to latents using frozen VAE.
+    Encode entire dataset to latents using frozen VAE with proper MONAI transforms.
+
+    Uses DataLoader with multi-threading for efficient batch loading.
+    Ensures RAS orientation and 1mm resampling via get_val_transforms.
 
     Args:
         data_list: List of data dictionaries
         vae_model: Frozen VAE encoder
-        transform: MONAI transforms
+        spatial_size: HD spatial size (256, 256, 192)
         device: Device to run encoding
         batch_size: Batch size for encoding
+        num_workers: Number of workers for DataLoader
 
     Returns:
         Tuple of (latents, labels, conditions)
     """
     vae_model.eval()
 
+    # Get transforms with proper RAS orientation and 1mm resampling
+    transforms = get_val_transforms(spatial_size=spatial_size)
+
+    # Create a simple Dataset that applies MONAI transforms
+    class TransformDataset(torch.utils.data.Dataset):
+        def __init__(self, data_list, transform):
+            self.data_list = data_list
+            self.transform = transform
+
+        def __len__(self):
+            return len(self.data_list)
+
+        def __getitem__(self, idx):
+            item = self.data_list[idx]
+            # Apply MONAI transforms (handles LoadImaged, Orientation, Spacing, etc.)
+            result = self.transform(item)
+            return result
+
+    dataset = TransformDataset(data_list, transforms)
+
+    # Use DataLoader with multiple workers for parallel I/O
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
+
     latents_list = []
     labels_list = []
     conditions_list = []
 
-    for i in range(0, len(data_list), batch_size):
-        batch_items = data_list[i:i + batch_size]
+    with torch.no_grad():
+        for batch in dataloader:
+            images = batch["image"].to(device)
+            labels = batch["label"]
+            conditions = batch.get("condition", None)
+            if conditions is not None and conditions.dim() == 1:
+                conditions = conditions.unsqueeze(-1)
 
-        images = []
-        labels = []
-        conditions = []
-
-        for item in batch_items:
-            import nibabel as nib
-
-            nii = nib.load(item["image"])
-            image = nii.get_fdata().astype(np.float32)
-            image = torch.from_numpy(image).unsqueeze(0).unsqueeze(0)
-
-            if transform is not None:
-                image = transform({"image": image})["image"]
-
-            images.append(image)
-            labels.append(item["label"])
-            conditions.append(item.get("condition", 0.7))
-
-        # Batch
-        images = torch.cat(images, dim=0).to(device)
-        labels = torch.tensor(labels)
-        conditions = torch.tensor(conditions, dtype=torch.float32).unsqueeze(-1)
-
-        with torch.no_grad():
+            # Extract latent using VAE encoder
             mu, _ = vae_model.encode(images)
             latents_list.append(mu.cpu())
             labels_list.append(labels)
-            conditions_list.append(conditions)
+            if conditions is not None:
+                conditions_list.append(conditions.cpu())
 
     latents = torch.cat(latents_list, dim=0)
     labels = torch.cat(labels_list, dim=0)
-    conditions = torch.cat(conditions_list, dim=0)
+    conditions = torch.cat(conditions_list, dim=0) if conditions_list else None
 
     return latents, labels, conditions
 
@@ -302,10 +263,13 @@ def train_classifier(
     device: torch.device,
 ) -> DiseaseClassifier:
     """
-    Train the disease classifier (Stage 2).
+    Train the disease classifier (Stage 2) with AdaptiveAvgPool3d.
+
+    Uses the updated DiseaseClassifier that takes vae_latent_channels and pooling_size
+    instead of hardcoded latent_dim to prevent OOM with HD latents.
 
     Args:
-        latents: VAE latents [N, C, D, H, W]
+        latents: VAE latents [N, C, 16, 16, 12] for HD
         labels: Disease labels [N]
         conditions: Clinical conditions [N, 1]
         config: Training configuration
@@ -314,38 +278,43 @@ def train_classifier(
     Returns:
         Trained DiseaseClassifier
     """
+    from sklearn.model_selection import train_test_split
+
     print("\n" + "=" * 60)
-    print("Stage 2: Training Disease Classifier")
+    print("Stage 2: Training Disease Classifier with AdaptiveAvgPool3d")
     print("=" * 60)
 
-    # Calculate latent dimension
-    latent_dim = latents.shape[1] * latents.shape[2] * latents.shape[3] * latents.shape[4]
-    print(f"Latent dimension: {latent_dim}")
+    latent_channels = latents.shape[1]
+    print(f"Latent shape: [{latent_channels}, {HD_LATENT_SPATIAL[0]}, {HD_LATENT_SPATIAL[1]}, {HD_LATENT_SPATIAL[2]}]")
 
-    # Create classifier
+    # Create classifier with pooling-based architecture (no hardcoded latent_dim)
     classifier = DiseaseClassifier(
-        latent_dim=latent_dim,
-        hidden_dims=[2048, 1024, 512],
+        vae_latent_channels=latent_channels,
+        pooling_size=HD_LATENT_SPATIAL,
+        hidden_dims=[512, 256, 128],
         num_classes=4,
         dropout=config.get("classifier", {}).get("dropout", 0.3),
     ).to(device)
 
-    # Create optimizer
     lr = config.get("classifier", {}).get("learning_rate", 1e-4)
     wd = config.get("classifier", {}).get("weight_decay", 1e-5)
-    optimizer = AdamW(classifier.parameters(), lr=lr, weight_decay=wd)
+    optimizer = torch.optim.AdamW(classifier.parameters(), lr=lr, weight_decay=wd)
 
-    # Training
     epochs = config.get("classifier", {}).get("epochs", 200)
     batch_size = config.get("batch_size", 32)
 
-    # Simple train/val split
+    # Stratified train/val split using sklearn
     n_samples = len(latents)
-    n_val = int(n_samples * 0.2)
-    indices = torch.randperm(n_samples)
-    train_idx, val_idx = indices[n_val:], indices[:n_val]
+    labels_np = labels.cpu().numpy()
+    indices = np.arange(n_samples)
 
-    # Create dataloaders
+    train_idx, val_idx = train_test_split(
+        indices,
+        test_size=0.2,
+        stratify=labels_np,
+        random_state=42,
+    )
+
     train_dataset = LatentDatasetPrecomputed(
         latents[train_idx], labels[train_idx],
         conditions[train_idx] if conditions is not None else None
@@ -355,10 +324,9 @@ def train_classifier(
         conditions[val_idx] if conditions is not None else None
     )
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
 
-    # Training loop
     best_acc = 0.0
     for epoch in range(epochs):
         classifier.train()
@@ -370,12 +338,10 @@ def train_classifier(
             z = batch["latent"].to(device)
             y = batch["label"].to(device)
 
-            # Forward
             logits = classifier(z)
             loss = classifier_ce_loss(logits, y)
             acc = classifier_accuracy(logits, y)
 
-            # Backward
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -387,7 +353,6 @@ def train_classifier(
         avg_loss = total_loss / num_batches
         avg_acc = total_acc / num_batches
 
-        # Validation
         classifier.eval()
         val_loss = 0.0
         val_acc = 0.0
@@ -409,7 +374,6 @@ def train_classifier(
         val_loss /= val_batches
         val_acc /= val_batches
 
-        # Log
         if (epoch + 1) % 10 == 0:
             print(
                 f"Epoch [{epoch+1}/{epochs}] "
@@ -417,7 +381,6 @@ def train_classifier(
                 f"Val Loss: {val_loss:.4f} Val Acc: {val_acc:.4f}"
             )
 
-        # Save best
         if val_acc > best_acc:
             best_acc = val_acc
             torch.save(classifier.state_dict(), "classifier_best.pt")
@@ -437,7 +400,7 @@ def train_cfm(
     Train the CFM velocity field network (Stage 3).
 
     Args:
-        latents: VAE latents [N, C, D, H, W]
+        latents: VAE latents [N, C, 16, 16, 12] for HD
         labels: Disease labels [N]
         conditions: Clinical conditions [N, num_conditions]
         config: Training configuration
@@ -446,20 +409,20 @@ def train_cfm(
     Returns:
         Trained VelocityFieldNet
     """
+    from sklearn.model_selection import train_test_split
+
     print("\n" + "=" * 60)
-    print("Stage 3: Training CFM Velocity Field Network")
+    print("Stage 3: Training CFM Velocity Field Network (HD)")
     print("=" * 60)
 
-    # Extract latent dimensions
     latent_channels = latents.shape[1]
     latent_spatial = tuple(latents.shape[2:])
     print(f"Latent shape: [{latent_channels}, {latent_spatial[0]}, {latent_spatial[1]}, {latent_spatial[2]}]")
 
-    # Create velocity field network
     cfm_config = config.get("cfm", {})
     vector_field = VelocityFieldNet(
         latent_channels=latent_channels,
-        latent_spatial=latent_spatial,
+        latent_spatial=HD_LATENT_SPATIAL,
         time_embed_dim=cfm_config.get("time_embed_dim", 128),
         time_hidden_dim=cfm_config.get("time_hidden_dim", 256),
         cond_embed_dim=cfm_config.get("cond_embed_dim", 64),
@@ -470,22 +433,25 @@ def train_cfm(
         num_res_blocks=cfm_config.get("num_res_blocks", 2),
     ).to(device)
 
-    # Create optimizer
     lr = cfm_config.get("learning_rate", 1e-4)
     wd = cfm_config.get("weight_decay", 1e-5)
-    optimizer = AdamW(vector_field.parameters(), lr=lr, weight_decay=wd)
+    optimizer = torch.optim.AdamW(vector_field.parameters(), lr=lr, weight_decay=wd)
 
-    # Scheduler
     epochs = cfm_config.get("epochs", 500)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr * 0.01)
 
-    # Train/val split
+    # Stratified train/val split using sklearn
     n_samples = len(latents)
-    n_val = int(n_samples * 0.2)
-    indices = torch.randperm(n_samples)
-    train_idx, val_idx = indices[n_val:], indices[:n_val]
+    labels_np = labels.cpu().numpy()
+    indices = np.arange(n_samples)
 
-    # Create dataloaders
+    train_idx, val_idx = train_test_split(
+        indices,
+        test_size=0.2,
+        stratify=labels_np,
+        random_state=42,
+    )
+
     train_dataset = LatentDatasetPrecomputed(
         latents[train_idx], labels[train_idx],
         conditions[train_idx] if conditions is not None else None
@@ -499,18 +465,17 @@ def train_cfm(
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
 
-    # Create trainer
     trainer = CFMTrainer(
         model=vector_field,
         optimizer=optimizer,
         device=device,
         config={
             "velocity_loss_weight": cfm_config.get("velocity_loss_weight", 1.0),
+            "batch_size": batch_size,
         },
         scheduler=scheduler,
     )
 
-    # Train
     output_dir = config.get("output_dir", "./checkpoints/stage3_cfm")
     os.makedirs(output_dir, exist_ok=True)
 
@@ -523,7 +488,6 @@ def train_cfm(
     )
 
     print(f"\nTraining completed. Best val loss: {trainer.best_val_loss:.4f}")
-
     return vector_field
 
 
@@ -583,16 +547,14 @@ def main():
 
     args = parser.parse_args()
 
-    # Load configuration
     if os.path.exists(args.config):
         config = load_config(args.config)
     else:
-        # Default config
         config = {
             "batch_size": 32,
             "cfm": {
-                "latent_channels": 64,
-                "latent_spatial": [8, 8, 8],
+                "latent_channels": HD_LATENT_CHANNELS,
+                "latent_spatial": list(HD_LATENT_SPATIAL),
                 "time_embed_dim": 128,
                 "cond_embed_dim": 64,
                 "epochs": 500,
@@ -604,7 +566,6 @@ def main():
             "output_dir": "./checkpoints/stage2_cfm",
         }
 
-    # Override config
     if args.data_dir:
         config["data_dir"] = args.data_dir
     if args.output_dir:
@@ -612,12 +573,13 @@ def main():
 
     device = torch.device(args.device)
     print(f"\nUsing device: {device}")
+    print(f"HD Configuration: spatial_size={HD_SPATIAL_SIZE}, latent_spatial={HD_LATENT_SPATIAL}")
 
     # Prepare data
     if args.use_dummy_data:
         print("\nUsing dummy data for training")
         data_list = create_dummy_dataset(
-            spatial_size=(128, 128, 128),
+            spatial_size=HD_SPATIAL_SIZE,
             num_samples=40,
         )
     else:
@@ -628,17 +590,18 @@ def main():
             print(f"Data directory not found: {data_dir}")
             print("Using dummy data")
             data_list = create_dummy_dataset(
-                spatial_size=(128, 128, 128),
+                spatial_size=HD_SPATIAL_SIZE,
                 num_samples=40,
             )
 
     print(f"Total samples: {len(data_list)}")
 
-    # Load VAE
+    # Load VAE with HD configuration
     vae = ADynamicsVAE3D(
-        spatial_size=(128, 128, 128),
+        spatial_size=HD_SPATIAL_SIZE,
         in_channels=1,
-        latent_channels=config.get("cfm", {}).get("latent_channels", 64),
+        latent_channels=HD_LATENT_CHANNELS,
+        base_channels=32,
     )
 
     if args.vae_checkpoint and os.path.exists(args.vae_checkpoint):
@@ -649,21 +612,25 @@ def main():
         print("Warning: No VAE checkpoint provided. Using untrained VAE.")
 
     vae = vae.to(device)
-    vae.eval()  # Freeze VAE
+    vae.eval()
 
-    # Extract latents
-    print("\nExtracting latents from VAE...")
-    transforms = get_train_transforms(spatial_size=(128, 128, 128))
+    # Extract latents with proper MONAI transforms and multi-threaded loading
+    print("\nExtracting latents from VAE (using MONAI transforms + DataLoader)...")
     latents, labels, conditions = encode_dataset_to_latents(
-        data_list, vae, transforms, device, batch_size=8
+        data_list, vae, HD_SPATIAL_SIZE, device, batch_size=8, num_workers=4
     )
     print(f"Latents shape: {latents.shape}")
     print(f"Labels shape: {labels.shape}")
-    print(f"Conditions shape: {conditions.shape}")
+    print(f"Conditions shape: {conditions.shape if conditions is not None else 'None'}")
+
+    # Cleanup dummy data
+    if args.use_dummy_data:
+        cleanup_dummy_dataset(data_list)
 
     # Train requested stage
     if args.stage == 2:
         classifier = train_classifier(latents, labels, conditions, config, device)
+        os.makedirs(config["output_dir"], exist_ok=True)
         torch.save(classifier.state_dict(), os.path.join(config["output_dir"], "classifier_final.pt"))
         print(f"\nClassifier saved to {config['output_dir']}/classifier_final.pt")
 

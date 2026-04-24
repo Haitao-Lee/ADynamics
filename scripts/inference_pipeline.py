@@ -1,12 +1,9 @@
 """
 ADynamics End-to-End Inference Pipeline.
 
-This is the工程结晶 (engineering masterpiece) that combines all trained
-modules into a complete disease progression modeling system.
-
-Pipeline Flow:
+Combines all trained modules into a complete disease progression modeling system:
     1. Load new NC patient T1 MRI and patient age
-    2. VAE Encoder: Extract initial latent z0
+    2. VAE Encoder: Extract initial latent z0 (shape: [1, C, 16, 16, 12] for HD)
     3. CFM Euler Integration: Evolve z0 -> z_final using learned velocity field
     4. Deformation Generator: Generate 3D displacement field from z_final
     5. Spatial Transformer: Apply warp to original MRI
@@ -28,17 +25,15 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import nibabel as nib
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from torch import Tensor
+from tqdm import tqdm
 
-# Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core_data.transforms import get_val_transforms
+from monai.transforms import LoadImaged
 from models.spatial_transform import (
     DeformationGenerator,
     SpatialTransformer,
@@ -47,6 +42,11 @@ from models.spatial_transform import (
 from models.vector_field import VelocityFieldNet
 from models.vae3d import ADynamicsVAE3D
 from utils.io_utils import save_tensor_to_nifti
+
+
+# HD configuration
+HD_SPATIAL_SIZE = (256, 256, 192)
+HD_LATENT_SPATIAL = (16, 16, 12)
 
 
 class EvolvePipeline:
@@ -59,7 +59,7 @@ class EvolvePipeline:
         - Deformation Generator (trained)
         - Spatial Transformer
 
-    To evolve an NC brain MRI through disease stages to AD.
+    All forward passes use torch.no_grad() for memory efficiency.
     """
 
     def __init__(
@@ -68,7 +68,7 @@ class EvolvePipeline:
         vector_field: VelocityFieldNet,
         deform_generator: DeformationGenerator,
         device: Union[str, torch.device] = "cuda",
-        spatial_size: Tuple[int, int, int] = (128, 128, 128),
+        spatial_size: Tuple[int, int, int] = HD_SPATIAL_SIZE,
     ) -> None:
         """
         Initialize the evolution pipeline.
@@ -83,7 +83,6 @@ class EvolvePipeline:
         self.device = torch.device(device)
         self.spatial_size = spatial_size
 
-        # Move models to device and set to eval mode
         self.vae = vae.to(self.device)
         self.vae.eval()
 
@@ -93,10 +92,7 @@ class EvolvePipeline:
         self.deform_generator = deform_generator.to(self.device)
         self.deform_generator.eval()
 
-        # Initialize spatial transformer
         self.stn = SpatialTransformer(mode="bilinear", padding_mode="border")
-
-        # Preprocessing transforms
         self.transform = get_val_transforms(spatial_size=spatial_size)
 
     @torch.no_grad()
@@ -108,7 +104,7 @@ class EvolvePipeline:
             mri: MRI tensor of shape [1, 1, D, H, W]
 
         Returns:
-            Latent tensor of shape [1, latent_channels, D', H', W']
+            Latent tensor of shape [1, latent_channels, 16, 16, 12]
         """
         mu, _ = self.vae.encode(mri)
         return mu
@@ -123,10 +119,8 @@ class EvolvePipeline:
         """
         Euler integration of velocity field from t=0 to t=1.
 
-        Solves: dz/dt = v(z, t) starting from z0
-
         Args:
-            z0: Initial latent [1, C, D', H', W']
+            z0: Initial latent [1, C, 16, 16, 12]
             c: Optional clinical conditions [1, num_conditions]
             steps: Number of integration steps
 
@@ -137,11 +131,15 @@ class EvolvePipeline:
         dt = 1.0 / steps
         trajectory = [z_t.clone()]
 
-        for i in range(steps):
-            t = torch.tensor([i * dt], device=self.device)
+        for i in tqdm(range(steps), desc="ODE Integration", leave=False):
+            t = torch.tensor([i * dt], device=self.device, dtype=z_t.dtype)
             v_t = self.vector_field(z_t, t, c)
             z_t = z_t + v_t * dt
             trajectory.append(z_t.clone())
+
+            # Memory cleanup during long integrations
+            if i % 10 == 0:
+                torch.cuda.empty_cache()
 
         return z_t, trajectory
 
@@ -154,7 +152,7 @@ class EvolvePipeline:
         Generate deformation field from evolved latent.
 
         Args:
-            z_final: Evolved latent [1, C, D', H', W']
+            z_final: Evolved latent [1, C, 16, 16, 12]
 
         Returns:
             Deformation field [1, 3, D, H, W]
@@ -181,7 +179,6 @@ class EvolvePipeline:
         warped = self.stn(mri, flow)
         return warped
 
-    @torch.no_grad()
     def evolve(
         self,
         mri: Tensor,
@@ -189,7 +186,7 @@ class EvolvePipeline:
         ode_steps: int = 20,
     ) -> Dict[str, Any]:
         """
-        Full evolution pipeline.
+        Full evolution pipeline with torch.no_grad() for memory efficiency.
 
         Args:
             mri: Input MRI [1, 1, D, H, W]
@@ -197,23 +194,11 @@ class EvolvePipeline:
             ode_steps: Number of ODE integration steps
 
         Returns:
-            Dictionary containing:
-                - evolved_mri: Final evolved MRI
-                - deformation_field: 3D displacement field
-                - z_final: Final latent state
-                - trajectory: List of intermediate latent states
-                - z0: Initial latent state
+            Dictionary containing evolved_mri, deformation_field, z_final, trajectory, z0
         """
-        # Step 1: Encode to latent
         z0 = self.encode(mri)
-
-        # Step 2: Integrate ODE in latent space
         z_final, trajectory = self.integrate_ode(z0, c, steps=ode_steps)
-
-        # Step 3: Generate deformation field
         flow = self.generate_deformation(z_final)
-
-        # Step 4: Apply warp to original image
         evolved_mri = self.apply_warp(mri, flow)
 
         return {
@@ -230,10 +215,13 @@ class EvolvePipeline:
         output_dir: str,
         patient_id: str = "patient",
         affine: Optional[np.ndarray] = None,
-        voxel_size: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+        spacing: Optional[Tuple[float, float, float]] = None,
     ) -> None:
         """
         Save evolution results to NIfTI files.
+
+        Extracts real spacing from affine matrix when available.
+        Uses permute_to_xyz=False to match spatial_transform conventions.
 
         Files saved:
             - {patient_id}_original.nii.gz: Original input MRI
@@ -248,16 +236,25 @@ class EvolvePipeline:
             output_dir: Directory to save results
             patient_id: Identifier for the patient
             affine: 4x4 affine matrix for NIfTI (if None, creates identity)
-            voxel_size: Voxel spacing in mm
+            spacing: Physical voxel spacing (dx, dy, dz). If None, extracted from affine
         """
         os.makedirs(output_dir, exist_ok=True)
 
-        # Create affine if not provided
+        # Extract spacing from affine if not provided
+        if spacing is None and affine is not None:
+            spacing = (
+                float(np.sqrt(np.sum(affine[:3, 0] ** 2))),
+                float(np.sqrt(np.sum(affine[:3, 1] ** 2))),
+                float(np.sqrt(np.sum(affine[:3, 2] ** 2))),
+            )
+
         if affine is None:
+            if spacing is None:
+                spacing = (1.0, 1.0, 1.0)
             affine = np.eye(4, dtype=np.float64)
-            affine[0, 0] = voxel_size[0]
-            affine[1, 1] = voxel_size[1]
-            affine[2, 2] = voxel_size[2]
+            affine[0, 0] = spacing[0]
+            affine[1, 1] = spacing[1]
+            affine[2, 2] = spacing[2]
 
         # Save original MRI
         if "original_mri" in results:
@@ -268,7 +265,7 @@ class EvolvePipeline:
                 original,
                 affine,
                 os.path.join(output_dir, f"{patient_id}_original.nii.gz"),
-                voxel_size=voxel_size,
+                permute_to_xyz=False,
             )
 
         # Save evolved MRI
@@ -279,7 +276,7 @@ class EvolvePipeline:
             evolved_mri,
             affine,
             os.path.join(output_dir, f"{patient_id}_evolved.nii.gz"),
-            voxel_size=voxel_size,
+            permute_to_xyz=False,
         )
 
         # Save deformation field components
@@ -289,15 +286,15 @@ class EvolvePipeline:
 
         # Save each component separately (for 3D Slicer visualization)
         for i, dim_name in enumerate(["D", "H", "W"]):
-            flow_component = flow[0, i]  # shape: [D, H, W]
+            flow_component = flow[0, i]
             save_tensor_to_nifti(
                 torch.from_numpy(flow_component),
                 affine,
                 os.path.join(output_dir, f"{patient_id}_flow_{dim_name}.nii.gz"),
-                voxel_size=voxel_size,
+                permute_to_xyz=False,
             )
 
-        # Save trajectory as numpy array for analysis
+        # Save trajectory as numpy array
         trajectory = results["trajectory"]
         trajectory_array = np.stack([t.cpu().numpy() for t in trajectory], axis=0)
         np.savez(
@@ -318,11 +315,14 @@ class EvolvePipeline:
 
 def load_mri(
     filepath: str,
-    spatial_size: Tuple[int, int, int] = (128, 128, 128),
+    spatial_size: Tuple[int, int, int] = HD_SPATIAL_SIZE,
     transform=None,
 ) -> Tuple[Tensor, np.ndarray]:
     """
-    Load and preprocess MRI file.
+    Load and preprocess MRI file using MONAI for proper metadata preservation.
+
+    Uses LoadImaged to preserve affine matrix and metadata for correct
+    orientation handling by Orientationd transform.
 
     Args:
         filepath: Path to NIfTI file
@@ -330,27 +330,27 @@ def load_mri(
         transform: Optional MONAI transforms
 
     Returns:
-        Tuple of (preprocessed_tensor, original_affine)
+        Tuple of (preprocessed_tensor, original_affine, image_meta_dict)
     """
-    # Load NIfTI
-    nii = nib.load(filepath)
-    affine = nii.affine
-    data = nii.get_fdata().astype(np.float32)
-    # shape: [D, H, W]
+    # Use MONAI LoadImaged to preserve metadata
+    loader = LoadImaged(reader="NibabelReader", image_only=False)
+    loaded = loader({"image": filepath})
 
-    # Convert to tensor and add dimensions
-    mri = torch.from_numpy(data).unsqueeze(0).unsqueeze(0)
-    # shape: [1, 1, D, H, W]
+    image = loaded["image"]
+    image_meta_dict = loaded["image_meta_dict"]
+
+    # Extract affine from metadata
+    affine = image_meta_dict.get("affine", np.eye(4))
 
     # Apply transforms
     if transform is not None:
-        mri = transform({"image": mri})["image"]
+        image = transform({"image": image})["image"]
 
-    return mri, affine
+    return image, affine, image_meta_dict
 
 
 def create_dummy_mri(
-    spatial_size: Tuple[int, int, int] = (128, 128, 128),
+    spatial_size: Tuple[int, int, int] = HD_SPATIAL_SIZE,
 ) -> Tensor:
     """
     Create a dummy MRI for testing.
@@ -363,30 +363,24 @@ def create_dummy_mri(
     """
     D, H, W = spatial_size
 
-    # Create brain-like ellipsoid
     x = np.linspace(-1, 1, D)
     y = np.linspace(-1, 1, H)
     z = np.linspace(-1, 1, W)
     xx, yy, zz = np.meshgrid(x, y, z, indexing="ij")
 
-    # Brain shape
     ellipsoid = (xx**2 + yy**2 * 1.2 + zz**2 * 0.8) <= 0.7
     brain = ellipsoid.astype(np.float32)
 
-    # Add some structure (white matter, gray matter)
     wm_mask = (xx**2 + yy**2 * 1.2 + zz**2 * 0.8) <= 0.4
     gm_mask = ellipsoid & ~wm_mask
 
     brain[wm_mask] = 0.9
     brain[gm_mask] = 0.6
     brain[~ellipsoid] = 0.1
-
-    # Add some noise
     brain = brain + np.random.randn(D, H, W).astype(np.float32) * 0.05
     brain = np.clip(brain, 0, 1)
 
     mri = torch.from_numpy(brain).unsqueeze(0).unsqueeze(0)
-    # shape: [1, 1, D, H, W]
 
     return mri
 
@@ -441,8 +435,14 @@ def main():
         "--spatial_size",
         type=int,
         nargs=3,
-        default=[128, 128, 128],
-        help="Spatial size for preprocessing",
+        default=[256, 256, 192],
+        help="Spatial size for preprocessing (HD: 256 256 192)",
+    )
+    parser.add_argument(
+        "--latent_channels",
+        type=int,
+        default=64,
+        help="Number of latent channels (must match checkpoint)",
     )
     parser.add_argument(
         "--ode_steps",
@@ -465,27 +465,29 @@ def main():
     args = parser.parse_args()
 
     spatial_size = tuple(args.spatial_size)
+    latent_channels = args.latent_channels
     device = torch.device(args.device)
 
     print("\n" + "=" * 60)
-    print("ADynamics End-to-End Inference Pipeline")
+    print("ADynamics End-to-End Inference Pipeline (HD)")
     print("=" * 60)
     print(f"Device: {device}")
     print(f"Spatial size: {spatial_size}")
+    print(f"Latent channels: {latent_channels}")
+    print(f"Latent spatial: {HD_LATENT_SPATIAL}")
     print(f"ODE steps: {args.ode_steps}")
 
-    # Initialize models with architecture matching checkpoints
-    latent_channels = 64  # Must match training config
-
+    # Initialize models with architecture matching HD checkpoints
     vae = ADynamicsVAE3D(
         spatial_size=spatial_size,
         in_channels=1,
         latent_channels=latent_channels,
+        base_channels=32,  # Match training config
     )
 
     vector_field = VelocityFieldNet(
         latent_channels=latent_channels,
-        latent_spatial=(8, 8, 8),
+        latent_spatial=HD_LATENT_SPATIAL,
         time_embed_dim=128,
         cond_embed_dim=64,
         num_conditions=1,
@@ -493,8 +495,9 @@ def main():
 
     deform_generator = DeformationGenerator(
         latent_channels=latent_channels,
-        latent_spatial=(8, 8, 8),
+        latent_spatial=HD_LATENT_SPATIAL,
         output_spatial=spatial_size,
+        base_channels=16,  # HD memory efficient
     )
 
     # Load checkpoints
@@ -527,11 +530,12 @@ def main():
         print("\nUsing dummy MRI for inference")
         mri = create_dummy_mri(spatial_size)
         affine = np.eye(4, dtype=np.float64)
-        affine[:3, :3] = np.diag([1.0, 1.0, 1.0])
+        image_meta_dict = None
     elif args.input:
         print(f"\nLoading MRI from {args.input}")
         transform = get_val_transforms(spatial_size=spatial_size)
-        mri, affine = load_mri(args.input, spatial_size, transform)
+        mri, affine, image_meta_dict = load_mri(args.input, spatial_size, transform)
+        print(f"  Image meta keys: {list(image_meta_dict.keys()) if image_meta_dict else 'N/A'}")
     else:
         raise ValueError("Must provide --input or --use_dummy")
 
@@ -542,7 +546,7 @@ def main():
     # Prepare condition (normalized age)
     c = None
     if args.age is not None:
-        age_normalized = args.age / 100.0  # Normalize to [0, 1]
+        age_normalized = args.age / 100.0
         c = torch.tensor([[age_normalized]], dtype=torch.float32).to(device)
         print(f"Condition: age = {args.age} -> normalized = {age_normalized}")
 
@@ -567,10 +571,9 @@ def main():
         output_dir=args.output_dir,
         patient_id=args.patient_id,
         affine=affine,
-        voxel_size=(1.0, 1.0, 1.0),
     )
 
-    # Compute some statistics
+    # Compute statistics
     flow = results["deformation_field"]
     flow_np = flow.cpu().numpy()
     print(f"\nDeformation field statistics:")

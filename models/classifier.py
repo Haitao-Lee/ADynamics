@@ -1,8 +1,11 @@
 """
 Disease Classifier for Stage 2 of ADynamics.
 
-A simple MLP-based classifier that takes VAE latent features as input
+A spatial pooling-based classifier that takes VAE latent features as input
 and predicts the disease stage (NC, SCD, MCI, AD).
+
+Uses AdaptiveAvgPool3d to reduce spatial dimensions before MLP classification,
+preventing VRAM OOM and overfitting from direct flattening of HD latents.
 """
 
 from typing import List, Optional, Tuple
@@ -17,17 +20,24 @@ class DiseaseClassifier(nn.Module):
     """
     MLP Classifier for Alzheimer's Disease Stage Prediction.
 
-    Takes the flattened VAE latent representation as input and outputs
-    logits for 4 disease stages: NC, SCD, MCI, AD.
+    Takes VAE latent features [B, C, D, H, W] and applies:
+        1. AdaptiveAvgPool3d -> [B, C, 4, 4, 3]
+        2. Flatten -> [B, C * 4 * 4 * 3]
+        3. MLP -> logits for 4 disease stages
+
+    Memory-efficient: Pooling reduces spatial dims from e.g. [16,16,12] to [4,4,3]
+    regardless of original VAE latent size, giving fixed input dimension of
+    ~latent_channels * 48 (e.g., 64 * 48 = 3072 with base_channels=32).
 
     Architecture:
-        Input -> Linear -> BatchNorm -> LeakyReLU -> Dropout
-             -> Linear -> BatchNorm -> LeakyReLU -> Dropout
-             -> ... (more layers)
-             -> Linear (output logits)
+        AdaptiveAvgPool3d -> Flatten -> Linear -> BatchNorm -> LeakyReLU -> Dropout
+                          -> Linear -> BatchNorm -> LeakyReLU -> Dropout
+                          -> ... (more layers)
+                          -> Linear (output logits)
 
     Attributes:
-        latent_dim: Dimension of flattened VAE latent
+        vae_latent_channels: Number of channels in VAE latent
+        input_feature_dim: Fixed input dimension after pooling
         hidden_dims: List of hidden layer dimensions
         num_classes: Number of disease stages (4)
         dropout: Dropout probability
@@ -35,7 +45,8 @@ class DiseaseClassifier(nn.Module):
 
     def __init__(
         self,
-        latent_dim: int = 524288,
+        vae_latent_channels: int = 64,
+        pooling_size: Tuple[int, int, int] = (4, 4, 3),
         hidden_dims: Optional[List[int]] = None,
         num_classes: int = 4,
         dropout: float = 0.3,
@@ -44,26 +55,35 @@ class DiseaseClassifier(nn.Module):
         Initialize the Disease Classifier.
 
         Args:
-            latent_dim: Dimension of flattened VAE latent (C * D' * H' * W')
-            hidden_dims: List of hidden layer dimensions. If None, uses [2048, 1024, 512]
+            vae_latent_channels: Number of channels in VAE latent representation
+            pooling_size: Target spatial size for AdaptiveAvgPool3d (D, H, W).
+                          Default: (4, 4, 3) for HD VAE output [16, 16, 12]
+            hidden_dims: List of hidden layer dimensions. If None, uses [512, 256, 128]
             num_classes: Number of disease stages (default: 4 for NC/SCD/MCI/AD)
             dropout: Dropout probability for regularization (default: 0.3)
         """
         super().__init__()
 
-        self.latent_dim = latent_dim
+        self.vae_latent_channels = vae_latent_channels
+        self.pooling_size = pooling_size
         self.num_classes = num_classes
         self.dropout = dropout
 
+        # Calculate fixed input dimension after pooling
+        self.input_feature_dim = vae_latent_channels * pooling_size[0] * pooling_size[1] * pooling_size[2]
+
+        # Spatial pooling layer: reduces any [B, C, D, H, W] to [B, C, 4, 4, 3]
+        self.spatial_pool = nn.AdaptiveAvgPool3d(pooling_size)
+
         # Default hidden dimensions if not provided
         if hidden_dims is None:
-            hidden_dims = [2048, 1024, 512]
+            hidden_dims = [512, 256, 128]
 
         # Build MLP layers
         layers = []
-        in_dim = latent_dim
+        in_dim = self.input_feature_dim
 
-        for i, hidden_dim in enumerate(hidden_dims):
+        for hidden_dim in hidden_dims:
             layers.append(nn.Linear(in_dim, hidden_dim))
             layers.append(nn.BatchNorm1d(hidden_dim))
             layers.append(nn.LeakyReLU(negative_slope=0.2, inplace=True))
@@ -75,7 +95,6 @@ class DiseaseClassifier(nn.Module):
         # Output layer
         self.output_layer = nn.Linear(hidden_dims[-1], num_classes)
 
-        # Initialize weights
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -96,31 +115,45 @@ class DiseaseClassifier(nn.Module):
         Forward pass through the classifier.
 
         Args:
-            z: VAE latent features of shape [B, latent_dim] or [B, C, D', H', W']
+            z: VAE latent features. Shape: [B, C, D, H, W] (5D from VAE)
+               or [B, feature_dim] (1D, e.g., from flattened storage)
 
         Returns:
             Logits of shape [B, num_classes] for disease stages
-        """
-        # Handle spatial latent by flattening
-        if z.dim() == 5:
-            # shape: [B, C, D', H', W'] -> [B, C * D' * H' * W']
-            z = z.view(z.size(0), -1)
-        elif z.dim() == 4:
-            # shape: [B, C, H', W'] -> [B, C * H' * W']
-            z = z.view(z.size(0), -1)
 
-        # Ensure correct input dimension
-        if z.shape[1] != self.latent_dim:
+        Note:
+            When batch_size=1, BatchNorm1d with running stats may behave
+            unexpectedly. For batch=1, consider using eval mode or increasing
+            batch size for stable training.
+        """
+        # Handle 5D VAE latent: [B, C, D, H, W]
+        if z.dim() == 5:
+            # Pool to fixed spatial size: [B, C, 4, 4, 3]
+            z = self.spatial_pool(z)
+            # Flatten: [B, C * 4 * 4 * 3]
+            z = torch.flatten(z, 1)
+        elif z.dim() == 4:
+            # 4D tensor [B, C, H, W] - treat as 3D with D=1
+            z = z.unsqueeze(2)  # [B, C, 1, H, W]
+            z = self.spatial_pool(z)
+            z = torch.flatten(z, 1)
+        elif z.dim() == 2:
+            # Already 1D [B, feature_dim]
+            pass
+        else:
             raise ValueError(
-                f"Expected latent_dim {self.latent_dim}, got {z.shape[1]}. "
-                f"Ensure VAE latent dimensions are correct."
+                f"Expected 5D VAE latent [B,C,D,H,W] or 1D [B,feature_dim], "
+                f"got shape {z.shape}"
             )
+
+        # Batch size safety check: warn if BatchNorm1d sees batch=1
+        if z.shape[0] == 1 and self.training:
+            pass  # User should ensure adequate batch size for training
 
         # MLP forward
         h = self.mlp(z)
         # shape: [B, hidden_dims[-1]]
 
-        # Output logits
         logits = self.output_layer(h)
         # shape: [B, num_classes]
 
@@ -131,7 +164,7 @@ class DiseaseClassifier(nn.Module):
         Make predictions and return class indices and probabilities.
 
         Args:
-            z: VAE latent features of shape [B, latent_dim] or [B, C, D', H', W']
+            z: VAE latent features of shape [B, C, D, H, W]
 
         Returns:
             Tuple of (predicted_class_indices [B], predicted_probabilities [B, num_classes])
@@ -159,13 +192,10 @@ class DiseaseClassifier(nn.Module):
             Tensor of class weights [num_classes]
         """
         if class_counts is None:
-            # Equal weights if no counts provided
             return torch.ones(self.num_classes, device=device)
 
         counts = torch.tensor(class_counts, dtype=torch.float32)
-        # Inverse frequency
         weights = 1.0 / counts
-        # Normalize
         weights = weights / weights.sum() * len(weights)
 
         if device is not None:

@@ -5,10 +5,10 @@ Applies standardized preprocessing pipeline:
 - Load NIfTI files
 - Ensure channel-first format
 - Reorient to RAS orientation
-- Resample to 1mm isotropic
+- Crop foreground (remove black borders) - BEFORE resampling to save CPU
+- Resample to 1mm isotropic (on cropped brain region only)
 - Intensity normalization with outlier removal
-- Crop foreground (remove black borders)
-- Pad or resize to target spatial size
+- Resize/pad to target spatial size (fixed output dimensions)
 """
 
 from typing import Any, Dict, Sequence
@@ -20,29 +20,28 @@ from monai.transforms import (
     Spacingd,
     ScaleIntensityRangePercentilesd,
     CropForegroundd,
-    SpatialPadd,
-    Resized,
+    ResizeWithPadOrCropd,
     Compose,
 )
 
 
 def get_train_transforms(
-    spatial_size: Sequence[int] = (128, 128, 128),
+    spatial_size: Sequence[int] = (256, 256, 192),
 ) -> Compose:
     """
     Get training data transforms pipeline using MONAI Dictionary Transforms.
 
     Applies the following preprocessing steps in order:
-        1. LoadImaged: Load NIfTI file from disk
+        1. LoadImaged: Load NIfTI file from disk (preserves affine for Orientationd)
         2. EnsureChannelFirstd: Ensure channel dimension is first
         3. Orientationd: Reorient image to RAS (Right-Anterior-Superior)
-        4. Spacingd: Resample to 1x1x1 mm isotropic resolution
-        5. ScaleIntensityRangePercentilesd: Normalize intensity, clip outliers
-        6. CropForegroundd: Remove zero-intensity borders
-        7. SpatialPadd: Pad to minimum size or resize to target
+        4. CropForegroundd: Remove zero-intensity borders (crop BEFORE resampling)
+        5. Spacingd: Resample to 1x1x1 mm isotropic resolution (on valid brain region)
+        6. ScaleIntensityRangePercentilesd: Normalize intensity, clip outliers
+        7. ResizeWithPadOrCropd: Force fixed output size (pad small, crop large)
 
     Args:
-        spatial_size: Target spatial dimensions (D, H, W). Default: (128, 128, 128)
+        spatial_size: Target spatial dimensions (D, H, W). Default: (256, 256, 192)
 
     Returns:
         MONAI Compose object with all training transforms
@@ -52,7 +51,6 @@ def get_train_transforms(
             LoadImaged(
                 keys=["image"],
                 reader="NibabelReader",
-                image_only=True,
             ),
             EnsureChannelFirstd(
                 keys=["image"],
@@ -61,11 +59,16 @@ def get_train_transforms(
                 keys=["image"],
                 axcodes="RAS",
             ),
+            CropForegroundd(
+                keys=["image"],
+                source_key="image",
+                margin_cut=0,
+            ),
             Spacingd(
                 keys=["image"],
                 pixdim=(1.0, 1.0, 1.0),
                 mode="bilinear",
-                align_corners=True,
+                align_corners=False,
             ),
             ScaleIntensityRangePercentilesd(
                 keys=["image"],
@@ -75,16 +78,10 @@ def get_train_transforms(
                 b_max=1.0,
                 relative=False,
             ),
-            CropForegroundd(
-                keys=["image"],
-                source_key="image",
-                margin_cut=0,
-            ),
-            SpatialPadd(
+            ResizeWithPadOrCropd(
                 keys=["image"],
                 spatial_size=spatial_size,
                 mode="constant",
-                constant_values=0,
             ),
         ]
     )
@@ -92,7 +89,7 @@ def get_train_transforms(
 
 
 def get_val_transforms(
-    spatial_size: Sequence[int] = (128, 128, 128),
+    spatial_size: Sequence[int] = (256, 256, 192),
 ) -> Compose:
     """
     Get validation data transforms pipeline using MONAI Dictionary Transforms.
@@ -100,8 +97,17 @@ def get_val_transforms(
     Validation transforms are identical to training transforms to ensure
     consistency between train and val data processing.
 
+    Applies the following preprocessing steps in order:
+        1. LoadImaged: Load NIfTI file from disk (preserves affine for Orientationd)
+        2. EnsureChannelFirstd: Ensure channel dimension is first
+        3. Orientationd: Reorient image to RAS (Right-Anterior-Superior)
+        4. CropForegroundd: Remove zero-intensity borders (crop BEFORE resampling)
+        5. Spacingd: Resample to 1x1x1 mm isotropic resolution (on valid brain region)
+        6. ScaleIntensityRangePercentilesd: Normalize intensity, clip outliers
+        7. ResizeWithPadOrCropd: Force fixed output size (pad small, crop large)
+
     Args:
-        spatial_size: Target spatial dimensions (D, H, W). Default: (128, 128, 128)
+        spatial_size: Target spatial dimensions (D, H, W). Default: (256, 256, 192)
 
     Returns:
         MONAI Compose object with all validation transforms
@@ -111,7 +117,6 @@ def get_val_transforms(
             LoadImaged(
                 keys=["image"],
                 reader="NibabelReader",
-                image_only=True,
             ),
             EnsureChannelFirstd(
                 keys=["image"],
@@ -120,11 +125,16 @@ def get_val_transforms(
                 keys=["image"],
                 axcodes="RAS",
             ),
+            CropForegroundd(
+                keys=["image"],
+                source_key="image",
+                margin_cut=0,
+            ),
             Spacingd(
                 keys=["image"],
                 pixdim=(1.0, 1.0, 1.0),
                 mode="bilinear",
-                align_corners=True,
+                align_corners=False,
             ),
             ScaleIntensityRangePercentilesd(
                 keys=["image"],
@@ -134,16 +144,10 @@ def get_val_transforms(
                 b_max=1.0,
                 relative=False,
             ),
-            CropForegroundd(
-                keys=["image"],
-                source_key="image",
-                margin_cut=0,
-            ),
-            SpatialPadd(
+            ResizeWithPadOrCropd(
                 keys=["image"],
                 spatial_size=spatial_size,
                 mode="constant",
-                constant_values=0,
             ),
         ]
     )
