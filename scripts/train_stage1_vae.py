@@ -300,7 +300,7 @@ def main():
         # HD-optimized default config
         config = {
             "batch_size": 1,
-            "learning_rate": 1e-4,
+            "learning_rate": 1e-5,
             "weight_decay": 1e-5,
             "epochs": 300,
             "spatial_size": list(HD_SPATIAL_SIZE),
