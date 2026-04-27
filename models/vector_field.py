@@ -200,6 +200,128 @@ class ConditionEmbedding(nn.Module):
         return gamma, beta
 
 
+class DemographicsEmbedding(nn.Module):
+    """
+    Separate embeddings for Age and Sex with ablation support.
+
+    Provides independent learned embeddings for age (continuous) and sex (binary)
+    that can be individually enabled/disabled for ablation experiments:
+        - age only: both embeddings active, sex embedding masked to zeros
+        - sex only: both embeddings active, age embedding masked to zeros
+        - both: full demographics conditioning
+        - neither: both masked to zeros (baseline)
+
+    Architecture:
+        Age: Linear(1) -> SiLU -> Linear(age_embed_dim) -> SiLU -> Linear(2 * age_embed_dim) -> γ_a, β_a
+        Sex: Linear(1) -> SiLU -> Linear(sex_embed_dim) -> SiLU -> Linear(2 * sex_embed_dim) -> γ_s, β_s
+        Combined: concatenate(γ_a, γ_s), concatenate(β_a, β_s) -> [B, age_embed_dim + sex_embed_dim]
+
+    γ, β initialized such that γ ≈ 1.0, β ≈ 0.0 for stable early training.
+    """
+
+    def __init__(
+        self,
+        age_embed_dim: int = 32,
+        sex_embed_dim: int = 16,
+        age_hidden_dim: int = 64,
+        sex_hidden_dim: int = 32,
+    ) -> None:
+        """
+        Initialize demographics embedding network.
+
+        Args:
+            age_embed_dim: Output embedding dimension for age FiLM parameters
+            sex_embed_dim: Output embedding dimension for sex FiLM parameters
+            age_hidden_dim: Hidden layer dimension for age MLP
+            sex_hidden_dim: Hidden layer dimension for sex MLP
+        """
+        super().__init__()
+
+        self.age_embed_dim = age_embed_dim
+        self.sex_embed_dim = sex_embed_dim
+
+        # Age embedding: takes normalized age [0, 1]
+        self.age_mlp = nn.Sequential(
+            nn.Linear(1, age_hidden_dim),
+            nn.SiLU(inplace=True),
+            nn.Linear(age_hidden_dim, age_hidden_dim),
+            nn.SiLU(inplace=True),
+            nn.Linear(age_hidden_dim, age_embed_dim * 2),  # γ and β
+        )
+
+        # Sex embedding: takes binary sex (0=female, 1=male)
+        self.sex_mlp = nn.Sequential(
+            nn.Linear(1, sex_hidden_dim),
+            nn.SiLU(inplace=True),
+            nn.Linear(sex_hidden_dim, sex_hidden_dim),
+            nn.SiLU(inplace=True),
+            nn.Linear(sex_hidden_dim, sex_embed_dim * 2),  # γ and β
+        )
+
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        """Initialize weights with Kaiming normal, γ ≈ 1, β ≈ 0."""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+    def forward(
+        self,
+        age: Optional[Tensor] = None,
+        sex: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        """
+        Compute FiLM parameters γ and β from age and/or sex.
+
+        Args:
+            age: Normalized age tensor of shape [B, 1] in [0, 1], or None to mask
+            sex: Binary sex tensor of shape [B, 1] (0=female, 1=male), or None to mask
+
+        Returns:
+            Tuple of (gamma, beta) each of shape [B, age_embed_dim + sex_embed_dim]
+            Missing embeddings are masked to zeros (γ=1, β=0 effect via masking)
+        """
+        B = 0
+        if age is not None:
+            B = age.shape[0]
+        elif sex is not None:
+            B = sex.shape[0]
+
+        device = None
+        dtype = None
+        if age is not None:
+            device = age.device
+            dtype = age.dtype
+        elif sex is not None:
+            device = sex.device
+            dtype = sex.dtype
+
+        # Initialize to zeros (γ=0, β=0 -> identity when multiplied)
+        gamma = torch.zeros(B, self.age_embed_dim + self.sex_embed_dim, device=device, dtype=dtype)
+        beta = torch.zeros(B, self.age_embed_dim + self.sex_embed_dim, device=device, dtype=dtype)
+
+        offset = 0
+
+        if age is not None:
+            gamma_beta_a = self.age_mlp(age)
+            gamma_a, beta_a = gamma_beta_a.chunk(2, dim=-1)
+            gamma[:, offset:offset + self.age_embed_dim] = gamma_a
+            beta[:, offset:offset + self.age_embed_dim] = beta_a
+            offset += self.age_embed_dim
+
+        if sex is not None:
+            gamma_beta_s = self.sex_mlp(sex)
+            gamma_s, beta_s = gamma_beta_s.chunk(2, dim=-1)
+            gamma[:, offset:offset + self.sex_embed_dim] = gamma_s
+            beta[:, offset:offset + self.sex_embed_dim] = beta_s
+            offset += self.sex_embed_dim
+
+        return gamma, beta
+
+
 class FiLMLayer3D(nn.Module):
     """
     Feature-wise Linear Modulation (FiLM) Layer for 3D Tensors.
@@ -514,6 +636,12 @@ class VelocityFieldNet(nn.Module):
         base_channels: int = 64,
         channel_mults: Tuple[int, int, int] = (1, 2, 4),
         num_res_blocks: int = 2,
+        # Demographics embedding options for ablation
+        use_demographics: bool = False,
+        age_embed_dim: int = 32,
+        sex_embed_dim: int = 16,
+        age_hidden_dim: int = 64,
+        sex_hidden_dim: int = 32,
     ) -> None:
         """
         Initialize the Velocity Field Network.
@@ -529,6 +657,11 @@ class VelocityFieldNet(nn.Module):
             base_channels: Base channel count for U-Net
             channel_mults: Channel multipliers for each U-Net level
             num_res_blocks: Number of ResBlocks per U-Net level
+            use_demographics: If True, use separate age/sex embeddings instead of generic condition
+            age_embed_dim: Embedding dim for age (only used if use_demographics=True)
+            sex_embed_dim: Embedding dim for sex (only used if use_demographics=True)
+            age_hidden_dim: Hidden dim for age MLP (only used if use_demographics=True)
+            sex_hidden_dim: Hidden dim for sex MLP (only used if use_demographics=True)
         """
         super().__init__()
 
@@ -538,20 +671,33 @@ class VelocityFieldNet(nn.Module):
         self.cond_embed_dim = cond_embed_dim
         self.num_res_blocks = num_res_blocks
         self.channel_mults = channel_mults
+        self.use_demographics = use_demographics
 
         # Time embedding
         self.time_embed = SinusoidalTimeEmbedding(embed_dim=time_embed_dim)
         self.time_mlp = TimeEmbedding(embed_dim=time_embed_dim, hidden_dim=time_hidden_dim)
 
-        # Condition embedding
+        # Condition embedding (legacy or when use_demographics=False)
         self.cond_embed = ConditionEmbedding(
             embed_dim=cond_embed_dim,
             hidden_dim=cond_hidden_dim,
             num_conditions=num_conditions,
         )
 
+        # Demographics embedding (age + sex) for ablation experiments
+        if use_demographics:
+            self.demographics_embed = DemographicsEmbedding(
+                age_embed_dim=age_embed_dim,
+                sex_embed_dim=sex_embed_dim,
+                age_hidden_dim=age_hidden_dim,
+                sex_hidden_dim=sex_hidden_dim,
+            )
+            self.cond_embed_dim = age_embed_dim + sex_embed_dim
+        else:
+            self.demographics_embed = None
+
         # Combined embedding dimension (for FiLM)
-        self.film_embed_dim = time_embed_dim + cond_embed_dim
+        self.film_embed_dim = time_embed_dim + self.cond_embed_dim
 
         # Input projection: [B, C, 16, 16, 12] -> [B, base, 16, 16, 12]
         self.input_conv = nn.Conv3d(latent_channels, base_channels, 3, padding=1)
@@ -653,6 +799,30 @@ class VelocityFieldNet(nn.Module):
         gamma, beta = self.cond_embed(c)
         return gamma, beta
 
+    def get_demographics_condition(
+        self,
+        age: Optional[Tensor] = None,
+        sex: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        """
+        Compute demographics conditioning parameters for FiLM.
+
+        Supports ablation by allowing age and/or sex to be None.
+
+        Args:
+            age: Normalized age tensor [B, 1] in [0, 1], or None to mask
+            sex: Binary sex tensor [B, 1] (0=female, 1=male), or None to mask
+
+        Returns:
+            Tuple of (gamma, beta) for FiLM conditioning
+        """
+        if self.demographics_embed is None:
+            raise RuntimeError(
+                "Demographics embedding not enabled. "
+                "Set use_demographics=True in constructor."
+            )
+        return self.demographics_embed(age=age, sex=sex)
+
     def combine_conditions(
         self,
         time_gamma: Tensor,
@@ -683,14 +853,18 @@ class VelocityFieldNet(nn.Module):
         z_t: Tensor,
         t: Tensor,
         c: Optional[Tensor] = None,
+        age: Optional[Tensor] = None,
+        sex: Optional[Tensor] = None,
     ) -> Tensor:
         """
-        Compute velocity field v(z_t, t, c).
+        Compute velocity field v(z_t, t, c) or v(z_t, t, age, sex).
 
         Args:
             z_t: Latent tensor at time t of shape [B, latent_channels, 16, 16, 12]
             t: Time step tensor of shape [B] with values in [0, 1]
-            c: Optional clinical conditions of shape [B, num_conditions]
+            c: Clinical conditions of shape [B, num_conditions] (legacy, used when use_demographics=False)
+            age: Normalized age tensor [B, 1] in [0, 1] (used when use_demographics=True)
+            sex: Binary sex tensor [B, 1], 0=female 1=male (used when use_demographics=True)
 
         Returns:
             Velocity field of shape [B, latent_channels, 16, 16, 12]
@@ -698,7 +872,11 @@ class VelocityFieldNet(nn.Module):
         # Get conditioning - always use combined time+condition (FiLM requires consistent embed_dim)
         time_gamma, time_beta = self.get_time_condition(t)
 
-        if c is not None:
+        if self.use_demographics:
+            # Use separate age/sex embeddings for ablation
+            cond_gamma, cond_beta = self.get_demographics_condition(age=age, sex=sex)
+        elif c is not None:
+            # Use legacy condition embedding
             cond_gamma, cond_beta = self.get_cond_condition(c)
         else:
             # Use zero conditioning when not provided to keep embed_dim consistent

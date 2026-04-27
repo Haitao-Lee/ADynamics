@@ -86,6 +86,15 @@ class CFMTrainer:
         self.nc_condition_pool: List[Tensor] = []
         self.ad_condition_pool: List[Tensor] = []
 
+        # Demographics pools (age, sex) for ablation when use_demographics=True
+        self.nc_age_pool: List[Tensor] = []
+        self.ad_age_pool: List[Tensor] = []
+        self.nc_sex_pool: List[Tensor] = []
+        self.ad_sex_pool: List[Tensor] = []
+
+        # Check if using demographics embedding
+        self.use_demographics = config.get("use_demographics", False)
+
         # Training state
         self.current_epoch = 0
         self.best_val_loss = float("inf")
@@ -107,6 +116,10 @@ class CFMTrainer:
         self.ad_latent_pool = []
         self.nc_condition_pool = []
         self.ad_condition_pool = []
+        self.nc_age_pool = []
+        self.ad_age_pool = []
+        self.nc_sex_pool = []
+        self.ad_sex_pool = []
 
         self.model.eval()
         with torch.no_grad():
@@ -114,6 +127,8 @@ class CFMTrainer:
                 z = batch["latent"]
                 labels = batch["label"]
                 c = batch.get("condition", None)
+                age = batch.get("age", None)
+                sex = batch.get("sex", None)
 
                 # NC: label == 0
                 nc_mask = labels == 0
@@ -122,6 +137,10 @@ class CFMTrainer:
                         self.nc_latent_pool.append(z[i])
                         if c is not None:
                             self.nc_condition_pool.append(c[i])
+                        if age is not None:
+                            self.nc_age_pool.append(age[i])
+                        if sex is not None:
+                            self.nc_sex_pool.append(sex[i])
 
                 # AD: label == 3
                 ad_mask = labels == 3
@@ -130,19 +149,29 @@ class CFMTrainer:
                         self.ad_latent_pool.append(z[i])
                         if c is not None:
                             self.ad_condition_pool.append(c[i])
+                        if age is not None:
+                            self.ad_age_pool.append(age[i])
+                        if sex is not None:
+                            self.ad_sex_pool.append(sex[i])
 
         # Move to device for faster sampling during training
         self.nc_latent_pool = [z.to(self.device) for z in self.nc_latent_pool]
         self.ad_latent_pool = [z.to(self.device) for z in self.ad_latent_pool]
         self.nc_condition_pool = [c.to(self.device) for c in self.nc_condition_pool]
         self.ad_condition_pool = [c.to(self.device) for c in self.ad_condition_pool]
+        self.nc_age_pool = [a.to(self.device) for a in self.nc_age_pool]
+        self.ad_age_pool = [a.to(self.device) for a in self.ad_age_pool]
+        self.nc_sex_pool = [s.to(self.device) for s in self.nc_sex_pool]
+        self.ad_sex_pool = [s.to(self.device) for s in self.ad_sex_pool]
 
         print(f"Latent pools built: {len(self.nc_latent_pool)} NC, {len(self.ad_latent_pool)} AD")
+        if self.use_demographics:
+            print(f"Demographics pools: {len(self.nc_age_pool)} age, {len(self.nc_sex_pool)} sex")
 
     def sample_latent_pairs(
         self,
         batch_size: int,
-    ) -> Tuple[Tensor, Tensor, Optional[Tensor], Optional[Tensor]]:
+    ) -> Tuple[Tensor, Tensor, Optional[Tensor], Optional[Tensor], Optional[Tensor], Optional[Tensor]]:
         """
         Sample NC and AD latent pairs from pre-built global pools.
 
@@ -150,11 +179,13 @@ class CFMTrainer:
             batch_size: Number of pairs to sample
 
         Returns:
-            Tuple of (z0, z1, c0, c1) where:
+            Tuple of (z0, z1, c0, c1, age0, sex0) where:
                 - z0: NC latents [B, C, D, H, W]
                 - z1: AD latents [B, C, D, H, W]
-                - c0: NC conditions [B, num_conditions] or None
-                - c1: AD conditions [B, num_conditions] or None
+                - c0: NC conditions [B, num_conditions] or None (legacy)
+                - c1: AD conditions [B, num_conditions] or None (legacy)
+                - age0: NC ages [B, 1] or None
+                - sex0: NC sexes [B, 1] or None
         """
         if len(self.nc_latent_pool) == 0 or len(self.ad_latent_pool) == 0:
             raise RuntimeError(
@@ -174,7 +205,14 @@ class CFMTrainer:
             c0 = torch.stack([self.nc_condition_pool[i] for i in nc_indices])
             c1 = torch.stack([self.ad_condition_pool[i] for i in ad_indices])
 
-        return z0, z1, c0, c1
+        # Demographics (age, sex)
+        age0 = None
+        sex0 = None
+        if self.use_demographics and self.nc_age_pool and self.nc_sex_pool:
+            age0 = torch.stack([self.nc_age_pool[i] for i in nc_indices])
+            sex0 = torch.stack([self.nc_sex_pool[i] for i in nc_indices])
+
+        return z0, z1, c0, c1, age0, sex0
 
     def sample_time(self, batch_size: int) -> Tensor:
         """
@@ -216,20 +254,24 @@ class CFMTrainer:
         z1: Tensor,
         c0: Optional[Tensor] = None,
         c1: Optional[Tensor] = None,
+        age0: Optional[Tensor] = None,
+        sex0: Optional[Tensor] = None,
     ) -> Dict[str, Tensor]:
         """
         Perform one CFM training step with AMP.
 
         1. Sample t ~ U(0, 1)
         2. Compute z_t = (1-t)*z0 + t*z1
-        3. Predict v_pred = Model(z_t, t, c)
+        3. Predict v_pred = Model(z_t, t, c) or Model(z_t, t, age=age, sex=sex)
         4. Compute loss = ||v_pred - (z1 - z0)||^2
 
         Args:
             z0: Source latents (NC) [B, C, D, H, W]
             z1: Target latents (AD) [B, C, D, H, W]
-            c0: Optional NC conditions [B, num_conditions]
-            c1: Optional AD conditions [B, num_conditions]
+            c0: Optional NC conditions [B, num_conditions] (legacy)
+            c1: Optional AD conditions [B, num_conditions] (legacy)
+            age0: Optional NC ages [B, 1] normalized to [0, 1]
+            sex0: Optional NC sexes [B, 1] (0=female, 1=male)
 
         Returns:
             Dictionary of losses
@@ -238,12 +280,14 @@ class CFMTrainer:
 
         t = self.sample_time(batch_size)
 
-        # Use NC conditions for conditioning (or None if unavailable)
-        c = c0
-
         z_t = self.interpolate_latents(z0, z1, t)
 
-        v_pred = self.model(z_t, t, c)
+        if self.use_demographics:
+            # Use separate age/sex embeddings for ablation
+            v_pred = self.model(z_t, t, c=None, age=age0, sex=sex0)
+        else:
+            # Use legacy condition embedding
+            v_pred = self.model(z_t, t, c0)
 
         loss = cfm_loss(v_pred, z0, z1)
 
@@ -275,12 +319,12 @@ class CFMTrainer:
         num_batches_total = max(1, num_pairs // batch_size)
 
         for _ in range(num_batches_total):
-            z0, z1, c0, c1 = self.sample_latent_pairs(batch_size)
+            z0, z1, c0, c1, age0, sex0 = self.sample_latent_pairs(batch_size)
 
             self.optimizer.zero_grad()
 
             with autocast('cuda', enabled=self.use_amp):
-                losses = self.train_step(z0, z1, c0, c1)
+                losses = self.train_step(z0, z1, c0, c1, age0, sex0)
 
             if self.use_amp:
                 self.scaler.scale(losses["loss"]).backward()
@@ -324,10 +368,10 @@ class CFMTrainer:
         num_batches_total = max(1, num_pairs // batch_size)
 
         for _ in range(num_batches_total):
-            z0, z1, c0, c1 = self.sample_latent_pairs(batch_size)
+            z0, z1, c0, c1, age0, sex0 = self.sample_latent_pairs(batch_size)
 
             with autocast('cuda', enabled=self.use_amp):
-                losses = self.train_step(z0, z1, c0, c1)
+                losses = self.train_step(z0, z1, c0, c1, age0, sex0)
 
             total_loss += losses["loss"].item()
             total_velocity_loss += losses["velocity_loss"].item()
