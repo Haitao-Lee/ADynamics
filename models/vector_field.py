@@ -272,6 +272,7 @@ class DemographicsEmbedding(nn.Module):
         self,
         age: Optional[Tensor] = None,
         sex: Optional[Tensor] = None,
+        t: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor]:
         """
         Compute FiLM parameters γ and β from age and/or sex.
@@ -279,6 +280,7 @@ class DemographicsEmbedding(nn.Module):
         Args:
             age: Normalized age tensor of shape [B, 1] in [0, 1], or None to mask
             sex: Binary sex tensor of shape [B, 1] (0=female, 1=male), or None to mask
+            t: Time tensor [B] to determine batch size when both age and sex are None
 
         Returns:
             Tuple of (gamma, beta) each of shape [B, age_embed_dim + sex_embed_dim]
@@ -289,6 +291,8 @@ class DemographicsEmbedding(nn.Module):
             B = age.shape[0]
         elif sex is not None:
             B = sex.shape[0]
+        elif t is not None:
+            B = t.shape[0]
 
         device = None
         dtype = None
@@ -298,6 +302,9 @@ class DemographicsEmbedding(nn.Module):
         elif sex is not None:
             device = sex.device
             dtype = sex.dtype
+        elif t is not None:
+            device = t.device
+            dtype = t.dtype
 
         # Initialize to zeros (γ=0, β=0 -> identity when multiplied)
         gamma = torch.zeros(B, self.age_embed_dim + self.sex_embed_dim, device=device, dtype=dtype)
@@ -421,7 +428,7 @@ class ResBlock3D(nn.Module):
         self.out_channels = out_channels
         self.embed_dim = embed_dim
 
-        # Pre-projection for skip connection alignment
+        # Pre-projection for main path channel alignment
         self.pre_conv = nn.Conv3d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
 
         # Main path
@@ -431,8 +438,8 @@ class ResBlock3D(nn.Module):
         self.norm2 = nn.GroupNorm(num_groups, out_channels)
         self.conv2 = nn.Conv3d(out_channels, out_channels, 3, padding=1)
 
-        # Skip connection
-        self.skip = nn.Identity()
+        # Skip connection: project to match output channels for residual addition
+        self.skip = nn.Conv3d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
 
         # FiLM conditioning (applied after first conv)
         if embed_dim is not None:
@@ -710,16 +717,20 @@ class VelocityFieldNet(nn.Module):
         for i, mult in enumerate(channel_mults):
             out_ch = base_channels * mult
 
-            # ResBlocks with FiLM
-            for _ in range(num_res_blocks):
+            # ResBlocks with FiLM: first block uses ch, subsequent blocks use previous out_ch
+            for j in range(num_res_blocks):
+                if j == 0:
+                    in_ch = ch  # First block uses input from previous level
+                else:
+                    in_ch = out_ch  # Subsequent blocks use previous block's output
                 self.encoder_blocks.append(
-                    ResBlock3D(out_ch, out_ch, embed_dim=self.film_embed_dim)
+                    ResBlock3D(in_ch, out_ch, embed_dim=self.film_embed_dim)
                 )
 
             # Downsample with FiLM (except last level)
             if i < len(channel_mults) - 1:
                 self.encoder_downsample.append(
-                    DownBlock3D(ch, out_ch, embed_dim=self.film_embed_dim)
+                    DownBlock3D(out_ch, out_ch, embed_dim=self.film_embed_dim)
                 )
                 ch = out_ch
 
@@ -745,15 +756,15 @@ class VelocityFieldNet(nn.Module):
                 self.decoder_upsample.append(
                     UpBlock3D(ch, out_ch, embed_dim=self.film_embed_dim)
                 )
-                # Projection for skip connection: encoder has out_ch, upsample outputs out_ch
-                # No extra projection needed when i == 1 (first upsample)
-                # When i > 1, we need to handle different skip channel counts
-                self.decoder_proj.append(nn.Identity())
-
-            # ResBlocks: input channels = upsample_out (if upsample) + skip (if concat)
-            # The first decoder block after middle doesn't have upsample, just middle output
-            # When i == 0 (first iteration), we use middle output directly
-            # When i > 0, upsample output + skip
+                # Projection for skip connection to match channel dimensions
+                # At each decoder level, we need skip_ch to match out_ch for proper concat
+                # skip_idx maps decoder level i to encoder level (len-1-i)
+                skip_idx = len(channel_mults) - 1 - i
+                skip_ch = base_channels * channel_mults[skip_idx]
+                if skip_ch != out_ch:
+                    self.decoder_proj.append(nn.Conv3d(skip_ch, out_ch, 1))
+                else:
+                    self.decoder_proj.append(nn.Identity())
 
             for _ in range(num_res_blocks):
                 # Compute actual in_channels based on whether we upsample or not
@@ -761,8 +772,8 @@ class VelocityFieldNet(nn.Module):
                     # First block: no upsample, just middle output
                     block_in_ch = mid_ch
                 else:
-                    # After upsample: current ch (after upsample) + skip
-                    block_in_ch = out_ch + out_ch  # upsample output + skip (same channels)
+                    # After upsample: upsample output + projected skip
+                    block_in_ch = out_ch + out_ch  # upsample output + skip (projected to out_ch)
 
                 self.decoder_blocks.append(
                     ResBlock3D(block_in_ch, out_ch, embed_dim=self.film_embed_dim)
@@ -803,6 +814,7 @@ class VelocityFieldNet(nn.Module):
         self,
         age: Optional[Tensor] = None,
         sex: Optional[Tensor] = None,
+        t: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor]:
         """
         Compute demographics conditioning parameters for FiLM.
@@ -812,6 +824,7 @@ class VelocityFieldNet(nn.Module):
         Args:
             age: Normalized age tensor [B, 1] in [0, 1], or None to mask
             sex: Binary sex tensor [B, 1] (0=female, 1=male), or None to mask
+            t: Time tensor [B] to determine batch size when both age and sex are None
 
         Returns:
             Tuple of (gamma, beta) for FiLM conditioning
@@ -821,7 +834,7 @@ class VelocityFieldNet(nn.Module):
                 "Demographics embedding not enabled. "
                 "Set use_demographics=True in constructor."
             )
-        return self.demographics_embed(age=age, sex=sex)
+        return self.demographics_embed(age=age, sex=sex, t=t)
 
     def combine_conditions(
         self,
@@ -874,7 +887,7 @@ class VelocityFieldNet(nn.Module):
 
         if self.use_demographics:
             # Use separate age/sex embeddings for ablation
-            cond_gamma, cond_beta = self.get_demographics_condition(age=age, sex=sex)
+            cond_gamma, cond_beta = self.get_demographics_condition(age=age, sex=sex, t=t)
         elif c is not None:
             # Use legacy condition embedding
             cond_gamma, cond_beta = self.get_cond_condition(c)
@@ -913,6 +926,7 @@ class VelocityFieldNet(nn.Module):
         # Decoder forward with skip connections and FiLM
         block_idx = 0
         upsample_idx = 0
+        proj_idx = 0
 
         for i, mult in enumerate(reversed(self.channel_mults)):
             # Upsample with FiLM (except first level)
@@ -922,11 +936,19 @@ class VelocityFieldNet(nn.Module):
 
             # ResBlocks with skip connections
             for _ in range(self.num_res_blocks):
-                # Concatenate skip connection
-                skip_idx = len(self.channel_mults) - 1 - i
-                h = torch.cat([h, encoder_outputs[skip_idx]], dim=1)
-
-                h = self.decoder_blocks[block_idx](h, gamma, beta)
+                # At level 0 (deepest), no concatenation - just process middle output
+                if i == 0:
+                    # No skip connection at deepest level
+                    h = self.decoder_blocks[block_idx](h, gamma, beta)
+                else:
+                    # Concatenate skip connection (with projection if needed)
+                    skip_idx = len(self.channel_mults) - 1 - i
+                    skip = encoder_outputs[skip_idx]
+                    if proj_idx < len(self.decoder_proj):
+                        skip = self.decoder_proj[proj_idx](skip)
+                        proj_idx += 1
+                    h = torch.cat([h, skip], dim=1)
+                    h = self.decoder_blocks[block_idx](h, gamma, beta)
                 block_idx += 1
 
         # Output projection
