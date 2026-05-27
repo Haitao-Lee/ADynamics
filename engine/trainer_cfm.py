@@ -75,7 +75,7 @@ class CFMTrainer:
 
         # AMP configuration: only create scaler when use_amp is True
         self.use_amp = config.get("use_amp", True)
-        self.scaler = GradScaler('cuda') if self.use_amp else None
+        self.scaler = GradScaler() if self.use_amp else None
 
         # Move model to device
         self.model.to(self.device)
@@ -391,6 +391,8 @@ class CFMTrainer:
         c: Optional[Tensor] = None,
         steps: int = 20,
         method: str = "euler",
+        age: Optional[Tensor] = None,
+        sex: Optional[Tensor] = None,
     ) -> Tuple[Tensor, List[Tensor]]:
         """
         Integrate the learned velocity field to evolve latent from t=0 to t=1.
@@ -401,9 +403,11 @@ class CFMTrainer:
 
         Args:
             z0: Initial latent [B, C, D, H, W]
-            c: Optional clinical conditions [B, num_conditions]
+            c: Optional clinical conditions [B, num_conditions] (legacy)
             steps: Number of integration steps (for Euler)
             method: Integration method ('euler' or 'dopri5' if torchdiffeq available)
+            age: Optional normalized ages [B, 1] for demographics conditioning
+            sex: Optional binary sexes [B, 1] for demographics conditioning
 
         Returns:
             Tuple of (z_final, trajectory) where trajectory is list of z_t
@@ -418,7 +422,10 @@ class CFMTrainer:
             if method == "euler":
                 for i in range(steps):
                     t = torch.full((z0.shape[0],), i * dt, device=z0.device, dtype=z0.dtype)
-                    v_t = self.model(z_t, t, c)
+                    if self.use_demographics:
+                        v_t = self.model(z_t, t, c=None, age=age, sex=sex)
+                    else:
+                        v_t = self.model(z_t, t, c)
                     z_t = z_t + v_t * dt
                     trajectory.append(z_t.clone())
             else:
@@ -485,6 +492,8 @@ class CFMTrainer:
         num_epochs: int,
         save_interval: int = 50,
         output_dir: str = "./checkpoints",
+        early_stopping_patience: int = 50,
+        log_file: Optional[str] = None,
     ) -> Dict[str, List[float]]:
         """
         Run full training loop with KL annealing.
@@ -495,12 +504,26 @@ class CFMTrainer:
             num_epochs: Number of epochs to train
             save_interval: Checkpoint save interval
             output_dir: Directory to save checkpoints
+            early_stopping_patience: Epochs without val loss improvement before stopping (default: 50)
+            log_file: Path to CSV log file. If None, saves to output_dir/train_log.csv
 
         Returns:
             Training history dictionary
         """
+        import csv
+        import time
+
         # Build global latent pools before training
         self.build_latent_pools(latent_loader_train)
+
+        # Setup log file
+        if log_file is None:
+            log_file = os.path.join(output_dir, "train_log.csv")
+        os.makedirs(os.path.dirname(log_file) if os.path.dirname(log_file) else ".", exist_ok=True)
+
+        # Check if log file exists and has data (resume case)
+        log_exists = os.path.exists(log_file)
+        write_header = not log_exists
 
         history = {
             "train_loss": [],
@@ -509,8 +532,13 @@ class CFMTrainer:
             "val_velocity_loss": [],
         }
 
+        # Early stopping state
+        epochs_without_improvement = 0
+        early_stopped = False
+
         for epoch in range(num_epochs):
             self.current_epoch = epoch
+            epoch_start_time = time.time()
 
             train_metrics = self.train_epoch()
             val_metrics = self.validate_epoch()
@@ -519,12 +547,23 @@ class CFMTrainer:
                 self.scheduler.step()
 
             current_lr = self.optimizer.param_groups[0]["lr"]
+            epoch_time = time.time() - epoch_start_time
+
+            # Check if this is best model
+            is_best = val_metrics["loss"] < self.best_val_loss
+            if is_best:
+                self.best_val_loss = val_metrics["loss"]
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
 
             print(
                 f"Epoch [{epoch+1}/{num_epochs}] "
                 f"LR: {current_lr:.6f} | "
                 f"Train Loss: {train_metrics['loss']:.4f} (vel: {train_metrics['velocity_loss']:.4f}) | "
-                f"Val Loss: {val_metrics['loss']:.4f} (vel: {val_metrics['velocity_loss']:.4f})"
+                f"Val Loss: {val_metrics['loss']:.4f} (vel: {val_metrics['velocity_loss']:.4f}) | "
+                f"Time: {epoch_time:.1f}s | "
+                f"Patience: {epochs_without_improvement}/{early_stopping_patience}"
             )
 
             history["train_loss"].append(train_metrics["loss"])
@@ -532,15 +571,48 @@ class CFMTrainer:
             history["val_loss"].append(val_metrics["loss"])
             history["val_velocity_loss"].append(val_metrics["velocity_loss"])
 
+            # Write to CSV log
+            with open(log_file, "a", newline="") as f:
+                writer = csv.writer(f)
+                if write_header:
+                    writer.writerow([
+                        "epoch", "train_loss", "train_velocity_loss",
+                        "val_loss", "val_velocity_loss", "lr", "epoch_time", "is_best"
+                    ])
+                    write_header = False
+                writer.writerow([
+                    epoch + 1,
+                    f"{train_metrics['loss']:.6f}",
+                    f"{train_metrics['velocity_loss']:.6f}",
+                    f"{val_metrics['loss']:.6f}",
+                    f"{val_metrics['velocity_loss']:.6f}",
+                    f"{current_lr:.8f}",
+                    f"{epoch_time:.2f}",
+                    "1" if is_best else "0"
+                ])
+
             if (epoch + 1) % save_interval == 0:
                 checkpoint_path = os.path.join(output_dir, f"cfm_epoch_{epoch+1}.pt")
                 self.save_checkpoint(checkpoint_path)
                 print(f"Checkpoint saved to {checkpoint_path}")
 
-            if val_metrics["loss"] < self.best_val_loss:
-                self.best_val_loss = val_metrics["loss"]
+            if is_best:
                 best_path = os.path.join(output_dir, "cfm_best.pt")
                 self.save_checkpoint(best_path)
                 print(f"Best model saved to {best_path} (val_loss: {self.best_val_loss:.4f})")
+
+            # Early stopping check
+            if epochs_without_improvement >= early_stopping_patience:
+                print(f"\n{'='*60}")
+                print(f"Early stopping triggered at epoch {epoch+1}")
+                print(f"No improvement for {early_stopping_patience} epochs")
+                print(f"Best val_loss: {self.best_val_loss:.6f}")
+                print(f"{'='*60}\n")
+                early_stopped = True
+                break
+
+        if early_stopped:
+            print(f"Training stopped early at epoch {epoch+1}")
+            print(f"Best val_loss: {self.best_val_loss:.6f}")
 
         return history

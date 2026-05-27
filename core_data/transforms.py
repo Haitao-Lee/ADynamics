@@ -1,7 +1,11 @@
 """
-MONAI-based preprocessing transforms for 3D T1 MRI.
+MONAI-based preprocessing transforms for 3D MRI.
 
-Applies standardized preprocessing pipeline:
+Supports:
+- Single-modal: T1 MRI only
+- Multi-modal: T1 + optional fMRI, ASL, QSM, FLAIR
+
+Preprocessing pipeline:
 - Load NIfTI files
 - Ensure channel-first format
 - Reorient to RAS orientation
@@ -11,7 +15,7 @@ Applies standardized preprocessing pipeline:
 - Resize/pad to target spatial size (fixed output dimensions)
 """
 
-from typing import Any, Dict, Sequence
+from typing import Any, Dict, List, Sequence, Optional
 
 from monai.transforms import (
     LoadImaged,
@@ -152,3 +156,64 @@ def get_val_transforms(
         ]
     )
     return val_transforms
+
+
+# Multi-modal transform sizes
+MULTI_MODAL_SPATIAL_SIZES = {
+    "t1": (256, 256, 192),
+    "fmri": (34, 64, 64),
+    "asl": (128, 128, 36),
+    "qsm": (192, 192, 128),
+    "flair": (256, 256, 192),
+}
+
+
+def get_multimodal_train_transforms(
+    spatial_sizes: Optional[Dict[str, Sequence[int]]] = None,
+) -> Compose:
+    """
+    Get multi-modal training transforms.
+
+    Only T1 gets full preprocessing pipeline. Optional modalities get simplified
+    transforms (load + resize) since they may be missing.
+
+    Args:
+        spatial_sizes: Dict mapping modality names to spatial sizes.
+                      Default uses MULTI_MODAL_SPATIAL_SIZES.
+
+    Returns:
+        MONAI Compose object with multi-modal transforms
+    """
+    if spatial_sizes is None:
+        spatial_sizes = MULTI_MODAL_SPATIAL_SIZES
+
+    # T1 transforms (full pipeline)
+    t1_size = spatial_sizes.get("t1", (256, 256, 192))
+    t1_transforms = Compose([
+        LoadImaged(keys=["t1"], reader="NibabelReader"),
+        EnsureChannelFirstd(keys=["t1"]),
+        Orientationd(keys=["t1"], axcodes="RAS"),
+        CropForegroundd(keys=["t1"], source_key="t1", margin_cut=0),
+        Spacingd(keys=["t1"], pixdim=(1.0, 1.0, 1.0), mode="bilinear", align_corners=False),
+        ScaleIntensityRangePercentilesd(keys=["t1"], lower=0.5, upper=99.5, b_min=0.0, b_max=1.0, relative=False),
+        ResizeWithPadOrCropd(keys=["t1"], spatial_size=t1_size, mode="constant"),
+    ])
+
+    return t1_transforms
+
+
+def get_multimodal_val_transforms(
+    spatial_sizes: Optional[Dict[str, Sequence[int]]] = None,
+) -> Compose:
+    """
+    Get multi-modal validation transforms.
+    Same as training transforms since we don't apply augmentation.
+
+    Args:
+        spatial_sizes: Dict mapping modality names to spatial sizes.
+                      Default uses MULTI_MODAL_SPATIAL_SIZES.
+
+    Returns:
+        MONAI Compose object with multi-modal transforms
+    """
+    return get_multimodal_train_transforms(spatial_sizes)

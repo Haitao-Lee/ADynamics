@@ -1,8 +1,15 @@
 """
-ADynamics End-to-End Inference Pipeline.
+ADynamics End-to-End Inference Pipeline with Preprocessing.
 
-Combines all trained modules into a complete disease progression modeling system:
-    1. Load new NC patient T1 MRI and patient age
+Combines preprocessing pipeline and trained modules into a complete disease progression modeling system:
+
+Preprocessing (optional, toggle with --preprocess):
+    1. Denoise T1 images using ANTsPy
+    2. N4 bias field correction
+    3. Registration to template space
+
+Inference:
+    1. Load preprocessed NC patient T1 MRI and patient age
     2. VAE Encoder: Extract initial latent z0 (shape: [1, C, 16, 16, 12] for HD)
     3. CFM Euler Integration: Evolve z0 -> z_final using learned velocity field
     4. Deformation Generator: Generate 3D displacement field from z_final
@@ -10,8 +17,21 @@ Combines all trained modules into a complete disease progression modeling system
     6. Save results for 3D Slicer QC
 
 Usage:
+    # With preprocessing (raw T1 -> preprocessed -> inference)
     python scripts/inference_pipeline.py \
-        --input path/to/NC_T1.nii.gz \
+        --input path/to/raw_T1.nii.gz \
+        --preprocess \
+        --age 70 \
+        --template_dir E:/LHT_workspace/AD/T1/preprocess/tools \
+        --vae_checkpoint checkpoints/stage1_vae/vae_best.pt \
+        --cfm_checkpoint checkpoints/stage3_cfm/cfm_best.pt \
+        --deform_checkpoint checkpoints/stage4_deform/deform_best.pt \
+        --output_dir ./inference_results
+
+    # Without preprocessing (already preprocessed registered_brain.nii.gz)
+    python scripts/inference_pipeline.py \
+        --input path/to/registered_brain.nii.gz \
+        --skip_preprocessing \
         --age 70 \
         --vae_checkpoint checkpoints/stage1_vae/vae_best.pt \
         --cfm_checkpoint checkpoints/stage3_cfm/cfm_best.pt \
@@ -22,6 +42,7 @@ Usage:
 import argparse
 import os
 import sys
+import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -32,15 +53,17 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+# Add local preprocessing utils to path
+sys.path.insert(0, str(Path(__file__).parent.parent / "utils" / "preprocessing"))
+
 from core_data.transforms import get_val_transforms
 from monai.transforms import LoadImaged
 from models.spatial_transform import (
     DeformationGenerator,
     SpatialTransformer,
-    create_identity_flow,
 )
 from models.vector_field import VelocityFieldNet
-from models.vae3d import ADynamicsVAE3D
+from models.vae3d import MultiModalVAE3D
 from utils.io_utils import save_tensor_to_nifti
 
 
@@ -48,6 +71,293 @@ from utils.io_utils import save_tensor_to_nifti
 HD_SPATIAL_SIZE = (256, 256, 192)
 HD_LATENT_SPATIAL = (16, 16, 12)
 
+
+# ===================== Preprocessing Functions =====================
+
+def _run_denoise(
+    input_path: Union[str, Path],
+    output_dir: Union[str, Path],
+) -> Path:
+    """
+    Step 1: Denoise T1 image using ANTsPy.
+
+    Args:
+        input_path: Path to raw T1 nii.gz
+        output_dir: Output directory for denoised image
+
+    Returns:
+        Path to denoised image
+    """
+    from utils.denoise import denoise_single_t1_antspy
+
+    input_path = Path(input_path)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    stem = input_path.stem.replace(".nii", "")
+    output_path = output_dir / f"{stem}_den.nii.gz"
+
+    if output_path.exists():
+        print(f"[Denoise] Skip (exists): {output_path}")
+        return output_path
+
+    print(f"[Denoise] Processing: {input_path.name}")
+    denoise_single_t1_antspy(
+        in_nii=str(input_path),
+        out_nii=str(output_path),
+        brain_mask_nii=None,
+        noise_model="Rician",
+        verbose=True,
+    )
+    return output_path
+
+
+def _run_hd_bet(
+    input_path: Union[str, Path],
+    output_dir: Union[str, Path],
+    device: str = "cuda:0",
+) -> Path:
+    """
+    Step 2: Generate brainmask using HD-BET.
+
+    Args:
+        input_path: Path to input nii.gz (denoised or bias-corrected)
+        output_dir: Output directory for brainmask
+        device: GPU device for HD-BET
+
+    Returns:
+        Path to brainmask
+    """
+    input_path = Path(input_path)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    stem = input_path.stem.replace(".nii", "")
+    output_path = output_dir / f"{stem}.nii.gz"
+
+    if output_path.exists():
+        print(f"[HD-BET] Skip (exists): {output_path}")
+        return output_path
+
+    print(f"[HD-BET] Processing: {input_path.name}")
+
+    cmd = [
+        "hd-bet",
+        "-i", str(input_path),
+        "-o", str(output_dir / stem),
+        "-device", device,
+    ]
+    import subprocess
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    print(result.stdout)
+    if result.returncode != 0:
+        raise RuntimeError(f"HD-BET failed: {result.stderr}")
+
+    # HD-BET outputs {stem}_mask.nii.gz, rename to match expected naming
+    mask_from_hd = output_dir / f"{stem}_mask.nii.gz"
+    if mask_from_hd.exists() and not output_path.exists():
+        shutil.move(str(mask_from_hd), str(output_path))
+
+    return output_path
+
+
+def _run_n4_bias_correction(
+    input_path: Union[str, Path],
+    mask_path: Union[str, Path],
+    output_dir: Union[str, Path],
+) -> Path:
+    """
+    Step 3: N4 bias field correction.
+
+    Args:
+        input_path: Path to denoised image
+        mask_path: Path to brainmask
+        output_dir: Output directory for bias-corrected image
+
+    Returns:
+        Path to bias-corrected image
+    """
+    from utils.n4_bias_correction import n4_bias_correction
+
+    input_path = Path(input_path)
+    mask_path = Path(mask_path)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    stem = input_path.stem.replace(".nii", "")
+    output_path = output_dir / f"{stem}_n4.nii.gz"
+
+    if output_path.exists():
+        print(f"[N4] Skip (exists): {output_path}")
+        return output_path
+
+    print(f"[N4] Processing: {input_path.name}")
+    n4_bias_correction(
+        in_nii=str(input_path),
+        out_nii=str(output_path),
+        mask_nii=str(mask_path) if mask_path.exists() else None,
+        shrink_factor=2,
+        bspline_fitting_distance=200.0,
+        verbose=True,
+    )
+    return output_path
+
+
+def _run_registration(
+    input_path: Union[str, Path],
+    mask_path: Union[str, Path],
+    template_dir: Union[str, Path],
+    output_dir: Union[str, Path],
+    age: float,
+) -> Tuple[Path, Path]:
+    """
+    Step 4: Registration to template space.
+
+    Args:
+        input_path: Path to N4 bias-corrected image
+        mask_path: Path to brainmask
+        template_dir: Path to template directory
+        output_dir: Output directory for registered results
+        age: Patient age for template selection
+
+    Returns:
+        Tuple of (registered_brain_path, registered_image_path)
+    """
+    from utils.registration import template_registration
+    import pandas as pd
+
+    input_path = Path(input_path)
+    mask_path = Path(mask_path)
+    template_dir = Path(template_dir)
+    output_dir = Path(output_dir)
+
+    stem = input_path.stem.replace(".nii", "")
+
+    # Create temporary metadata file for single-subject registration
+    temp_dir = output_dir / "temp_meta"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    meta_path = temp_dir / "meta_temp.xlsx"
+    df = pd.DataFrame({"name": [stem], "age": [age]})
+    df.to_excel(meta_path, index=False)
+
+    # Setup input structure as expected by template_registration
+    temp_input = temp_dir / "input"
+    temp_input.mkdir(parents=True, exist_ok=True)
+
+    # Copy input and mask with expected naming: {name}_den_n4.nii.gz
+    stem = input_path.stem.replace(".nii", "").replace("_n4", "")
+    import shutil
+    shutil.copy(str(input_path), str(temp_input / f"{stem}_den_n4.nii.gz"))
+    if mask_path.exists():
+        shutil.copy(str(mask_path), str(temp_input / f"{stem}_den_n4.nii.gz"))
+
+    # Registration outputs go to output_dir / name / coarse / registered_brain.nii.gz
+    registered_brain = output_dir / stem / "coarse" / "registered_brain.nii.gz"
+    registered_img = output_dir / stem / "coarse" / "registered.nii.gz"
+
+    if registered_brain.exists():
+        print(f"[Registration] Skip (exists): {registered_brain}")
+        # Clean up temp dir
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return registered_brain, registered_img
+
+    print(f"[Registration] Processing: {input_path.name} (age={age})")
+
+    try:
+        template_registration(
+            in_path=temp_input,
+            out_path=output_dir,
+            mask_path=temp_input,
+            meta_path=meta_path,
+            template_path=template_dir,
+            do_fine=False,
+        )
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+    return registered_brain, registered_img
+
+
+def run_full_preprocessing(
+    input_path: Union[str, Path],
+    output_dir: Union[str, Path],
+    template_dir: Union[str, Path],
+    age: float,
+    device: str = "cuda:0",
+    skip_denoise: bool = False,
+    skip_hdbet: bool = False,
+) -> Tuple[Path, Path]:
+    """
+    Run the full preprocessing pipeline: Denoise -> N4 -> Registration.
+
+    Args:
+        input_path: Path to raw T1 nii.gz
+        output_dir: Output base directory for all preprocessing steps
+        template_dir: Path to template directory (contains registration_template/)
+        age: Patient age for template selection
+        device: GPU device for HD-BET
+        skip_denoise: Skip denoising step (if already done)
+        skip_hdbet: Skip HD-BET step (if mask already exists)
+
+    Returns:
+        Tuple of (registered_brain_path, registered_image_path)
+    """
+    input_path = Path(input_path)
+    output_dir = Path(output_dir)
+    template_dir = Path(template_dir)
+
+    print("\n" + "=" * 60)
+    print("Preprocessing Pipeline")
+    print("=" * 60)
+
+    # Step 1: Denoise
+    denoised_dir = output_dir / "denoised"
+    if skip_denoise:
+        # Assume input is already denoised, just use it directly
+        denoised_path = input_path
+        print(f"[Denoise] Skipped, using input directly")
+    else:
+        denoised_path = _run_denoise(input_path, denoised_dir)
+
+    # Step 2: HD-BET for brainmask (needed for N4)
+    rough_mask_dir = output_dir / "hd-bet_brainmask_rough"
+    if skip_hdbet:
+        # Assume mask already exists, find it
+        stem = input_path.stem.replace(".nii", "").replace("_den", "")
+        rough_mask_path = rough_mask_dir / f"{stem}.nii.gz"
+        if not rough_mask_path.exists():
+            # Try common naming patterns
+            for pattern in ["*_mask.nii.gz", "*_brain_mask.nii.gz"]:
+                matches = list(rough_mask_dir.glob(pattern))
+                if matches:
+                    rough_mask_path = matches[0]
+                    break
+        print(f"[HD-BET] Skipped, using existing mask: {rough_mask_path}")
+    else:
+        rough_mask_path = _run_hd_bet(denoised_path, rough_mask_dir, device)
+
+    # Step 3: N4 bias correction
+    n4_dir = output_dir / "n4_bias_corrected"
+    n4_path = _run_n4_bias_correction(denoised_path, rough_mask_path, n4_dir)
+
+    # Step 4: Registration
+    registered_brain, registered_img = _run_registration(
+        input_path=n4_path,
+        mask_path=rough_mask_path,
+        template_dir=template_dir,
+        output_dir=output_dir / "registered",
+        age=age,
+    )
+
+    print("\n" + "=" * 60)
+    print(f"Preprocessing Complete!")
+    print(f"  Registered brain: {registered_brain}")
+    print("=" * 60 + "\n")
+
+    return registered_brain, registered_img
+
+
+# ===================== Inference Pipeline =====================
 
 class EvolvePipeline:
     """
@@ -106,7 +416,11 @@ class EvolvePipeline:
         Returns:
             Latent tensor of shape [1, latent_channels, 16, 16, 12]
         """
-        mu, _ = self.vae.encode(mri)
+        # MultiModalVAE3D.encode returns concat features, not mu
+        # Use forward pass to get mu through fusion projection
+        x_dict = {"t1": mri}
+        z_concat = self.vae.encode(x_dict)
+        mu = self.vae.fusion_proj(z_concat)
         return mu
 
     @torch.no_grad()
@@ -114,7 +428,10 @@ class EvolvePipeline:
         self,
         z0: Tensor,
         c: Optional[Tensor] = None,
+        age: Optional[Tensor] = None,
+        sex: Optional[Tensor] = None,
         steps: int = 20,
+        use_demographics: bool = False,
     ) -> Tuple[Tensor, List[Tensor]]:
         """
         Euler integration of velocity field from t=0 to t=1.
@@ -122,7 +439,10 @@ class EvolvePipeline:
         Args:
             z0: Initial latent [1, C, 16, 16, 12]
             c: Optional clinical conditions [1, num_conditions]
+            age: Optional normalized ages [1, 1] for demographics conditioning
+            sex: Optional binary sexes [1, 1] for demographics conditioning
             steps: Number of integration steps
+            use_demographics: If True, use age/sex instead of c
 
         Returns:
             Tuple of (z_final, trajectory) where trajectory is list of z_t
@@ -133,11 +453,13 @@ class EvolvePipeline:
 
         for i in tqdm(range(steps), desc="ODE Integration", leave=False):
             t = torch.tensor([i * dt], device=self.device, dtype=z_t.dtype)
-            v_t = self.vector_field(z_t, t, c)
+            if use_demographics:
+                v_t = self.vector_field(z_t, t, c=None, age=age, sex=sex)
+            else:
+                v_t = self.vector_field(z_t, t, c)
             z_t = z_t + v_t * dt
             trajectory.append(z_t.clone())
 
-            # Memory cleanup during long integrations
             if i % 10 == 0:
                 torch.cuda.empty_cache()
 
@@ -183,7 +505,10 @@ class EvolvePipeline:
         self,
         mri: Tensor,
         c: Optional[Tensor] = None,
+        age: Optional[Tensor] = None,
+        sex: Optional[Tensor] = None,
         ode_steps: int = 20,
+        use_demographics: bool = False,
     ) -> Dict[str, Any]:
         """
         Full evolution pipeline with torch.no_grad() for memory efficiency.
@@ -191,13 +516,18 @@ class EvolvePipeline:
         Args:
             mri: Input MRI [1, 1, D, H, W]
             c: Optional clinical conditions [1, num_conditions]
+            age: Optional normalized ages [1, 1] for demographics conditioning
+            sex: Optional binary sexes [1, 1] for demographics conditioning
             ode_steps: Number of ODE integration steps
+            use_demographics: If True, use age/sex instead of c
 
         Returns:
             Dictionary containing evolved_mri, deformation_field, z_final, trajectory, z0
         """
         z0 = self.encode(mri)
-        z_final, trajectory = self.integrate_ode(z0, c, steps=ode_steps)
+        z_final, trajectory = self.integrate_ode(
+            z0, c, age, sex, steps=ode_steps, use_demographics=use_demographics
+        )
         flow = self.generate_deformation(z_final)
         evolved_mri = self.apply_warp(mri, flow)
 
@@ -240,7 +570,6 @@ class EvolvePipeline:
         """
         os.makedirs(output_dir, exist_ok=True)
 
-        # Extract spacing from affine if not provided
         if spacing is None and affine is not None:
             spacing = (
                 float(np.sqrt(np.sum(affine[:3, 0] ** 2))),
@@ -256,7 +585,6 @@ class EvolvePipeline:
             affine[1, 1] = spacing[1]
             affine[2, 2] = spacing[2]
 
-        # Save original MRI
         if "original_mri" in results:
             original = results["original_mri"]
             if isinstance(original, Tensor):
@@ -268,7 +596,6 @@ class EvolvePipeline:
                 permute_to_xyz=False,
             )
 
-        # Save evolved MRI
         evolved_mri = results["evolved_mri"]
         if isinstance(evolved_mri, Tensor):
             evolved_mri = evolved_mri.cpu().numpy()
@@ -279,12 +606,10 @@ class EvolvePipeline:
             permute_to_xyz=False,
         )
 
-        # Save deformation field components
         flow = results["deformation_field"]
         if isinstance(flow, Tensor):
             flow = flow.cpu().numpy()
 
-        # Save each component separately (for 3D Slicer visualization)
         for i, dim_name in enumerate(["D", "H", "W"]):
             flow_component = flow[0, i]
             save_tensor_to_nifti(
@@ -294,7 +619,6 @@ class EvolvePipeline:
                 permute_to_xyz=False,
             )
 
-        # Save trajectory as numpy array
         trajectory = results["trajectory"]
         trajectory_array = np.stack([t.cpu().numpy() for t in trajectory], axis=0)
         np.savez(
@@ -321,86 +645,99 @@ def load_mri(
     """
     Load and preprocess MRI file using MONAI for proper metadata preservation.
 
-    Uses LoadImaged to preserve affine matrix and metadata for correct
-    orientation handling by Orientationd transform.
-
     Args:
         filepath: Path to NIfTI file
         spatial_size: Target spatial size for preprocessing
         transform: Optional MONAI transforms
 
     Returns:
-        Tuple of (preprocessed_tensor, original_affine, image_meta_dict)
+        Tuple of (preprocessed_tensor, affine, image_meta_dict)
     """
-    # Use MONAI LoadImaged to preserve metadata
     loader = LoadImaged(reader="NibabelReader", image_only=False)
     loaded = loader({"image": filepath})
 
     image = loaded["image"]
     image_meta_dict = loaded["image_meta_dict"]
-
-    # Extract affine from metadata
     affine = image_meta_dict.get("affine", np.eye(4))
 
-    # Apply transforms
     if transform is not None:
         image = transform({"image": image})["image"]
 
     return image, affine, image_meta_dict
 
 
-def create_dummy_mri(
-    spatial_size: Tuple[int, int, int] = HD_SPATIAL_SIZE,
-) -> Tensor:
-    """
-    Create a dummy MRI for testing.
-
-    Args:
-        spatial_size: Spatial dimensions
-
-    Returns:
-        Dummy MRI tensor [1, 1, D, H, W]
-    """
-    D, H, W = spatial_size
-
-    x = np.linspace(-1, 1, D)
-    y = np.linspace(-1, 1, H)
-    z = np.linspace(-1, 1, W)
-    xx, yy, zz = np.meshgrid(x, y, z, indexing="ij")
-
-    ellipsoid = (xx**2 + yy**2 * 1.2 + zz**2 * 0.8) <= 0.7
-    brain = ellipsoid.astype(np.float32)
-
-    wm_mask = (xx**2 + yy**2 * 1.2 + zz**2 * 0.8) <= 0.4
-    gm_mask = ellipsoid & ~wm_mask
-
-    brain[wm_mask] = 0.9
-    brain[gm_mask] = 0.6
-    brain[~ellipsoid] = 0.1
-    brain = brain + np.random.randn(D, H, W).astype(np.float32) * 0.05
-    brain = np.clip(brain, 0, 1)
-
-    mri = torch.from_numpy(brain).unsqueeze(0).unsqueeze(0)
-
-    return mri
-
-
 def main():
     parser = argparse.ArgumentParser(
-        description="ADynamics End-to-End Inference Pipeline",
+        description="ADynamics End-to-End Inference Pipeline with Preprocessing",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+
+    # Input/Output
     parser.add_argument(
         "--input",
         type=str,
-        help="Path to input NC T1 MRI NIfTI file",
+        required=True,
+        help="Path to input T1 MRI NIfTI file (raw or preprocessed registered_brain.nii.gz)",
     )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="./inference_results",
+        help="Output directory for results",
+    )
+    parser.add_argument(
+        "--patient_id",
+        type=str,
+        default="patient",
+        help="Patient identifier for output files",
+    )
+
+    # Preprocessing options
+    preprocess_group = parser.add_argument_group("Preprocessing (optional)")
+    preprocess_group.add_argument(
+        "--preprocess",
+        action="store_true",
+        help="Run full preprocessing pipeline on raw T1 (denoise -> N4 -> registration)",
+    )
+    preprocess_group.add_argument(
+        "--skip_preprocessing",
+        action="store_true",
+        help="Skip preprocessing (input is already preprocessed registered_brain.nii.gz)",
+    )
+    preprocess_group.add_argument(
+        "--template_dir",
+        type=str,
+        default="ADynamics/utils/templates",
+        help="Path to template directory (needed for --preprocess)",
+    )
+    preprocess_group.add_argument(
+        "--preprocess_output_dir",
+        type=str,
+        default=None,
+        help="Output directory for preprocessing (default: <output_dir>/preprocessed)",
+    )
+    preprocess_group.add_argument(
+        "--device",
+        type=str,
+        default="cuda:0",
+        help="GPU device for HD-BET",
+    )
+
+    # Demographics
     parser.add_argument(
         "--age",
         type=float,
         default=None,
-        help="Patient age (normalized to [0, 1] internally)",
+        help="Patient age (required for preprocessing template selection and inference)",
     )
+    parser.add_argument(
+        "--sex",
+        type=int,
+        default=None,
+        help="Patient sex: 0=female, 1=male (optional, for demographics-aware inference)",
+    )
+
+    # Model checkpoints
     parser.add_argument(
         "--vae_checkpoint",
         type=str,
@@ -419,18 +756,8 @@ def main():
         default="checkpoints/stage4_deform/deform_best.pt",
         help="Path to deformation generator checkpoint",
     )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="./inference_results",
-        help="Output directory for results",
-    )
-    parser.add_argument(
-        "--patient_id",
-        type=str,
-        default="patient",
-        help="Patient identifier for output files",
-    )
+
+    # Model architecture (must match checkpoints)
     parser.add_argument(
         "--spatial_size",
         type=int,
@@ -445,44 +772,84 @@ def main():
         help="Number of latent channels (must match checkpoint)",
     )
     parser.add_argument(
+        "--use_demographics",
+        action="store_true",
+        help="Use demographics (age/sex) conditioning instead of clinical conditions",
+    )
+
+    # Inference options
+    parser.add_argument(
         "--ode_steps",
         type=int,
         default=20,
         help="Number of ODE integration steps",
     )
     parser.add_argument(
-        "--device",
+        "--inference_device",
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Device to run on",
-    )
-    parser.add_argument(
-        "--use_dummy",
-        action="store_true",
-        help="Use dummy MRI instead of real file",
+        help="Device for inference",
     )
 
     args = parser.parse_args()
 
+    # Validate preprocessing flags
+    if args.preprocess and args.skip_preprocessing:
+        raise ValueError("Cannot use both --preprocess and --skip_preprocessing")
+
     spatial_size = tuple(args.spatial_size)
     latent_channels = args.latent_channels
-    device = torch.device(args.device)
+    device = torch.device(args.inference_device)
 
     print("\n" + "=" * 60)
-    print("ADynamics End-to-End Inference Pipeline (HD)")
+    print("ADynamics End-to-End Inference Pipeline")
     print("=" * 60)
     print(f"Device: {device}")
-    print(f"Spatial size: {spatial_size}")
-    print(f"Latent channels: {latent_channels}")
-    print(f"Latent spatial: {HD_LATENT_SPATIAL}")
-    print(f"ODE steps: {args.ode_steps}")
+    print(f"Input: {args.input}")
 
-    # Initialize models with architecture matching HD checkpoints
-    vae = ADynamicsVAE3D(
+    # ===================== Preprocessing =====================
+    input_path = Path(args.input)
+
+    if args.preprocess:
+        if args.age is None:
+            raise ValueError("--age is required when using --preprocess")
+
+        preprocess_output_dir = Path(args.preprocess_output_dir) if args.preprocess_output_dir else Path(args.output_dir) / "preprocessed"
+
+        registered_brain, registered_img = run_full_preprocessing(
+            input_path=input_path,
+            output_dir=preprocess_output_dir,
+            template_dir=Path(args.template_dir),
+            age=args.age,
+            device=args.device,
+        )
+
+        # Use the registered brain as input for inference
+        input_path = registered_brain
+        print(f"[Inference] Using preprocessed input: {input_path}")
+
+    elif not args.skip_preprocessing:
+        # Check if input is already preprocessed (registered_brain.nii.gz)
+        # If it looks like a preprocessed file (contains registered), skip preprocessing
+        if "registered" not in str(input_path) and not input_path.name.endswith("_brain.nii.gz"):
+            print("\n[WARNING] Input does not appear to be preprocessed registered brain.")
+            print("  Consider using --preprocess if this is raw T1 data.")
+            print("  Or use --skip_preprocessing if input is already preprocessed registered_brain.nii.gz")
+
+    # ===================== Load Models =====================
+    print("\n[Model] Initializing models...")
+
+    # Use MultiModalVAE3D to match training pipeline
+    # Note: Training uses MultiModalVAE3D with optional modalities
+    vae = MultiModalVAE3D(
         spatial_size=spatial_size,
         in_channels=1,
         latent_channels=latent_channels,
-        base_channels=32,  # Match training config
+        base_channels=32,
+        num_classes=4,
+        dropout_rate=0.0,  # No dropout in inference
+        decoder_depth=4,
+        optional_modalities=["fmri", "asl", "qsm", "flair"],
     )
 
     vector_field = VelocityFieldNet(
@@ -491,28 +858,29 @@ def main():
         time_embed_dim=128,
         cond_embed_dim=64,
         num_conditions=1,
+        use_demographics=args.use_demographics,
     )
 
     deform_generator = DeformationGenerator(
         latent_channels=latent_channels,
         latent_spatial=HD_LATENT_SPATIAL,
         output_spatial=spatial_size,
-        base_channels=16,  # HD memory efficient
+        base_channels=16,
     )
 
     # Load checkpoints
     if os.path.exists(args.vae_checkpoint):
-        print(f"\nLoading VAE from {args.vae_checkpoint}")
+        print(f"[Model] Loading VAE from {args.vae_checkpoint}")
         state_dict = torch.load(args.vae_checkpoint, map_location=device)
         vae.load_state_dict(state_dict["model_state_dict"])
 
     if os.path.exists(args.cfm_checkpoint):
-        print(f"Loading CFM from {args.cfm_checkpoint}")
+        print(f"[Model] Loading CFM from {args.cfm_checkpoint}")
         state_dict = torch.load(args.cfm_checkpoint, map_location=device)
         vector_field.load_state_dict(state_dict["model_state_dict"])
 
     if os.path.exists(args.deform_checkpoint):
-        print(f"Loading Deformation Generator from {args.deform_checkpoint}")
+        print(f"[Model] Loading Deformation Generator from {args.deform_checkpoint}")
         state_dict = torch.load(args.deform_checkpoint, map_location=device)
         deform_generator.load_state_dict(state_dict["model_state_dict"])
 
@@ -525,41 +893,50 @@ def main():
         spatial_size=spatial_size,
     )
 
-    # Load or create MRI
-    if args.use_dummy:
-        print("\nUsing dummy MRI for inference")
-        mri = create_dummy_mri(spatial_size)
-        affine = np.eye(4, dtype=np.float64)
-        image_meta_dict = None
-    elif args.input:
-        print(f"\nLoading MRI from {args.input}")
-        transform = get_val_transforms(spatial_size=spatial_size)
-        mri, affine, image_meta_dict = load_mri(args.input, spatial_size, transform)
-        print(f"  Image meta keys: {list(image_meta_dict.keys()) if image_meta_dict else 'N/A'}")
-    else:
-        raise ValueError("Must provide --input or --use_dummy")
+    # ===================== Load MRI =====================
+    print(f"\n[Data] Loading MRI from {input_path}")
+    transform = get_val_transforms(spatial_size=spatial_size)
+    mri, affine, image_meta_dict = load_mri(str(input_path), spatial_size, transform)
 
-    # Prepare input
     mri = mri.to(device)
-    print(f"Input MRI shape: {tuple(mri.shape)}")
+    print(f"[Data] Input MRI shape: {tuple(mri.shape)}")
 
-    # Prepare condition (normalized age)
+    # ===================== Prepare Condition =====================
     c = None
-    if args.age is not None:
-        age_normalized = args.age / 100.0
-        c = torch.tensor([[age_normalized]], dtype=torch.float32).to(device)
-        print(f"Condition: age = {args.age} -> normalized = {age_normalized}")
+    age_tensor = None
+    sex_tensor = None
 
-    # Run evolution
-    print("\nRunning evolution pipeline...")
+    if args.use_demographics:
+        if args.age is not None:
+            age_normalized = args.age / 100.0
+            age_tensor = torch.tensor([[age_normalized]], dtype=torch.float32).to(device)
+            print(f"[Condition] Age: {args.age} -> normalized: {age_normalized}")
+        if args.sex is not None:
+            sex_tensor = torch.tensor([[args.sex]], dtype=torch.float32).to(device)
+            print(f"[Condition] Sex: {args.sex} (0=female, 1=male)")
+    else:
+        if args.age is not None:
+            age_normalized = args.age / 100.0
+            c = torch.tensor([[age_normalized]], dtype=torch.float32).to(device)
+            print(f"[Condition] Age: {args.age} -> normalized: {age_normalized}")
+
+    # ===================== Run Inference =====================
+    print("\n[Inference] Running evolution pipeline...")
     print("  1. Encoding MRI to latent...")
     print("  2. CFM Euler integration (z0 -> z_final)...")
     print("  3. Generating deformation field...")
     print("  4. Applying spatial warp...")
 
-    results = pipeline.evolve(mri, c=c, ode_steps=args.ode_steps)
+    results = pipeline.evolve(
+        mri,
+        c=c,
+        age=age_tensor,
+        sex=sex_tensor,
+        ode_steps=args.ode_steps,
+        use_demographics=args.use_demographics,
+    )
 
-    print("\n  Evolution complete!")
+    print("\n[Inference] Evolution complete!")
     print(f"  Initial latent z0 shape: {tuple(results['z0'].shape)}")
     print(f"  Final latent z_final shape: {tuple(results['z_final'].shape)}")
     print(f"  Trajectory length: {len(results['trajectory'])}")

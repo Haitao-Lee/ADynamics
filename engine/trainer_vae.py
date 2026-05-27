@@ -10,12 +10,14 @@ from typing import Any, Dict, Optional, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 
-from engine.losses import total_vae_loss
+from engine.losses import total_vae_loss, vae_reconstruction_loss, vae_kl_loss, gradient_loss, ssim_loss
+from engine.losses import ordinal_cross_entropy_loss, ordinal_regression_loss
 
 
 class VAETrainer:
@@ -76,9 +78,23 @@ class VAETrainer:
         self.device = torch.device(device)
         self.config = config
 
+        # Detect if model is DataParallel and get device list
+        self.is_dataparallel = False
+        self.output_device = self.device
+        if hasattr(model, "module"):
+            # Model is DataParallel or DDP wrapped
+            self.is_dataparallel = True
+            # Get list of devices from model
+            if hasattr(model, "device_ids"):
+                self.devices = [torch.device(f"cuda:{i}") for i in model.device_ids]
+            else:
+                self.devices = [self.device]
+        else:
+            self.devices = [self.device]
+
         # AMP configuration: only create scaler when use_amp is True
         self.use_amp = config.get("use_amp", False)
-        self.scaler = GradScaler('cuda') if self.use_amp else None
+        self.scaler = GradScaler() if self.use_amp else None
 
         # Move model to device
         self.model.to(self.device)
@@ -93,6 +109,23 @@ class VAETrainer:
             for batch in self.val_loader:
                 self.viz_batch = batch["image"].to(self.device)
                 break
+
+        # Memory Bank for contrastive learning (initialized lazily)
+        self.memory_bank = None
+        self.use_memory_bank = config.get("use_memory_bank", False)
+        self.bank_size = config.get("memory_bank_size", 2048)
+
+    def _get_memory_bank(self):
+        """Get or initialize memory bank with correct latent dimension."""
+        if self.memory_bank is None:
+            from engine.losses import MemoryBank
+            latent_channels = self.config.get("latent_channels", 64)
+            self.memory_bank = MemoryBank(
+                size=self.bank_size,
+                device=self.device,
+                latent_channels=latent_channels,
+            )
+        return self.memory_bank
 
     def train_epoch(self, current_kl_weight: float) -> Dict[str, float]:
         """
@@ -115,46 +148,182 @@ class VAETrainer:
         total_loss = 0.0
         total_recon_loss = 0.0
         total_kl_loss = 0.0
+        total_contrastive_loss = 0.0
         num_batches = 0
 
         recon_loss_type = self.config.get("recon_loss_type", "l1")
+        gradient_weight = self.config.get("gradient_weight", 0.0)
+        ssim_weight = self.config.get("ssim_weight", 0.0)
+        use_multi_scale = self.config.get("use_multi_scale", False)
+        multi_scale_weights = self.config.get("multi_scale_weights", [0.1, 0.2, 0.3])
+        contrastive_weight = self.config.get("contrastive_weight", 0.0)
+        contrastive_temp = self.config.get("contrastive_temperature", 0.1)
+        use_ordinal = self.config.get("use_ordinal_contrastive", True)
+        bank_size = self.config.get("memory_bank_size", 2048)
+        accumulation_steps = self.config.get("accumulation_steps", 1)
 
-        for batch in self.train_loader:
+        from tqdm import tqdm
+
+        pbar = tqdm(enumerate(self.train_loader), total=len(self.train_loader), desc="Train", leave=False)
+
+        # Temp bank for contrastive learning: collect mu features during accumulation,
+        # then compute ordinal contrastive loss with latest model weights before optimizer step.
+        # This ensures all samples in the effective batch are encoded by the same updated encoder.
+        temp_features = []  # list of [B, C, D, H, W] mu tensors
+        temp_labels = []  # list of [B] label tensors
+
+        for batch_idx, batch in pbar:
             images = batch["image"]
             images = images.to(self.device)
 
-            self.optimizer.zero_grad()
+            # Extract labels for contrastive learning
+            labels = None
+            if contrastive_weight > 0 and "label" in batch:
+                labels = batch["label"].to(self.device)
+                if labels.dim() > 1:
+                    labels = labels.squeeze()
 
-            # Forward pass with AMP autocast if enabled
+            # Extract demographic info for conditioning
+            age = None
+            sex = None
+            if getattr(self.model, "module", self.model).use_demographic_cond:
+                if "age" in batch and batch["age"] is not None:
+                    age = batch["age"].to(self.device)
+                if "sex" in batch and batch["sex"] is not None:
+                    sex = batch["sex"].to(self.device)
+
+            # Zero grad and clear temp bank at start of accumulation cycle
+            if batch_idx % accumulation_steps == 0:
+                self.optimizer.zero_grad()
+                temp_features.clear()
+                temp_labels.clear()
+
+            # Forward pass with AMP autocast
             with autocast('cuda', enabled=self.use_amp):
-                recon, mu, logvar = self.model(images)
-                loss = total_vae_loss(
-                    recon,
-                    images,
-                    mu,
-                    logvar,
-                    kl_weight=current_kl_weight,
-                    recon_loss_type=recon_loss_type,
-                )
+                if age is not None and sex is not None:
+                    # Use optional demographic args in forward() for DataParallel compatibility
+                    recon, mu, logvar = self.model(images, age=age, sex=sex)
+                else:
+                    recon, mu, logvar = self.model(images)
 
-            # Backward pass with gradient scaling (if AMP enabled)
+                # Compute recon + KL loss (contrastive handled at accumulation step)
+                recon_loss = vae_reconstruction_loss(recon, images, loss_type=recon_loss_type)
+                kl_loss = vae_kl_loss(mu, logvar, reduction="mean")
+                base_loss = recon_loss + current_kl_weight * kl_loss
+
+                if gradient_weight > 0:
+                    grad_loss = gradient_loss(recon, images)
+                    base_loss = base_loss + gradient_weight * grad_loss
+
+                if ssim_weight > 0:
+                    ssim_l = ssim_loss(recon, images)
+                    base_loss = base_loss + ssim_weight * ssim_l
+
+            # Store images and labels for contrastive computation at optimizer step
+            # Store raw images (will re-encode with latest weights at optimizer step)
+            temp_features.append(images.detach())
+            if labels is not None:
+                temp_labels.append(labels.detach())
+
+            # Backward pass for recon+KL only (accumulate gradients)
             if self.use_amp:
-                self.scaler.scale(loss).backward()
+                self.scaler.scale(base_loss).backward()
+            else:
+                base_loss.backward()
+
+            # Step optimizer every accumulation_steps batches
+            if (batch_idx + 1) % accumulation_steps == 0:
+                # Compute contrastive loss with latest model weights before optimizer step
+                # NOTE: contrastive loss should contribute to gradients for encoder to learn
+                if contrastive_weight > 0 and len(temp_features) > 0:
+                    # Keep model in train mode to ensure gradients flow to encoder
+                    # Re-encode stored images with latest model weights
+                    all_images = torch.cat(temp_features, dim=0)  # [N_total, 1, D, H, W]
+                    all_labels = torch.cat(temp_labels, dim=0)  # [N_total]
+
+                    with autocast('cuda', enabled=self.use_amp):
+                        _, mu, _ = self.model(all_images)
+
+                    # Channel-wise mean pooling: [N_total, C, D, H, W] -> [N_total, C]
+                    pooled = F.adaptive_avg_pool3d(mu, output_size=(1, 1, 1))
+                    pooled = pooled.squeeze(-1).squeeze(-1).squeeze(-1)  # [N_total, C]
+                    pooled = F.normalize(pooled, dim=1)  # L2 normalize for contrastive
+
+                    # Compute ordinal contrastive loss
+                    from engine.losses import ordinal_contrastive_loss
+                    con_loss = ordinal_contrastive_loss(
+                        pooled, all_labels,
+                        temperature=contrastive_temp,
+                        alpha=0.5,
+                    )
+
+                    # Add contrastive loss to accumulated gradients
+                    # This ensures encoder learns discriminative latent space
+                    if self.use_amp:
+                        self.scaler.scale(contrastive_weight * con_loss).backward()
+                    else:
+                        (contrastive_weight * con_loss).backward()
+
+                    con_loss_val = con_loss.item()
+                else:
+                    con_loss_val = 0.0
+
+                # Unscale, clip, and optimizer step
+                if self.use_amp:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.optimizer.step()
+                self.optimizer.zero_grad()
+
+                # Accumulate contrastive loss
+                total_contrastive_loss += con_loss_val
+
+            # Accumulate metrics for logging
+            total_loss += (base_loss.item() + (contrastive_weight * con_loss_val if contrastive_weight > 0 else 0))
+            num_batches += 1
+            pbar.set_postfix({"loss": f"{base_loss.item():.4f}", "con": f"{con_loss_val:.4f}" if contrastive_weight > 0 else "0.0", "step": f"{batch_idx+1}/{len(self.train_loader)}"})
+
+        # Handle leftover gradients from incomplete accumulation cycle
+        if len(self.train_loader) % accumulation_steps != 0:
+            # Compute contrastive loss for remaining samples
+            if contrastive_weight > 0 and len(temp_features) > 0:
+                all_images = torch.cat(temp_features, dim=0)
+                all_labels = torch.cat(temp_labels, dim=0)
+
+                with autocast('cuda', enabled=self.use_amp):
+                    _, mu, _ = self.model(all_images)
+
+                pooled = F.adaptive_avg_pool3d(mu, output_size=(1, 1, 1))
+                pooled = pooled.squeeze(-1).squeeze(-1).squeeze(-1)
+                pooled = F.normalize(pooled, dim=1)
+                from engine.losses import ordinal_contrastive_loss
+                con_loss = ordinal_contrastive_loss(pooled, all_labels, temperature=contrastive_temp, alpha=0.5)
+
+                # Add to accumulated gradients
+                if self.use_amp:
+                    self.scaler.scale(contrastive_weight * con_loss).backward()
+                else:
+                    (contrastive_weight * con_loss).backward()
+
+                total_contrastive_loss += con_loss.item()
+
+            if self.use_amp:
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
-                loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
-
-            # Accumulate metrics (only during logging to avoid sync overhead)
-            total_loss += loss.item()
-            num_batches += 1
+            self.optimizer.zero_grad()
 
         # Compute averages
         avg_loss = total_loss / num_batches
+        avg_contrastive_loss = total_contrastive_loss / max(1, len(self.train_loader) // accumulation_steps)
 
         # Compute individual components for logging
         avg_recon_loss, avg_kl_loss = self._compute_loss_components(recon_loss_type)
@@ -163,6 +332,7 @@ class VAETrainer:
             "loss": avg_loss,
             "recon_loss": avg_recon_loss,
             "kl_loss": avg_kl_loss,
+            "contrastive_loss": avg_contrastive_loss,
         }
 
     @torch.no_grad()
@@ -178,18 +348,33 @@ class VAETrainer:
                 - loss: Total VAE loss
                 - recon_loss: Reconstruction loss component
                 - kl_loss: KL divergence component
+                - contrastive_loss: Ordinal contrastive loss (disease separation)
         """
         self.model.eval()
 
         total_loss = 0.0
+        total_contrastive_loss = 0.0
         num_batches = 0
 
         recon_loss_type = self.config.get("recon_loss_type", "l1")
+        gradient_weight = self.config.get("gradient_weight", 0.0)
+        ssim_weight = self.config.get("ssim_weight", 0.0)
         kl_weight = self.config.get("kl_weight", 0.0001)
+        contrastive_weight = self.config.get("contrastive_weight", 0.0)
+        contrastive_temp = self.config.get("contrastive_temperature", 0.1)
 
-        for batch in self.val_loader:
+        from tqdm import tqdm
+        pbar = tqdm(enumerate(self.val_loader), total=len(self.val_loader), desc="Val", leave=False)
+        for batch_idx, batch in pbar:
             images = batch["image"]
             images = images.to(self.device)
+
+            # Get labels for contrastive loss
+            labels = None
+            if contrastive_weight > 0 and "label" in batch:
+                labels = batch["label"].to(self.device)
+                if labels.dim() > 1:
+                    labels = labels.squeeze()
 
             # Forward pass with AMP autocast if enabled
             with autocast('cuda', enabled=self.use_amp):
@@ -201,26 +386,44 @@ class VAETrainer:
                     logvar,
                     kl_weight=kl_weight,
                     recon_loss_type=recon_loss_type,
+                    gradient_weight=gradient_weight,
+                    ssim_weight=ssim_weight,
                 )
+
+            # Compute contrastive loss separately for best model selection
+            if contrastive_weight > 0 and labels is not None:
+                pooled = F.adaptive_avg_pool3d(mu, output_size=(1, 1, 1))
+                pooled = pooled.squeeze(-1).squeeze(-1).squeeze(-1)
+                pooled = F.normalize(pooled, dim=1)
+                from engine.losses import ordinal_contrastive_loss
+                con_loss = ordinal_contrastive_loss(
+                    pooled, labels,
+                    temperature=contrastive_temp,
+                    alpha=0.5,
+                )
+                total_contrastive_loss += con_loss.item()
 
             total_loss += loss.item()
             num_batches += 1
+            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
         avg_loss = total_loss / num_batches
+        avg_contrastive_loss = total_contrastive_loss / num_batches if num_batches > 0 else 0.0
         avg_recon_loss, avg_kl_loss = self._compute_loss_components(recon_loss_type)
 
         return {
             "loss": avg_loss,
             "recon_loss": avg_recon_loss,
             "kl_loss": avg_kl_loss,
+            "contrastive_loss": avg_contrastive_loss,
         }
 
     def _compute_loss_components(self, recon_loss_type: str) -> tuple:
         """
         Compute reconstruction and KL loss components for logging.
 
-        This is called after training to get component-wise losses
-        without extra forward passes.
+        Computes loss components by running through all validation batches
+        for accurate loss tracking during training.
 
         Args:
             recon_loss_type: Type of reconstruction loss
@@ -228,18 +431,28 @@ class VAETrainer:
         Returns:
             Tuple of (avg_recon_loss, avg_kl_loss)
         """
-        # Use fixed viz_batch for deterministic loss component logging
-        if self.viz_batch is None:
+        self.model.eval()
+        total_recon = 0.0
+        total_kl = 0.0
+        num_samples = 0
+
+        with torch.no_grad():
+            for batch in self.val_loader:
+                images = batch["image"].to(self.device)
+                with autocast('cuda', enabled=self.use_amp):
+                    recon, mu, logvar = self.model(images)
+                    recon_loss, kl_loss = self._get_loss_components(
+                        recon, images, mu, logvar, recon_loss_type
+                    )
+                batch_size = images.shape[0]
+                total_recon += recon_loss.item() * batch_size
+                total_kl += kl_loss.item() * batch_size
+                num_samples += batch_size
+
+        if num_samples == 0:
             return 0.0, 0.0
-        images = self.viz_batch
 
-        with autocast('cuda', enabled=self.use_amp):
-            recon, mu, logvar = self.model(images)
-            recon_loss, kl_loss = self._get_loss_components(
-                recon, images, mu, logvar, recon_loss_type
-            )
-
-        return recon_loss.item(), kl_loss.item()
+        return total_recon / num_samples, total_kl / num_samples
 
     def _get_loss_components(
         self,
@@ -306,10 +519,23 @@ class VAETrainer:
             filepath: Path to checkpoint file
         """
         checkpoint = torch.load(filepath, map_location=self.device)
+        sd = checkpoint["model_state_dict"]
+        # Handle DataParallel wrapper: model is DataParallel if it has .module
+        model_sd = self.model.state_dict()
+        is_dataparallel = any(k.startswith("module.") for k in model_sd)
+        has_module_prefix = any(k.startswith("module.") for k in sd)
 
-        self.model.load_state_dict(checkpoint["model_state_dict"])
+        if is_dataparallel and not has_module_prefix:
+            # Checkpoint from non-DP, current model is DP -> add module. prefix
+            new_sd = {f"module.{k}": v for k, v in sd.items()}
+        elif not is_dataparallel and has_module_prefix:
+            # Checkpoint from DP, current model is non-DP -> strip module. prefix
+            new_sd = {k[7:]: v for k, v in sd.items()}
+        else:
+            new_sd = sd
+        self.model.load_state_dict(new_sd)
         self.current_epoch = checkpoint.get("epoch", 0)
-        self.best_val_loss = checkpoint.get("best_val_loss", float("inf"))
+        self.best_val_loss = float("inf")
 
         if "optimizer_state_dict" in checkpoint:
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -317,11 +543,41 @@ class VAETrainer:
         if "scheduler_state_dict" in checkpoint and self.scheduler is not None:
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
 
+    def load_encoder_only(self, filepath: str) -> None:
+        """Load only encoder weights from checkpoint, decoder is reinitialized."""
+        checkpoint = torch.load(filepath, map_location=self.device)
+        sd = checkpoint["model_state_dict"]
+
+        model_sd = self.model.state_dict()
+        is_dataparallel = any(k.startswith("module.") for k in model_sd)
+
+        # Strip module. from checkpoint keys for matching
+        clean_sd = {}
+        for k, v in sd.items():
+            k_clean = k[7:] if k.startswith("module.") else k
+            clean_sd[k_clean] = v
+
+        # Add module. back if current model is DataParallel
+        matched = {}
+        for k, v in clean_sd.items():
+            if k.startswith("encoder") and k in model_sd:
+                key = f"module.{k}" if is_dataparallel else k
+                matched[key] = v
+
+        result = self.model.load_state_dict(matched, strict=False)
+        # Count how many matched
+        loaded = sum(1 for k in matched if any(k in mk for mk in model_sd))
+        print(f"Encoder loading: {loaded} matched, rest freshly initialized.")
+        self.current_epoch = 0
+        self.best_val_loss = float("inf")
+
     def train(
         self,
         num_epochs: int,
         save_interval: int = 50,
         output_dir: str = "./checkpoints",
+        early_stopping_patience: int = 50,
+        log_file: Optional[str] = None,
     ) -> Dict[str, list]:
         """
         Run full training loop with KL annealing and AMP.
@@ -333,26 +589,49 @@ class VAETrainer:
             num_epochs: Number of epochs to train
             save_interval: Interval for saving checkpoints
             output_dir: Directory to save checkpoints
+            early_stopping_patience: Epochs without val loss improvement before stopping (default: 50)
+            log_file: Path to CSV log file. If None, saves to output_dir/train_log.csv
 
         Returns:
             Dictionary containing training history with lists of:
                 - train_loss, train_recon_loss, train_kl_loss
                 - val_loss, val_recon_loss, val_kl_loss
         """
+        import csv
+        import time
+
         target_kl_weight = self.config.get("kl_weight", 0.0001)
         kl_warmup_epochs = self.config.get("kl_warmup_epochs", 5)
+
+        # Setup log file
+        if log_file is None:
+            log_file = os.path.join(output_dir, "train_log.csv")
+        os.makedirs(os.path.dirname(log_file) if os.path.dirname(log_file) else ".", exist_ok=True)
+
+        # Check if log file exists and has data (resume case)
+        log_exists = os.path.exists(log_file)
+        write_header = not log_exists
 
         history = {
             "train_loss": [],
             "train_recon_loss": [],
             "train_kl_loss": [],
+            "train_contrastive_loss": [],
             "val_loss": [],
             "val_recon_loss": [],
             "val_kl_loss": [],
+            "val_contrastive_loss": [],
         }
 
+        # Early stopping state
+        epochs_without_improvement = 0
+        early_stopped = False
+        self.best_contrastive_loss = float("inf")  # for minimization: smaller (more negative) = better separation
+
+        # Training loop
         for epoch in range(num_epochs):
             self.current_epoch = epoch
+            epoch_start_time = time.time()
 
             # Compute KL weight with annealing (warmup from 0 to target)
             if epoch < kl_warmup_epochs:
@@ -371,23 +650,64 @@ class VAETrainer:
                 self.scheduler.step()
 
             current_lr = self.optimizer.param_groups[0]["lr"]
+            epoch_time = time.time() - epoch_start_time
+
+            # Check if this is best model (based on contrastive_loss for disease separation)
+            # contrastive_loss is negative, MORE NEGATIVE = better separation (smaller = better)
+            current_con_loss = val_metrics["contrastive_loss"]
+            is_best = current_con_loss < self.best_contrastive_loss
+            if is_best:
+                self.best_contrastive_loss = current_con_loss
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
 
             # Log metrics
             print(
                 f"Epoch [{epoch+1}/{num_epochs}] "
                 f"LR: {current_lr:.6f} | "
                 f"KL_w: {current_kl_weight:.6f} | "
-                f"Train Loss: {train_metrics['loss']:.4f} | "
-                f"Val Loss: {val_metrics['loss']:.4f}"
+                f"Train: {train_metrics['loss']:.4f} (recon: {train_metrics['recon_loss']:.4f}, con: {train_metrics['contrastive_loss']:.4f}) | "
+                f"Val: {val_metrics['loss']:.4f} (recon: {val_metrics['recon_loss']:.4f}, con: {val_metrics['contrastive_loss']:.4f}) | "
+                f"Time: {epoch_time:.1f}s | "
+                f"Patience: {epochs_without_improvement}/{early_stopping_patience}"
             )
 
             # Record history
             history["train_loss"].append(train_metrics["loss"])
             history["train_recon_loss"].append(train_metrics["recon_loss"])
             history["train_kl_loss"].append(train_metrics["kl_loss"])
+            history["train_contrastive_loss"].append(train_metrics["contrastive_loss"])
             history["val_loss"].append(val_metrics["loss"])
             history["val_recon_loss"].append(val_metrics["recon_loss"])
             history["val_kl_loss"].append(val_metrics["kl_loss"])
+            history["val_contrastive_loss"].append(val_metrics["contrastive_loss"])
+
+            # Write to CSV log
+            with open(log_file, "a", newline="") as f:
+                writer = csv.writer(f)
+                if write_header:
+                    writer.writerow([
+                        "epoch", "train_loss", "train_recon_loss", "train_kl_loss", "train_contrastive_loss",
+                        "val_loss", "val_recon_loss", "val_kl_loss", "val_contrastive_loss",
+                        "lr", "kl_weight", "epoch_time", "is_best"
+                    ])
+                    write_header = False
+                writer.writerow([
+                    epoch + 1,
+                    f"{train_metrics['loss']:.6f}",
+                    f"{train_metrics['recon_loss']:.6f}",
+                    f"{train_metrics['kl_loss']:.6f}",
+                    f"{train_metrics['contrastive_loss']:.6f}",
+                    f"{val_metrics['loss']:.6f}",
+                    f"{val_metrics['recon_loss']:.6f}",
+                    f"{val_metrics['kl_loss']:.6f}",
+                    f"{val_metrics['contrastive_loss']:.6f}",
+                    f"{current_lr:.8f}",
+                    f"{current_kl_weight:.6f}",
+                    f"{epoch_time:.2f}",
+                    "1" if is_best else "0"
+                ])
 
             # Save checkpoint
             if (epoch + 1) % save_interval == 0:
@@ -396,10 +716,438 @@ class VAETrainer:
                 print(f"Checkpoint saved to {checkpoint_path}")
 
             # Save best model
-            if val_metrics["loss"] < self.best_val_loss:
-                self.best_val_loss = val_metrics["loss"]
+            if is_best:
                 best_path = os.path.join(output_dir, "vae_best.pt")
                 self.save_checkpoint(best_path)
-                print(f"Best model saved to {best_path} (val_loss: {self.best_val_loss:.4f})")
+                print(f"Best model saved to {best_path} (val_con_loss: {current_con_loss:.4f})")
+
+            # Early stopping check
+            if epochs_without_improvement >= early_stopping_patience:
+                print(f"\n{'='*60}")
+                print(f"Early stopping triggered at epoch {epoch+1}")
+                print(f"No improvement for {early_stopping_patience} epochs")
+                print(f"Best val_loss: {self.best_val_loss:.6f}")
+                print(f"{'='*60}\n")
+                early_stopped = True
+                break
+
+        # Save final history
+        if early_stopped:
+            print(f"Training stopped early at epoch {epoch+1}")
+            print(f"Best val_loss: {self.best_val_loss:.6f}")
+
+        return history
+
+
+class MultiModalVAETrainer:
+    """
+    Trainer class for Multi-Modal VAE in Stage 1 of ADynamics.
+
+    Supports:
+        - Multi-modal VAE training (T1 + optional fMRI/ASL/QSM/FLAIR)
+        - Joint training with reconstruction + classification losses
+        - Modality dropout for robustness to missing modalities
+        - AMP for memory-efficient HD training
+
+    Attributes:
+        model: The MultiModalVAE3D model being trained
+        optimizer: AdamW optimizer
+        scheduler: Learning rate scheduler
+        train_loader: Training data loader
+        val_loader: Validation data loader
+        device: Device to train on (cuda/cpu)
+        config: Training configuration dictionary
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        optimizer: AdamW,
+        train_loader: DataLoader,
+        val_loader: DataLoader,
+        device: Union[str, torch.device],
+        config: Dict[str, Any],
+        scheduler: Optional[CosineAnnealingLR] = None,
+    ) -> None:
+        """
+        Initialize the Multi-Modal VAE trainer.
+
+        Args:
+            model: The MultiModalVAE3D model to train
+            optimizer: AdamW optimizer instance
+            train_loader: DataLoader for training data
+            val_loader: DataLoader for validation data
+            device: Device to train on ("cuda" or "cpu")
+            config: Configuration dictionary containing:
+                - recon_loss_type: Type of reconstruction loss ("l1" or "l2")
+                - cls_weight: Weight for classification loss. Default: 1.0
+                - use_amp: Enable AMP training (default: True)
+            scheduler: Optional learning rate scheduler
+        """
+        self.model = model
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.device = torch.device(device)
+        self.config = config
+
+        # AMP configuration
+        self.use_amp = config.get("use_amp", False)
+        self.scaler = GradScaler() if self.use_amp else None
+
+        # Move model to device
+        self.model.to(self.device)
+
+        # Training state
+        self.current_epoch = 0
+        self.best_val_loss = float("inf")
+        self.best_cls_acc = 0.0
+
+    def train_epoch(self) -> Dict[str, float]:
+        """
+        Run one training epoch.
+
+        Returns:
+            Dictionary containing average training metrics
+        """
+        self.model.train()
+
+        total_loss = 0.0
+        total_recon_loss = 0.0
+        total_cls_loss = 0.0
+        total_kl_loss = 0.0
+        total_cls_acc = 0.0
+        num_batches = 0
+
+        recon_loss_type = self.config.get("recon_loss_type", "l1")
+        cls_weight = self.config.get("cls_weight", 1.0)
+        kl_weight = self.config.get("kl_weight", 0.01)
+
+        from tqdm import tqdm
+        pbar = tqdm(enumerate(self.train_loader), total=len(self.train_loader), desc="Train", leave=False)
+
+        for batch_idx, batch in pbar:
+            # Get T1 (already preprocessed to 256x256x192)
+            t1 = batch["t1"].to(self.device)
+
+            # Build x_dict with T1 and optional modalities
+            x_dict = {"t1": t1}
+
+            # Optional modalities - encoder handles different sizes via adaptive pooling
+            for mod in ["fmri", "asl", "qsm", "flair"]:
+                if mod in batch and batch[mod] is not None:
+                    x_dict[mod] = batch[mod].to(self.device)
+
+            labels = batch.get("label")
+            if labels is not None:
+                labels = labels.to(self.device)
+                if labels.dim() > 1:
+                    labels = labels.squeeze()
+
+            # Zero grad
+            self.optimizer.zero_grad()
+
+            # Forward pass
+            with autocast('cuda', enabled=self.use_amp):
+                recon, cls_logits, mu, logvar = self.model(x_dict, return_components=True)
+
+                # Reconstruction loss (only T1)
+                recon_loss = F.l1_loss(recon, x_dict["t1"])
+
+                # Classification loss with ordinal structure
+                if labels is not None:
+                    # Use ordinal CE: penalizes distant misclassification more
+                    cls_loss = ordinal_cross_entropy_loss(cls_logits, labels, num_classes=4)
+                    # Add ordinal regression loss on latent mean
+                    ordinal_reg_loss = ordinal_regression_loss(mu, labels, num_classes=4)
+                else:
+                    cls_loss = torch.tensor(0.0, device=self.device)
+                    ordinal_reg_loss = torch.tensor(0.0, device=self.device)
+
+                # KL loss (true VAE)
+                kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+
+                # Total loss
+                loss = recon_loss + cls_weight * cls_loss + kl_weight * kl_loss + 0.1 * ordinal_reg_loss
+
+            # Backward pass
+            if self.use_amp:
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+
+            # Metrics
+            with torch.no_grad():
+                if labels is not None:
+                    preds = cls_logits.argmax(dim=1)
+                    cls_acc = (preds == labels).float().mean().item()
+                else:
+                    cls_acc = 0.0
+
+            total_loss += loss.item()
+            total_recon_loss += recon_loss.item()
+            total_cls_loss += cls_loss.item()
+            total_kl_loss += kl_loss.item()
+            total_cls_acc += cls_acc
+            num_batches += 1
+
+            pbar.set_postfix({
+                "loss": f"{loss.item():.4f}",
+                "recon": f"{recon_loss.item():.4f}",
+                "cls": f"{cls_loss.item():.4f}",
+                "kl": f"{kl_loss.item():.4f}",
+            })
+
+        return {
+            "loss": total_loss / num_batches,
+            "recon_loss": total_recon_loss / num_batches,
+            "cls_loss": total_cls_loss / num_batches,
+            "kl_loss": total_kl_loss / num_batches,
+            "cls_acc": total_cls_acc / num_batches,
+        }
+
+    @torch.no_grad()
+    def validate_epoch(self) -> Dict[str, float]:
+        """
+        Run one validation epoch.
+
+        Returns:
+            Dictionary containing average validation metrics
+        """
+        self.model.eval()
+
+        total_loss = 0.0
+        total_recon_loss = 0.0
+        total_cls_loss = 0.0
+        total_cls_acc = 0.0
+        num_batches = 0
+
+        recon_loss_type = self.config.get("recon_loss_type", "l1")
+        cls_weight = self.config.get("cls_weight", 1.0)
+        kl_weight = self.config.get("kl_weight", 0.01)
+
+        from tqdm import tqdm
+        pbar = tqdm(enumerate(self.val_loader), total=len(self.val_loader), desc="Val", leave=False)
+        total_kl_loss = 0.0
+
+        for batch_idx, batch in pbar:
+            # Get T1 (already preprocessed)
+            t1 = batch["t1"].to(self.device)
+
+            # Build x_dict with T1 and optional modalities
+            x_dict = {"t1": t1}
+
+            for mod in ["fmri", "asl", "qsm", "flair"]:
+                if mod in batch and batch[mod] is not None:
+                    x_dict[mod] = batch[mod].to(self.device)
+
+            labels = batch.get("label")
+            if labels is not None:
+                labels = labels.to(self.device)
+                if labels.dim() > 1:
+                    labels = labels.squeeze()
+
+            with autocast('cuda', enabled=self.use_amp):
+                recon, cls_logits, mu, logvar = self.model(x_dict, return_components=True)
+
+                recon_loss = F.l1_loss(recon, x_dict["t1"])
+
+                if labels is not None:
+                    cls_loss = ordinal_cross_entropy_loss(cls_logits, labels, num_classes=4)
+                    ordinal_reg_loss = ordinal_regression_loss(mu, labels, num_classes=4)
+                    preds = cls_logits.argmax(dim=1)
+                    cls_acc = (preds == labels).float().mean().item()
+                else:
+                    cls_loss = torch.tensor(0.0, device=self.device)
+                    ordinal_reg_loss = torch.tensor(0.0, device=self.device)
+                    cls_acc = 0.0
+
+                kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+                loss = recon_loss + cls_weight * cls_loss + kl_weight * kl_loss + 0.1 * ordinal_reg_loss
+
+            total_loss += loss.item()
+            total_recon_loss += recon_loss.item()
+            total_cls_loss += cls_loss.item()
+            total_kl_loss += kl_loss.item()
+            total_cls_acc += cls_acc
+            num_batches += 1
+
+            pbar.set_postfix({"loss": f"{loss.item():.4f}", "acc": f"{cls_acc:.4f}"})
+
+        return {
+            "loss": total_loss / num_batches,
+            "recon_loss": total_recon_loss / num_batches,
+            "cls_loss": total_cls_loss / num_batches,
+            "kl_loss": total_kl_loss / num_batches,
+            "cls_acc": total_cls_acc / num_batches,
+        }
+
+    def save_checkpoint(self, filepath: str, include_optimizer: bool = True) -> None:
+        """Save model checkpoint."""
+        checkpoint = {
+            "epoch": self.current_epoch,
+            "model_state_dict": self.model.state_dict(),
+            "best_val_loss": self.best_val_loss,
+            "best_cls_acc": self.best_cls_acc,
+        }
+        if include_optimizer:
+            checkpoint["optimizer_state_dict"] = self.optimizer.state_dict()
+        os.makedirs(os.path.dirname(filepath) if os.path.dirname(filepath) else ".", exist_ok=True)
+        torch.save(checkpoint, filepath)
+
+    def load_checkpoint(self, filepath: str) -> None:
+        """Load model checkpoint."""
+        checkpoint = torch.load(filepath, map_location=self.device)
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.current_epoch = checkpoint.get("epoch", 0)
+        self.best_val_loss = float("inf")
+        self.best_cls_acc = 0.0
+        if "optimizer_state_dict" in checkpoint:
+            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+    def train(
+        self,
+        num_epochs: int,
+        save_interval: int = 50,
+        output_dir: str = "./checkpoints",
+        early_stopping_patience: int = 50,
+        log_file: Optional[str] = None,
+    ) -> Dict[str, list]:
+        """
+        Run full training loop.
+
+        Args:
+            num_epochs: Number of epochs to train
+            save_interval: Interval for saving checkpoints
+            output_dir: Directory to save checkpoints
+            early_stopping_patience: Epochs without improvement before stopping
+            log_file: Path to CSV log file
+
+        Returns:
+            Dictionary containing training history
+        """
+        import csv
+        import time
+
+        if log_file is None:
+            log_file = os.path.join(output_dir, "train_log.csv")
+        os.makedirs(os.path.dirname(log_file) if os.path.dirname(log_file) else ".", exist_ok=True)
+
+        log_exists = os.path.exists(log_file)
+        write_header = not log_exists
+
+        history = {
+            "train_loss": [],
+            "train_recon_loss": [],
+            "train_cls_loss": [],
+            "train_kl_loss": [],
+            "train_cls_acc": [],
+            "val_loss": [],
+            "val_recon_loss": [],
+            "val_cls_loss": [],
+            "val_kl_loss": [],
+            "val_cls_acc": [],
+        }
+
+        epochs_without_improvement = 0
+        early_stopped = False
+
+        for epoch in range(num_epochs):
+            self.current_epoch = epoch
+            epoch_start_time = time.time()
+
+            train_metrics = self.train_epoch()
+            val_metrics = self.validate_epoch()
+
+            if self.scheduler is not None:
+                self.scheduler.step()
+
+            current_lr = self.optimizer.param_groups[0]["lr"]
+            epoch_time = time.time() - epoch_start_time
+
+            # Best model selection based on cls_acc (higher = better)
+            current_cls_acc = val_metrics["cls_acc"]
+            is_best = current_cls_acc > self.best_cls_acc
+            if is_best:
+                self.best_cls_acc = current_cls_acc
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+
+            print(
+                f"Epoch [{epoch+1}/{num_epochs}] "
+                f"LR: {current_lr:.6f} | "
+                f"Train: {train_metrics['loss']:.4f} (recon: {train_metrics['recon_loss']:.4f}, cls: {train_metrics['cls_loss']:.4f}, kl: {train_metrics['kl_loss']:.4f}, acc: {train_metrics['cls_acc']:.4f}) | "
+                f"Val: {val_metrics['loss']:.4f} (recon: {val_metrics['recon_loss']:.4f}, cls: {val_metrics['cls_loss']:.4f}, kl: {val_metrics['kl_loss']:.4f}, acc: {val_metrics['cls_acc']:.4f}) | "
+                f"Time: {epoch_time:.1f}s | "
+                f"Patience: {epochs_without_improvement}/{early_stopping_patience}"
+            )
+
+            # Record history
+            history["train_loss"].append(train_metrics["loss"])
+            history["train_recon_loss"].append(train_metrics["recon_loss"])
+            history["train_cls_loss"].append(train_metrics["cls_loss"])
+            history["train_kl_loss"].append(train_metrics["kl_loss"])
+            history["train_cls_acc"].append(train_metrics["cls_acc"])
+            history["val_loss"].append(val_metrics["loss"])
+            history["val_recon_loss"].append(val_metrics["recon_loss"])
+            history["val_cls_loss"].append(val_metrics["cls_loss"])
+            history["val_kl_loss"].append(val_metrics["kl_loss"])
+            history["val_cls_acc"].append(val_metrics["cls_acc"])
+
+            # Write to CSV
+            with open(log_file, "a", newline="") as f:
+                writer = csv.writer(f)
+                if write_header:
+                    writer.writerow([
+                        "epoch", "train_loss", "train_recon_loss", "train_cls_loss", "train_kl_loss", "train_cls_acc",
+                        "val_loss", "val_recon_loss", "val_cls_loss", "val_kl_loss", "val_cls_acc",
+                        "lr", "epoch_time", "is_best"
+                    ])
+                    write_header = False
+                writer.writerow([
+                    epoch + 1,
+                    f"{train_metrics['loss']:.6f}",
+                    f"{train_metrics['recon_loss']:.6f}",
+                    f"{train_metrics['cls_loss']:.6f}",
+                    f"{train_metrics['kl_loss']:.6f}",
+                    f"{train_metrics['cls_acc']:.6f}",
+                    f"{val_metrics['loss']:.6f}",
+                    f"{val_metrics['recon_loss']:.6f}",
+                    f"{val_metrics['cls_loss']:.6f}",
+                    f"{val_metrics['kl_loss']:.6f}",
+                    f"{val_metrics['cls_acc']:.6f}",
+                    f"{current_lr:.8f}",
+                    f"{epoch_time:.2f}",
+                    "1" if is_best else "0"
+                ])
+
+            # Save checkpoint
+            if (epoch + 1) % save_interval == 0:
+                checkpoint_path = os.path.join(output_dir, f"vae_epoch_{epoch+1}.pt")
+                self.save_checkpoint(checkpoint_path)
+                print(f"Checkpoint saved to {checkpoint_path}")
+
+            # Save best model
+            if is_best:
+                best_path = os.path.join(output_dir, "vae_best.pt")
+                self.save_checkpoint(best_path)
+                print(f"Best model saved to {best_path} (val_cls_acc: {current_cls_acc:.4f})")
+
+            # Early stopping
+            if epochs_without_improvement >= early_stopping_patience:
+                print(f"\n{'='*60}")
+                print(f"Early stopping triggered at epoch {epoch+1}")
+                print(f"Best val_cls_acc: {self.best_cls_acc:.4f}")
+                print(f"{'='*60}\n")
+                early_stopped = True
+                break
 
         return history

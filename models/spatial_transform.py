@@ -76,6 +76,7 @@ class DeformationGenerator(nn.Module):
         self.latent_spatial = latent_spatial
         self.output_spatial = output_spatial
         self.max_displacement = max_displacement
+        self.num_res_blocks = num_res_blocks
 
         # Initial projection from latent to feature map
         self.latent_proj = nn.Sequential(
@@ -91,6 +92,13 @@ class DeformationGenerator(nn.Module):
         ch = base_channels * channel_mults[-1]
         self.num_levels = len(channel_mults)
 
+        # Compute how many 2x upsamples we need to go from latent_spatial to output_spatial
+        import math
+        n_upsamples_d = max(0, round(math.log2(output_spatial[0] / latent_spatial[0])))
+        n_upsamples_h = max(0, round(math.log2(output_spatial[1] / latent_spatial[1])))
+        # Use the max dimension to determine upsample count (assumes spatial ratios are powers of 2)
+        n_upsamples = max(n_upsamples_d, n_upsamples_h)
+
         for i, mult in enumerate(reversed(channel_mults)):
             out_ch = base_channels * mult
 
@@ -104,7 +112,7 @@ class DeformationGenerator(nn.Module):
                 )
                 ch = out_ch
 
-            if i < len(channel_mults):
+            if i < n_upsamples:
                 self.decoder_upsample.append(
                     nn.ConvTranspose3d(ch, ch, 4, stride=2, padding=1)
                 )
@@ -145,14 +153,17 @@ class DeformationGenerator(nn.Module):
         h = self.latent_proj(z_final)
 
         block_idx = 0
-        for i in range(len(self.decoder_upsample)):
+        num_levels = len(self.decoder_upsample)
+
+        for i in range(num_levels):
             h = self.decoder_upsample[i](h)
 
-            for _ in range(2):
+            for _ in range(self.num_res_blocks):
                 h = h + self.decoder_blocks[block_idx](h)
                 block_idx += 1
 
-        for _ in range(2):
+        # Final blocks after last upsample (no more upsample, just residual blocks)
+        for _ in range(self.num_res_blocks):
             h = h + self.decoder_blocks[block_idx](h)
             block_idx += 1
 
@@ -391,55 +402,49 @@ def compute_determinant_jacobian(
     spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0),
 ) -> Tensor:
     """
-    Compute Jacobian determinant for a deformation field using torch.gradient.
+    Compute Jacobian determinant for a deformation field.
 
     For deformation φ(x) = x + u(x), J = I + ∂u/∂x
+    where u = (u_x, u_y, u_z) is the displacement field.
 
-    Uses torch.gradient for more accurate gradient computation that handles
-    boundary conditions better than manual slicing.
+    Uses torch.gradient for accurate gradient computation.
 
     Args:
         flow: Deformation field [B, 3, D, H, W]
-        spacing: Voxel spacing for gradient computation
+            - flow[:, 0] = displacement in W dimension (x-direction)
+            - flow[:, 1] = displacement in H dimension (y-direction)
+            - flow[:, 2] = displacement in D dimension (z-direction)
+        spacing: Voxel spacing (d, h, w) for gradient normalization
 
     Returns:
-        Jacobian determinant [B, D, H, W] (same size as input, edge handling at boundaries)
+        Jacobian determinant [B, D-2, H-2, W-2]
+        det > 0: orientation preserving (valid deformation)
+        det <= 0: folding/invalid (penalized by compute_jacobian_penalty)
     """
-    B, _, D, H, W = flow.shape
+    # torch.gradient returns partial derivatives for each spatial dimension
+    # dim order: (2, 3, 4) = (D, H, W) = (z, y, x) in physical space
 
-    # Use torch.gradient for accurate gradient computation
-    # gradient returns [B, 3, spatial_dims] for each spatial dimension
+    # Gradients of displacement in x-direction (W dimension)
+    # d_d, d_h, d_w are partial derivatives w.r.t. D, H, W axes
+    d_d, d_h, d_w = torch.gradient(flow[:, 0], dim=(2, 3, 4), spacing=spacing)
+    e_d, e_h, e_w = torch.gradient(flow[:, 1], dim=(2, 3, 4), spacing=spacing)
+    f_d, f_h, f_w = torch.gradient(flow[:, 2], dim=(2, 3, 4), spacing=spacing)
 
-    # Compute gradients along each dimension using torch.gradient
-    # Flow channel 0 = x displacement (W), channel 1 = y displacement (H), channel 2 = z displacement (D)
-
-    # Gradient w.r.t. x (W dimension) - note: x coordinate index in PyTorch is the last spatial index
-    dx0, dx1, dx2 = torch.gradient(flow[:, 0], dim=(2, 3, 4), spacing=(spacing[0], spacing[1], spacing[2]))
-    # dx0 = du_x/dx (wrt D), dx1 = du_x/dy (wrt H), dx2 = du_x/dz (wrt W)
-
-    dy0, dy1, dy2 = torch.gradient(flow[:, 1], dim=(2, 3, 4), spacing=(spacing[0], spacing[1], spacing[2]))
-    # dy0 = du_y/dx (wrt D), dy1 = du_y/dy (wrt H), dy2 = du_y/dz (wrt W)
-
-    dz0, dz1, dz2 = torch.gradient(flow[:, 2], dim=(2, 3, 4), spacing=(spacing[0], spacing[1], spacing[2]))
-    # dz0 = du_z/dx (wrt D), dz1 = du_z/dy (wrt H), dz2 = du_z/dz (wrt W)
-
-    # Jacobian matrix J for each spatial location:
-    # J[i,j] = ∂φ_i / ∂x_j = δ_ij + ∂u_i / ∂x_j
+    # Jacobian matrix J = I + ∂u/∂x:
+    # J = [[1 + ∂u_x/∂x,   ∂u_x/∂y,   ∂u_x/∂z],
+    #      [∂u_y/∂x,   1 + ∂u_y/∂y,   ∂u_y/∂z],
+    #      [∂u_z/∂x,     ∂u_z/∂y,   1 + ∂u_z/∂z]]
     #
-    # For 3D: J = [[1+du_x/dx, du_x/dy, du_x/dz],
-    #              [du_y/dx, 1+du_y/dy, du_y/dz],
-    #              [du_z/dx, du_z/dy, 1+du_z/dz]]
-    #
-    # Where x=W, y=H, z=D in tensor indexing
+    # In code: x→W (dim 4), y→H (dim 3), z→D (dim 2)
+    # J = [[1 + d_w,       d_h,       d_d],
+    #      [    e_w,   1 + e_h,       e_d],
+    #      [    f_w,       f_h,   1 + f_d]]
 
-    # Compute determinant: det(J) = (1+dx0)*((1+dy1)*(1+dz2) - dy2*dz1)
-    #                          - dx1*(dy0*(1+dz2) - dy2*dz0)
-    #                          + dx2*(dy0*dz1 - (1+dy1)*dz0)
-
+    # det(J) = (1+d_w)*((1+e_h)*(1+f_d) - e_d*f_h) - d_h*(e_w*(1+f_d) - e_d*f_w) + d_d*(e_w*f_h - (1+e_h)*f_w)
     det = (
-        (1 + dx0) * ((1 + dy1) * (1 + dz2) - dy2 * dz1)
-        - dx1 * (dy0 * (1 + dz2) - dy2 * dz0)
-        + dx2 * (dy0 * dz1 - (1 + dy1) * dz0)
+        (1 + d_w) * ((1 + e_h) * (1 + f_d) - e_d * f_h)
+        - d_h * (e_w * (1 + f_d) - e_d * f_w)
+        + d_d * (e_w * f_h - (1 + e_h) * f_w)
     )
 
     return det

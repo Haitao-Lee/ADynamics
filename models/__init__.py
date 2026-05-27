@@ -3,13 +3,11 @@ ADynamics Models Module
 
 Neural network architectures for AD progression modeling:
 - 3D VAE for latent representation learning
-- Disease stage classifier
 - Conditional Flow Matching vector field
 - Spatial transformer for deformation
 """
 
-from models.vae3d import ADynamicsVAE3D
-from models.classifier import DiseaseClassifier, classifier_ce_loss, classifier_accuracy
+from models.vae3d import ADynamicsVAE3D, MultiModalVAE3D
 from models.vector_field import VelocityFieldNet, cfm_velocity_loss
 from models.spatial_transform import (
     DeformationGenerator,
@@ -22,9 +20,7 @@ from models.spatial_transform import (
 
 __all__ = [
     "ADynamicsVAE3D",
-    "DiseaseClassifier",
-    "classifier_ce_loss",
-    "classifier_accuracy",
+    "MultiModalVAE3D",
     "VelocityFieldNet",
     "cfm_velocity_loss",
     "DeformationGenerator",

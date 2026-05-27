@@ -60,6 +60,8 @@ def vae_kl_loss(
     """
     if reduction == "mean":
         kl_div = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+        if torch.isnan(kl_div).any() or torch.isinf(kl_div).any():
+            print(f"[DEBUG KL] 1+logvar={torch.mean(1+logvar):.4f}, mu.pow(2)={torch.mean(mu.pow(2)):.4f}, logvar.exp()={torch.mean(logvar.exp()):.4f}, kl_div={kl_div.item()}")
     elif reduction == "sum":
         kl_div = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
     elif reduction == "none":
@@ -69,6 +71,374 @@ def vae_kl_loss(
     return kl_div
 
 
+def gradient_loss(recon: Tensor, target: Tensor) -> Tensor:
+    """
+    Compute gradient (edge/texture) loss using Sobel filters.
+    Helps preserve fine纹理 details in reconstruction.
+
+    Args:
+        recon: Reconstructed MRI [B, 1, D, H, W]
+        target: Target MRI [B, 1, D, H, W]
+
+    Returns:
+        Scalar gradient loss
+    """
+    # Sobel kernels for 3D: depth, height, width
+    # Use smooth+gradient approach via 3x3x3 averaging - gradient difference
+    kernel_size = 3
+    pad = kernel_size // 2
+
+    # Simple 3D gradient via central differences (avoids needing scipy)
+    def gradient_diff(x):
+        # D gradientqing
+        g_d = x[:, :, 2:, 1:-1, 1:-1] - x[:, :, :-2, 1:-1, 1:-1]
+        # H gradient
+        g_h = x[:, :, 1:-1, 2:, 1:-1] - x[:, :, 1:-1, :-2, 1:-1]
+        # W gradient
+        g_w = x[:, :, 1:-1, 1:-1, 2:] - x[:, :, 1:-1, 1:-1, :-2]
+        return g_d, g_h, g_w
+
+    recon_d, recon_h, recon_w = gradient_diff(recon)
+    target_d, target_h, target_w = gradient_diff(target)
+
+    loss = (F.l1_loss(recon_d, target_d) +
+            F.l1_loss(recon_h, target_h) +
+            F.l1_loss(recon_w, target_w))
+    return loss / 3.0
+
+
+def ssim_loss(recon: Tensor, target: Tensor, window_size: int = 11) -> Tensor:
+    """
+    Compute SSIM loss for structural similarity preservation.
+    SSIM is more sensitive to structural/texture changes than L1/L2.
+
+    Uses MONAI's SSIMLoss if available, otherwise falls back to simple SSIM.
+
+    Args:
+        recon: Reconstructed MRI [B, 1, D, H, W]
+        target: Target MRI [B, 1, D, H, W]
+        window_size: Window size for SSIM computation
+
+    Returns:
+        Scalar SSIM loss (1 - SSIM so minimizing it maximizes SSIM)
+    """
+    # Use fallback only - MONAI SSIMLoss has issues with 3D tensors
+    C1 = 0.01 ** 2
+    C2 = 0.03 ** 2
+
+    mu_recon = recon.mean(dim=(-1, -2, -3), keepdim=True)
+    mu_target = target.mean(dim=(-1, -2, -3), keepdim=True)
+    var_recon = recon.var(dim=(-1, -2, -3), keepdim=True)
+    var_target = target.var(dim=(-1, -2, -3), keepdim=True)
+
+    cov = ((recon - mu_recon) * (target - mu_target)).mean(dim=(-1, -2, -3), keepdim=True)
+
+    ssim_val = ((2 * mu_recon * mu_target + C1) * (2 * cov + C2) /
+                ((mu_recon ** 2 + mu_target ** 2 + C1) * (var_recon + var_target + C2)))
+    return 1.0 - ssim_val.mean()
+
+
+def ordinal_cross_entropy_loss(
+    logits: Tensor,
+    labels: Tensor,
+    num_classes: int = 4,
+) -> Tensor:
+    """
+    Ordinal Cross Entropy Loss for disease progression classification.
+
+    Penalizes misclassification based on ordinal distance:
+        - NC(0) vs AD(3) is penalized 3x more than NC(0) vs SCD(1)
+        - This enforces the ordinal structure NC < SCD < MCI < AD
+
+    Loss = sum(|label - pred| / (num_classes-1) * CE_loss
+
+    Args:
+        logits: Classification logits [B, num_classes]
+        labels: Ground truth labels [B] - 0=NC, 1=SCD, 2=MCI, 3=AD
+        num_classes: Number of classes
+
+    Returns:
+        Scalar loss
+    """
+    # Standard cross entropy
+    ce_loss = F.cross_entropy(logits, labels, reduction='none')
+
+    # Ordinal penalty: distance from correct class
+    preds = logits.argmax(dim=1)
+    ordinal_error = torch.abs(preds.float() - labels.float())
+
+    # Weight loss by ordinal distance
+    ordinal_weight = ordinal_error.float() / float(num_classes - 1)
+    loss = ce_loss * (1.0 + ordinal_weight)
+
+    return loss.mean()
+
+
+def ordinal_regression_loss(
+    mu: Tensor,
+    labels: Tensor,
+    num_classes: int = 4,
+) -> Tensor:
+    """
+    Ordinal Regression Loss for latent space alignment.
+
+    Encourages latent mean to form ordinal structure:
+        z[NC] < z[SCD] < z[MCI] < z[AD]
+
+    Uses MSE between normalized ordinal positions.
+
+    Args:
+        mu: Latent mean [B, C, D, H, W]
+        labels: Disease labels [B] - 0=NC, 1=SCD, 2=MCI, 3=AD
+        num_classes: Number of classes
+
+    Returns:
+        Scalar ordinal regression loss
+    """
+    # Pool latent to scalar per sample
+    pooled = F.adaptive_avg_pool3d(mu, output_size=(1, 1, 1))
+    pooled = pooled.squeeze(-1).squeeze(-1).squeeze(-1)  # [B, C]
+
+    # Normalize to [-1, 1] range based on class
+    # NC=0 -> -1, AD=3 -> +1
+    ordinal_targets = 2.0 * labels.float() / (num_classes - 1) - 1.0  # [B]
+
+    # Mean latent should follow ordinal structure
+    latent_mean = pooled.mean(dim=1)  # [B]
+
+    # MSE between ordinal position and latent mean
+    loss = F.mse_loss(latent_mean, ordinal_targets)
+
+    return loss
+
+
+def ordinal_contrastive_loss(
+    z: Tensor,
+    labels: Tensor,
+    temperature: float = 0.1,
+    alpha: float = 0.5,
+) -> Tensor:
+    """
+    Ordinal Supervised Contrastive Loss for disease progression modeling.
+
+    Unlike standard SupCon which treats all negatives equally,
+    this loss considers the ordinal nature of disease progression:
+    NC(0) < SCD(1) < MCI(2) < AD(3)
+
+    NC and AD are the most different (push apart most),
+    SCD and MCI are adjacent (push apart less).
+
+    Loss = positive_loss + alpha * negative_loss
+
+    Args:
+        z: Normalized latent features [B, latent_dim]
+        labels: Disease labels [B] - 0=NC, 1=SCD, 2=MCI, 3=AD
+        temperature: Temperature parameter for scaling similarity. Default: 0.1
+        alpha: Weight for ordinal push-apart term. Default: 0.5
+
+    Returns:
+        Scalar ordinal contrastive loss
+    """
+    B = z.size(0)
+
+    # Guard: need at least 2 samples and at least 2 unique labels
+    unique_labels = labels.unique()
+    if B < 2 or unique_labels.numel() < 2:
+        # Return a small constant loss that allows backward but doesn't affect training much
+        return z.new_zeros(1) + 1e-6
+
+    # Clamp temperature for numerical stability
+    temperature = max(temperature, 1e-3)
+
+    # Compute pairwise similarity with temperature scaling
+    sim = torch.matmul(z, z.T)  # [B, B]
+    sim = sim / temperature
+
+    # Clamp similarity for numerical stability before exp
+    sim = torch.clamp(sim, min=-50.0, max=50.0)
+
+    # Ordinal distance: how far apart are the labels?
+    # |label_i - label_j| gives ordinal distance
+    labels_i = labels.view(B, 1)  # [B, 1]
+    labels_j = labels.view(1, B)  # [1, B]
+    ordinal_dist = torch.abs(labels_i.float() - labels_j.float())  # [B, B]
+    # Normalize to [0, 1]
+    max_dist = 3.0  # NC(0) to AD(3)
+    ordinal_dist_norm = ordinal_dist / max_dist  # [0, 1]
+
+    # Masks
+    same_mask = torch.eq(labels_i, labels_j).float()  # 同类=1
+    diff_mask = 1.0 - same_mask  # 异类=1 (excludes self)
+
+    # Positive loss: pull same labels together
+    exp_sim = torch.exp(sim - sim.max())  # numerical stability
+    log_prob = sim - torch.log(exp_sim.sum(dim=1, keepdim=True) + 1e-8)
+
+    # Only consider positive pairs (same labels, excluding self)
+    same_mask_no_self = same_mask.clone()
+    same_mask_no_self.fill_diagonal_(0.0)
+    pos_sum = same_mask_no_self * log_prob
+    pos_count = same_mask_no_self.sum()
+    if pos_count < 1.0:
+        pos_loss = z.new_zeros(1)
+    else:
+        pos_loss = -pos_sum.sum() / pos_count
+
+    # Negative loss: push different labels apart, weighted by ordinal distance
+    # Higher ordinal distance = stronger push
+    diff_count = diff_mask.sum()
+    if diff_count < 1.0:
+        neg_loss = z.new_zeros(1)
+    else:
+        neg_term = diff_mask * sim * ordinal_dist_norm  # distant pairs weighted more
+        neg_loss = neg_term.sum() / diff_count
+
+    loss = pos_loss + alpha * neg_loss
+
+    # Final safety clamp
+    if torch.isnan(loss) or torch.isinf(loss):
+        print(f"[DEBUG ordinal_loss] NaN/Inf detected: B={B}, pos_loss={pos_loss}, neg_loss={neg_loss}, pos_count={pos_count}, diff_count={diff_count}")
+        return z.new_zeros(1) + 1e-6
+
+    return loss
+
+
+class MemoryBank:
+    """
+    Memory Bank for contrastive learning with small batch sizes.
+
+    Stores (latent, label) pairs from previous batches to enable
+    building positive/negative pairs even when batch_size is small.
+
+    Uses channel-wise pooling to reduce latent dimension for memory efficiency.
+
+    Usage:
+        bank = MemoryBank(size=4096, device='cuda', latent_channels=64)
+
+        for batch in dataloader:
+            mu, _ = vae.encode(batch)
+
+            # Compute loss using current batch + memory bank
+            loss = contrastive_loss_with_bank(mu, labels, bank)
+
+            # Update memory bank
+            bank.update(mu.detach(), labels)
+
+    Args:
+        size: Maximum number of samples to store
+        device: Device to store tensors on
+        latent_channels: Number of VAE latent channels (C)
+    """
+
+    def __init__(
+        self,
+        size: int = 4096,
+        device: torch.device = torch.device("cuda"),
+        latent_channels: int = 64,
+    ):
+        self.size = size
+        self.device = device
+        # Use channel-wise mean to reduce dimension: [B, C, D, H, W] -> [B, C]
+        self.dim = latent_channels
+        # Initialize with zeros
+        self.features = torch.zeros(size, self.dim, device=device)
+        self.labels = torch.zeros(size, dtype=torch.long, device=device)
+        self.ptr = 0  # Current position for circular update
+        self.count = 0  # Number of samples stored
+
+    def update(self, mu: Tensor, labels: Tensor):
+        """
+        Update memory bank with new VAE latent and labels.
+
+        Uses channel-wise mean pooling to reduce [B, C, D, H, W] to [B, C].
+
+        Args:
+            mu: VAE latent [B, C, D, H, W]
+            labels: [B] disease labels
+        """
+        B = mu.size(0)
+
+        # Channel-wise mean pooling: [B, C, D, H, W] -> [B, C]
+        z_pooled = F.adaptive_avg_pool3d(mu, output_size=(1, 1, 1))
+        z_flat = z_pooled.squeeze(-1).squeeze(-1).squeeze(-1)  # [B, C]
+        z_norm = F.normalize(z_flat, dim=1)  # [B, C]
+
+        for i in range(B):
+            idx = self.ptr % self.size
+            self.features[idx] = z_norm[i]
+            self.labels[idx] = labels[i]
+            self.ptr = (self.ptr + 1) % self.size
+            self.count = min(self.count + 1, self.size)
+
+    def get(self, k: int = None) -> Tuple[Tensor, Tensor]:
+        """
+        Get k random samples from memory bank.
+
+        Args:
+            k: Number of samples to retrieve. If None, returns all.
+
+        Returns:
+            Tuple of (features, labels)
+        """
+        if self.count == 0:
+            # Return zeros if bank is empty - use unit vector to avoid NaN in normalization
+            dummy = torch.zeros(1, self.dim, device=self.device)
+            dummy[0, 0] = 1.0  # unit vector to avoid NaN when normalized
+            return dummy, self.labels[:1]
+
+        if k is None or k >= self.count:
+            return self.features[:self.count], self.labels[:self.count]
+
+        # Random sample k indices
+        indices = torch.randperm(self.count)[:k].to(self.device)
+        return self.features[indices], self.labels[indices]
+
+    def __len__(self):
+        return self.count
+
+
+def supervised_contrastive_loss(
+    z: Tensor,
+    labels: Tensor,
+    temperature: float = 0.1,
+) -> Tensor:
+    """
+    Standard Supervised Contrastive Loss (SimCLR-style with labels).
+
+    Pulls same-label samples together, pushes different-label samples apart.
+    Does NOT consider ordinal relationships.
+
+    Args:
+        z: Normalized latent features [B, latent_dim]
+        labels: Disease labels [B] - 0=NC, 1=SCD, 2=MCI, 3=AD
+        temperature: Temperature parameter. Default: 0.1
+
+    Returns:
+        Scalar supervised contrastive loss
+    """
+    B = z.size(0)
+
+    if B < 2:
+        return z.new_zeros(1)
+
+    # Compute pairwise similarity
+    sim = torch.matmul(z, z.T) / temperature  # [B, B]
+
+    # Create positive mask (same labels, excluding self)
+    labels = labels.contiguous()
+    mask_pos = torch.eq(labels.view(-1, 1), labels.view(1, -1)).float()  # [B, B]
+    mask_pos = mask_pos - torch.eye(B, device=mask_pos.device)  # exclude self
+
+    # InfoNCE loss
+    exp_sim = torch.exp(sim - sim.max())  # numerical stability
+    log_prob = sim - torch.log(exp_sim.sum(dim=1, keepdim=True) + 1e-8)
+
+    # Positive pairs loss
+    pos_loss = -(mask_pos * log_prob).sum() / (mask_pos.sum() + 1e-8)
+
+    return pos_loss
+
+
 def total_vae_loss(
     recon: Tensor,
     target: Tensor,
@@ -76,21 +446,36 @@ def total_vae_loss(
     logvar: Tensor,
     kl_weight: float = 0.0001,
     recon_loss_type: str = "l1",
+    gradient_weight: float = 0.0,
+    ssim_weight: float = 0.0,
+    multi_scale_recons: Optional[list] = None,
+    multi_scale_weights: Optional[list] = None,
+    contrastive_labels: Optional[Tensor] = None,
+    contrastive_weight: float = 0.0,
+    contrastive_temperature: float = 0.1,
+    use_ordinal_contrastive: bool = True,
 ) -> Tensor:
     """
-    Compute total VAE loss = reconstruction + kl_weight * KL.
-
-    The KL term encourages the latent distribution to be close to a
-    standard normal distribution, which aids in regularizing the latent
-    space and improving generalization.
+    Compute total VAE loss = recon + kl_weight * KL + gradient * grad + ssim * ssim
+    + contrastive * ordinal_supcon.
 
     Args:
-        recon: Reconstructed MRI of shape [B, 1, D, H, W]
-        target: Target MRI of shape [B, 1, D, H, W]
+        recon: Reconstructed MRI [B, 1, D, H, W]
+        target: Target MRI [B, 1, D, H, W]
         mu: Mean of latent distribution
         logvar: Log variance of latent distribution
         kl_weight: Weight for KL divergence term. Default: 0.0001
         recon_loss_type: Type of reconstruction loss ("l1" or "l2"). Default: "l1"
+        gradient_weight: Weight for gradient (texture) loss. Default: 0.0
+        ssim_weight: Weight for SSIM loss. Default: 0.0
+        multi_scale_recons: List of [recon_s1, recon_s2, recon_s3] from multi-scale decoder.
+                            Each should be downsampled target at that scale.
+        multi_scale_weights: List of weights for each scale loss. Default: [0.1, 0.2, 0.3]
+        contrastive_labels: Disease labels for contrastive loss [B]. Default: None
+        contrastive_weight: Weight for ordinal contrastive loss. Default: 0.0
+        contrastive_temperature: Temperature for contrastive loss. Default: 0.1
+        use_ordinal_contrastive: If True, use ordinal (disease-aware) contrastive loss.
+                                  If False, use standard supervised contrastive. Default: True
 
     Returns:
         Scalar total VAE loss
@@ -99,6 +484,47 @@ def total_vae_loss(
     kl_loss = vae_kl_loss(mu, logvar, reduction="mean")
 
     total_loss = recon_loss + kl_weight * kl_loss
+
+    if gradient_weight > 0:
+        grad_loss = gradient_loss(recon, target)
+        total_loss = total_loss + gradient_weight * grad_loss
+
+    if ssim_weight > 0:
+        ssim_l = ssim_loss(recon, target)
+        total_loss = total_loss + ssim_weight * ssim_l
+
+    # Multi-scale loss: downsample target to match each scale, compute loss
+    if multi_scale_recons is not None and len(multi_scale_recons) > 0:
+        weights = multi_scale_weights or [0.1, 0.2, 0.3]
+        target_full = target
+
+        spatial_factors = [8, 4, 2]  # Downsample factors for scales 1, 2, 3
+
+        for i, (recon_sc, wf) in enumerate(zip(multi_scale_recons, weights)):
+            # Downsample target to match scale
+            ds = spatial_factors[i]
+            # Simple pooling to downsample
+            t_down = F.avg_pool3d(target_full, kernel_size=ds, stride=ds)
+            scale_loss = vae_reconstruction_loss(recon_sc, t_down, loss_type=recon_loss_type)
+            total_loss = total_loss + wf * scale_loss
+
+    # Contrastive loss for latent space separation
+    if contrastive_labels is not None and contrastive_weight > 0:
+        # Flatten mu and normalize for contrastive loss
+        z_flat = mu.flatten(1)
+        z_norm = F.normalize(z_flat, dim=1)
+
+        if use_ordinal_contrastive:
+            con_loss = ordinal_contrastive_loss(
+                z_norm, contrastive_labels, temperature=contrastive_temperature
+            )
+        else:
+            con_loss = supervised_contrastive_loss(
+                z_norm, contrastive_labels, temperature=contrastive_temperature
+            )
+
+        total_loss = total_loss + contrastive_weight * con_loss
+
     return total_loss
 
 
@@ -106,24 +532,18 @@ def cfm_loss(
     v_pred: Tensor,
     z0: Tensor,
     z1: Tensor,
-    t: Optional[Tensor] = None,
 ) -> Tensor:
     """
-    Conditional Flow Matching (CFM) loss.
+    Conditional Flow Matching (CFM) loss using Optimal Transport formulation.
 
     The CFM loss computes the MSE between the predicted velocity field
     and the optimal transport target (z1 - z0).
 
     L_CFM = || v_theta(z_t, t) - (z1 - z0) ||^2
 
-    where z_t = (1-t)*z0 + t*z1 (linear interpolation in latent space)
-
-    Note on time parameter t:
-        This implementation uses the Independent CFM formulation where the
-        target velocity is constant (z1 - z0) independent of t. This assumes
-        a constant velocity field for optimal transport between z0 and z1.
-        The t parameter is accepted for API compatibility but is not used
-        in the current formulation.
+    This uses the Independent CFM formulation where the target velocity
+    is constant (z1 - z0) independent of t, assuming a constant velocity
+    field for optimal transport between z0 and z1.
 
     This is used in Stage 3 to train the vector field network.
 
@@ -131,7 +551,6 @@ def cfm_loss(
         v_pred: Predicted velocity field of shape [B, C, D, H, W]
         z0: Source latent (NC group) of shape [B, C, D, H, W]
         z1: Target latent (AD group) of shape [B, C, D, H, W]
-        t: Time interpolation values of shape [B, 1]. Currently unused.
 
     Returns:
         Scalar CFM loss
@@ -139,73 +558,6 @@ def cfm_loss(
     target_v = z1 - z0
     loss = F.mse_loss(v_pred, target_v)
     return loss
-
-
-def deformation_smooth_loss(
-    flow: Tensor,
-    penalty_type: str = "l2",
-) -> Tensor:
-    """
-    Compute smoothness penalty for deformation fields.
-
-    Encourages the deformation field to be smooth (small gradients)
-    which promotes anatomically plausible warps without discontinuities.
-
-    L_smooth = mean(|grad(dx)|^2 + |grad(dy)|^2 + |grad(dz)|^2)
-
-    Args:
-        flow: 3D deformation field of shape [B, 3, D, H, W]
-        penalty_type: Type of penalty ("l1" or "l2"). Default: "l2"
-
-    Returns:
-        Scalar smoothness loss
-    """
-    grad_d = flow[:, :, 1:, :, :] - flow[:, :, :-1, :, :]
-    grad_h = flow[:, :, :, 1:, :] - flow[:, :, :, :-1, :]
-    grad_w = flow[:, :, :, :, 1:] - flow[:, :, :, :, :-1]
-
-    if penalty_type == "l1":
-        loss = (
-            torch.mean(torch.abs(grad_d))
-            + torch.mean(torch.abs(grad_h))
-            + torch.mean(torch.abs(grad_w))
-        )
-    else:
-        loss = (
-            torch.mean(grad_d**2)
-            + torch.mean(grad_h**2)
-            + torch.mean(grad_w**2)
-        )
-
-    return loss
-
-
-def dice_loss(
-    pred: Tensor,
-    target: Tensor,
-    smooth: float = 1e-5,
-) -> Tensor:
-    """
-    Compute Dice coefficient loss for segmentation tasks.
-
-    Dice = 2 * |A ∩ B| / (|A| + |B|)
-    Dice loss = 1 - Dice
-
-    Args:
-        pred: Predicted probabilities of shape [B, C, D, H, W]
-        target: Target binary mask of shape [B, C, D, H, W]
-        smooth: Smoothing factor to avoid division by zero
-
-    Returns:
-        Scalar Dice loss
-    """
-    pred_flat = pred.view(-1)
-    target_flat = target.view(-1)
-
-    intersection = (pred_flat * target_flat).sum()
-    dice = (2.0 * intersection + smooth) / (pred_flat.sum() + target_flat.sum() + smooth)
-
-    return 1.0 - dice
 
 
 class GradientSmoothingLoss(nn.Module):
@@ -272,170 +624,3 @@ class GradientSmoothingLoss(nn.Module):
         return loss
 
 
-class NegativeJacobianPenalty(nn.Module):
-    """
-    Negative Jacobian Determinant Penalty for 3D Deformation Fields.
-
-    Penalizes negative Jacobian determinants which indicate folding or
-    self-intersection in the deformation field. A valid deformation should
-    have Jacobian > 0 everywhere (orientation preserving).
-
-    For a deformation field φ(x) = x + flow(x), the Jacobian J = ∂φ/∂x
-    For 3D: det(J) should be > 0 for all voxels.
-
-    This loss penalizes det(J) < 0 regions:
-        L_jac = mean(max(0, -det(J))^2)
-
-    This is CRITICAL for medical imaging applications to ensure
-    anatomically plausible deformations.
-    """
-
-    def __init__(
-        self,
-        epsilon: float = 1e-5,
-    ) -> None:
-        """
-        Initialize Jacobian penalty.
-
-        Args:
-            epsilon: Small value to prevent numerical issues. Default: 1e-5
-        """
-        super().__init__()
-        self.epsilon = epsilon
-
-    def compute_jacobian_determinant(
-        self,
-        flow: Tensor,
-        spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0),
-        is_normalized: bool = True,
-    ) -> Tensor:
-        """
-        Compute Jacobian determinant for each voxel in the deformation field.
-
-        Uses central differences to compute the Jacobian matrix ∂φ/∂x
-        where φ(x) = x + flow(x).
-
-        Args:
-            flow: Deformation field of shape [B, 3, D, H, W]
-                flow[:, 0] = displacement in D dimension
-                flow[:, 1] = displacement in H dimension
-                flow[:, 2] = displacement in W dimension
-            spacing: Physical voxel spacing (dx, dy, dz) in mm
-            is_normalized: If True, spacing is in grid units (2/size) for
-                          normalized flow [-1, 1]. If False, uses physical spacing.
-
-        Returns:
-            Jacobian determinant of shape [B, D-2, H-2, W-2]
-        """
-        # Compute gradient step size based on normalization
-        if is_normalized:
-            # Flow is in normalized coords [-1, 1], gradient step is 2/size
-            D, H, W = flow.shape[2], flow.shape[3], flow.shape[4]
-            step_d = 2.0 / max(D - 1, 1)
-            step_h = 2.0 / max(H - 1, 1)
-            step_w = 2.0 / max(W - 1, 1)
-        else:
-            # Physical spacing
-            step_d, step_h, step_w = spacing
-
-        # Central differences for gradient computation
-        dfx_dd = (flow[:, 0, 2:, 1:-1, 1:-1] - flow[:, 0, :-2, 1:-1, 1:-1]) / (2 * step_d)
-        dfx_dh = (flow[:, 0, 1:-1, 2:, 1:-1] - flow[:, 0, 1:-1, :-2, 1:-1]) / (2 * step_h)
-        dfx_dw = (flow[:, 0, 1:-1, 1:-1, 2:] - flow[:, 0, 1:-1, 1:-1, :-2]) / (2 * step_w)
-
-        dfy_dd = (flow[:, 1, 2:, 1:-1, 1:-1] - flow[:, 1, :-2, 1:-1, 1:-1]) / (2 * step_d)
-        dfy_dh = (flow[:, 1, 1:-1, 2:, 1:-1] - flow[:, 1, 1:-1, :-2, 1:-1]) / (2 * step_h)
-        dfy_dw = (flow[:, 1, 1:-1, 1:-1, 2:] - flow[:, 1, 1:-1, 1:-1, :-2]) / (2 * step_w)
-
-        dfz_dd = (flow[:, 2, 2:, 1:-1, 1:-1] - flow[:, 2, :-2, 1:-1, 1:-1]) / (2 * step_d)
-        dfz_dh = (flow[:, 2, 1:-1, 2:, 1:-1] - flow[:, 2, 1:-1, :-2, 1:-1]) / (2 * step_h)
-        dfz_dw = (flow[:, 2, 1:-1, 1:-1, 2:] - flow[:, 2, 1:-1, 1:-1, :-2]) / (2 * step_w)
-
-        # Jacobian: J = I + ∂flow/∂x
-        # det(J) = (1 + dfx_dx) * ((1 + dfy_dy) * (1 + dfz_dz) - dfy_dz * dfz_dy)
-        #          - dfx_dy * (dfy_dx * (1 + dfz_dz) - dfy_dz * dfz_dx)
-        #          + dfx_dz * (dfy_dx * dfz_dy - (1 + dfy_dy) * dfz_dx)
-        det = (
-            (1 + dfx_dd) * ((1 + dfy_dh) * (1 + dfz_dw) - dfy_dw * dfz_dh)
-            - dfx_dh * (dfy_dd * (1 + dfz_dw) - dfy_dw * dfz_dd)
-            + dfx_dw * (dfy_dd * dfz_dh - (1 + dfy_dh) * dfz_dd)
-        )
-
-        return det
-
-    def forward(
-        self,
-        flow: Tensor,
-        spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0),
-        is_normalized: bool = True,
-    ) -> Tensor:
-        """
-        Compute negative Jacobian penalty loss.
-
-        Penalizes regions where det(J) <= 0.
-
-        L = mean(max(0, -det(J))^2)
-
-        Args:
-            flow: Deformation field of shape [B, 3, D, H, W]
-            spacing: Voxel spacing for gradient computation (used when is_normalized=False)
-            is_normalized: If True, flow is in normalized coords [-1, 1] and spacing
-                          is ignored; step size is computed from grid dimensions.
-
-        Returns:
-            Scalar loss
-        """
-        det = self.compute_jacobian_determinant(flow, spacing, is_normalized)
-
-        negative_det = torch.clamp(-det, min=0.0)
-        loss = torch.mean(negative_det**2)
-
-        near_zero_penalty = torch.clamp(self.epsilon - det, min=0.0)
-        loss = loss + 0.1 * torch.mean(near_zero_penalty**2)
-
-        return loss
-
-
-def total_deformation_loss(
-    flow: Tensor,
-    sim_weight: float = 1.0,
-    smooth_weight: float = 0.1,
-    jacobian_weight: float = 0.01,
-    similarity_target: Optional[Tensor] = None,
-    similarity_pred: Optional[Tensor] = None,
-    spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0),
-    is_normalized: bool = True,
-) -> Tensor:
-    """
-    Compute total deformation loss combining multiple terms.
-
-    L_total = sim_weight * L_sim + smooth_weight * L_smooth + jacobian_weight * L_jac
-
-    Args:
-        flow: Deformation field [B, 3, D, H, W]
-        sim_weight: Weight for similarity loss
-        smooth_weight: Weight for smoothing loss
-        jacobian_weight: Weight for Jacobian penalty
-        similarity_target: Target image for similarity [B, 1, D, H, W]
-        similarity_pred: Predicted/warped image [B, 1, D, H, W]
-        spacing: Voxel spacing for Jacobian computation
-        is_normalized: If True, flow is in normalized coords [-1, 1]
-
-    Returns:
-        Scalar total deformation loss
-    """
-    total_loss = 0.0
-
-    if similarity_target is not None and similarity_pred is not None and sim_weight > 0:
-        sim_loss = F.l1_loss(similarity_pred, similarity_target)
-        total_loss = total_loss + sim_weight * sim_loss
-
-    if smooth_weight > 0:
-        smooth_loss = GradientSmoothingLoss(penalty_type="l2")(flow)
-        total_loss = total_loss + smooth_weight * smooth_loss
-
-    if jacobian_weight > 0:
-        jac_loss = NegativeJacobianPenalty()(flow, spacing, is_normalized)
-        total_loss = total_loss + jacobian_weight * jac_loss
-
-    return total_loss

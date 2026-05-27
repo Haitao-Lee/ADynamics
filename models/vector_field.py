@@ -60,8 +60,11 @@ class SinusoidalTimeEmbedding(nn.Module):
         """
         B = t.shape[0]
         half_dim = self.embed_dim // 2
+        # Use same dtype as input tensor to avoid fp16 precision issues in AMP
+        dtype = t.dtype
         freqs = torch.exp(
-            -torch.log(torch.tensor(10000.0, device=t.device, dtype=torch.float16)) * torch.arange(half_dim, device=t.device, dtype=torch.float16) / half_dim
+            -torch.log(torch.tensor(10000.0, device=t.device, dtype=dtype)) *
+            torch.arange(half_dim, device=t.device, dtype=dtype) / half_dim
         )
         angles = t.unsqueeze(-1) * freqs.unsqueeze(0)
         emb = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)

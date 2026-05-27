@@ -9,16 +9,14 @@ Core training logic for each stage:
 
 from engine.losses import (
     cfm_loss,
-    deformation_smooth_loss,
     total_vae_loss,
 )
-from engine.trainer_vae import VAETrainer
+from engine.trainer_vae import MultiModalVAETrainer
 from engine.trainer_cfm import CFMTrainer
 
 __all__ = [
-    "VAETrainer",
+    "MultiModalVAETrainer",
     "CFMTrainer",
     "total_vae_loss",
     "cfm_loss",
-    "deformation_smooth_loss",
 ]

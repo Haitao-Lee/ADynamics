@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from monai.data import CacheDataset, DataLoader, Dataset
 
 
@@ -72,7 +73,7 @@ def get_train_val_test_dataloaders(
     val_split: float = 0.15,
     shuffle: bool = True,
     seed: int = 42,
-    use_cache: bool = False,
+    use_cache: bool = True,
     cache_rate: float = 0.1,
     split_save_dir: Optional[str] = None,
 ) -> Tuple[DataLoader, DataLoader, Optional[DataLoader]]:
@@ -105,7 +106,7 @@ def get_train_val_test_dataloaders(
         val_split: Fraction of data for validation. Default: 0.15 (15%)
         shuffle: Whether to shuffle training data. Default: True
         seed: Random seed for reproducible split. Default: 42
-        use_cache: If True, use CacheDataset with cache_rate. Default: False (memory-safe)
+        use_cache: If True, use CacheDataset with cache_rate. Default: True (caching enabled)
         cache_rate: Fraction of data to cache (0.0 to 1.0). Only used if use_cache=True.
             Default: 0.1 (caches 10% of training data)
         split_save_dir: Optional directory to save/load dataset splits as JSON.
@@ -140,6 +141,10 @@ def get_train_val_test_dataloaders(
     # This ensures reproducibility regardless of filesystem ordering (e.g., os.listdir)
     data_list = sorted(data_list, key=lambda x: str(x["image"]))
 
+    # Note: test_split is derived from train_split + val_split complement.
+    # When train_split + val_split = 1.0, test_split = 0.0 (no test set created).
+    # This is intentional for train-only workflows; test_transforms parameter
+    # becomes required by API signature but is unused when test_split=0.0.
     test_split = round(1.0 - train_split - val_split, 6)
     if abs(train_split + val_split + test_split - 1.0) > 1e-6:
         raise ValueError(
@@ -417,3 +422,225 @@ def create_dummy_dataset(
         })
 
     return data_list
+
+
+class MultiModalDataset(Dataset):
+    """
+    Multi-Modal MRI Dataset for ADynamics.
+
+    Supports T1 (required) + optional modalities (fMRI, ASL, QSM, FLAIR).
+    Handles missing modalities gracefully by returning None for missing files.
+
+    Each sample returns:
+        - x_dict: Dict[str, Tensor] - modality tensors (T1 required, others optional)
+        - label: int - disease stage (0=NC, 1=SCD, 2=MCI, 3=AD)
+        - patient_id: str
+        - available_modalities: List[str] - which optional modalities were loaded
+
+    Example:
+        >>> dataset = MultiModalDataset(
+        ...     data_list=data_list,
+        ...     transform=transforms,
+        ...     spatial_sizes={'t1': (256,256,192), 'fmri': (34,64,64), ...}
+        ... )
+        >>> sample = dataset[0]
+        >>> print(sample.keys())  # ['t1', 'fmri', 'asl', 'qsm', 'flair', 'label', 'patient_id', 'available']
+    """
+
+    def __init__(
+        self,
+        data_list: List[Dict[str, Any]],
+        transform: Optional[Any] = None,
+        spatial_sizes: Optional[Dict[str, Tuple[int, int, int]]] = None,
+        required_modality: str = "t1",
+        optional_modalities: Optional[List[str]] = None,
+    ) -> None:
+        """
+        Initialize multi-modal dataset.
+
+        Args:
+            data_list: List of data dictionaries with modality paths and labels
+            transform: MONAI transform to apply
+            spatial_sizes: Dict mapping modality -> (D, H, W). Required for ResizeWithPadOrCrop.
+            required_modality: The required modality (default: "t1")
+            optional_modalities: List of optional modality names (default: ["fmri", "asl", "qsm", "flair"])
+        """
+        super().__init__(data=data_list, transform=transform)
+        self.spatial_sizes = spatial_sizes or {}
+        self.required_modality = required_modality
+        self.optional_modalities = optional_modalities or ["fmri", "asl", "qsm", "flair"]
+        # Fixed target size for all modalities (to match T1 after preprocessing)
+        self.target_size = (256, 256, 192)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        """
+        Get a multi-modal sample.
+
+        Returns:
+            Dictionary containing:
+                - t1: preprocessed T1 tensor
+                - other modalities as resized tensors (all to same size)
+                - label: disease stage
+                - patient_id
+                - available_modalities: list of available modality names
+        """
+        data_item = self.data[idx]
+
+        result = {}
+        available_modalities = []
+
+        # T1 path (required) - validate before passing to MONAI transforms
+        t1_path = data_item.get("t1") or data_item.get(self.required_modality)
+        if not t1_path or not os.path.exists(t1_path):
+            raise FileNotFoundError(f"Required modality not found: {t1_path}")
+
+        # Validate T1 file dimensions (catch corrupted [0,0,0] files)
+        try:
+            import nibabel as nib
+            t1_img = nib.load(str(t1_path))
+            t1_data = t1_img.get_fdata()
+            if t1_data.ndim != 3 or any(s == 0 for s in t1_data.shape):
+                raise ValueError(f"Corrupted T1 file: {t1_path} has shape {t1_data.shape}")
+        except Exception as e:
+            if isinstance(e, (FileNotFoundError, ValueError)):
+                raise
+            raise FileNotFoundError(f"Cannot load T1 file: {t1_path}") from e
+
+        # Build dict for MONAI transforms
+        data_dict = {"t1": str(t1_path)}
+
+        # Optional modalities - load and resize to fixed size
+        for mod in self.optional_modalities:
+            path = data_item.get(mod)
+            if path and os.path.exists(path):
+                try:
+                    import nibabel as nib
+                    img = nib.load(str(path))
+                    data = img.get_fdata().astype(np.float32)
+                    # Skip corrupted files with zero dimensions
+                    if data.ndim != 3 or any(s == 0 for s in data.shape):
+                        result[mod] = None
+                        continue
+                    tensor = torch.from_numpy(data).unsqueeze(0).unsqueeze(0)  # [1, 1, D, H, W]
+                    # Resize to fixed target size
+                    tensor = F.interpolate(tensor, size=self.target_size, mode="trilinear", align_corners=False)
+                    tensor = tensor.squeeze(0)  # [1, D, H, W]
+                    result[mod] = tensor
+                    available_modalities.append(mod)
+                except Exception:
+                    result[mod] = None
+            else:
+                result[mod] = None
+
+        # Apply transforms to T1
+        if self.transform is not None:
+            data_dict = self.transform(data_dict)
+            result["t1"] = data_dict["t1"]
+        else:
+            raise ValueError("Transform is required for T1 preprocessing")
+
+        # Label and metadata
+        result["label"] = data_item.get("label", 0)
+        result["patient_id"] = data_item.get("patient_id", f"unknown_{idx}")
+        result["available_modalities"] = available_modalities
+
+        return result
+
+
+def multimodal_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Simple collate function that stacks all tensors and handles missing modalities.
+    """
+    result = {}
+    keys = ["t1", "fmri", "asl", "qsm", "flair", "label", "patient_id", "available_modalities"]
+
+    for key in keys:
+        values = [item.get(key) for item in batch]
+
+        if key == "label":
+            result[key] = torch.tensor(values, dtype=torch.long)
+        elif key == "patient_id":
+            result[key] = values
+        elif key == "available_modalities":
+            result[key] = values
+        elif key in ["t1", "fmri", "asl", "qsm", "flair"]:
+            # Stack valid tensors, use zeros for None
+            valid_vals = [v for v in values if v is not None and isinstance(v, torch.Tensor)]
+            if valid_vals:
+                ref_shape = valid_vals[0].shape
+                tensors = []
+                for v in values:
+                    if v is None or not isinstance(v, torch.Tensor):
+                        tensors.append(torch.zeros(ref_shape, dtype=torch.float32))
+                    else:
+                        tensors.append(v)
+                result[key] = torch.stack(tensors)
+            else:
+                result[key] = None
+        else:
+            result[key] = values
+
+    return result
+
+
+def create_multimodal_dataloaders(
+    data_list: List[Dict[str, Any]],
+    train_transforms,
+    val_transforms,
+    batch_size: int = 2,
+    num_workers: int = 4,
+    train_split: float = 0.7,
+    val_split: float = 0.15,
+    shuffle: bool = True,
+    seed: int = 42,
+) -> tuple:
+    """
+    Create train/val dataloaders for multi-modal dataset.
+
+    Args:
+        data_list: List of data dictionaries
+        train_transforms: Transform for training
+        val_transforms: Transform for validation
+        batch_size: Batch size
+        num_workers: Number of workers
+        train_split: Training fraction
+        val_split: Validation fraction
+        shuffle: Shuffle training data
+        seed: Random seed
+
+    Returns:
+        Tuple of (train_loader, val_loader)
+    """
+    from sklearn.model_selection import train_test_split
+
+    # Stratified split
+    labels = np.array([item.get("label", 0) for item in data_list])
+    train_data, val_data = train_test_split(
+        data_list,
+        test_size=val_split,
+        stratify=labels,
+        random_state=seed,
+    )
+
+    # Create datasets
+    train_dataset = MultiModalDataset(train_data, transform=train_transforms)
+    val_dataset = MultiModalDataset(val_data, transform=val_transforms)
+
+    # Create dataloaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+    return train_loader, val_loader

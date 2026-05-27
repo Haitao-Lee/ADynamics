@@ -117,6 +117,15 @@ inference_results/
 logs/
 loss/
 
+# Documentation (keep in repo but exclude generated docs)
+docs/
+
+# Batch files
+*.bat
+
+# Dataset manifests (large, generated)
+core_data/dataset_manifest_merged.json
+
 # OS
 .DS_Store
 Thumbs.db
