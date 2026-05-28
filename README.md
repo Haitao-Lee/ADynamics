@@ -283,14 +283,16 @@ T1 is required. Other modalities are optional (model handles missing modalities 
 
 ## CFM Loss
 
-$$L_{CFM} = \| v_\theta(z_t, t, \text{mmse\_target}) - (z_1 - z_0) \|^2$$
+$$L_{CFM} = \| v_\theta(z_t, t, m) - (z_1 - z_0) \|^2$$
 
-Where $z_t = (1-t) \cdot z_0 + t \cdot z_1$ and $z_0 \sim p_{\text{MMSE}=X}$, $z_1 \sim p_{\text{MMSE}=Y}$, $X > Y$.
+where $m$ is the target MMSE score.
+
+Where $z_t = (1-t) \cdot z_0 + t \cdot z_1$ and $z_0 \sim p_{\mathrm{MMSE}=X}$, $z_1 \sim p_{\mathrm{MMSE}=Y}$, $X > Y$.
 
 **Forward-only constraint**: Only pairs where `source_MMSE > target_MMSE` are used. Distance-aware sampling gives higher weight to adjacent MMSE ranges.
 
 **Rectified flow regularization** (optional):
-$$L_{RF} = \lambda \cdot \mathbb{E}_t[\|v_\theta(z_t, t, \text{mmse})\|^2 \cdot t(1-t)] + \lambda \cdot \|\nabla_z v_\theta\|^2$$
+$$L_{RF} = \lambda \cdot \mathbb{E}_t[\|v_\theta(z_t, t, \mathrm{mmse})\|^2 \cdot t(1-t)] + \lambda \cdot \|\nabla_z v_\theta\|^2$$
 Encourages straight trajectories for efficient ODE integration.
 
 **MMSE conditioning**: Target MMSE is injected via FiLM (Feature-wise Linear Modulation) at every U-Net block, enabling fine-grained control over progression degree.
