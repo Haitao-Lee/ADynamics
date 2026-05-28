@@ -103,20 +103,26 @@ def parse_args():
                         help="Decoder depth (4 for full upsampling)")
     parser.add_argument("--dropout_rate", type=float, default=0.2,
                         help="Modality dropout rate during training")
-    parser.add_argument("--num_classes", type=int, default=4,
-                        help="Number of disease classes (4: NC, SCD, MCI, AD)")
+    parser.add_argument("--num_classes", type=int, default=3,
+                        help="Number of disease classes (3: NC, SCD+MCI, AD)")
 
     # Training
     parser.add_argument("--batch_size", type=int, default=2, help="Batch size")
     parser.add_argument("--epochs", type=int, default=300, help="Number of epochs")
     parser.add_argument("--learning_rate", type=float, default=0.0002, help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=1e-5, help="Weight decay")
-    parser.add_argument("--cls_weight", type=float, default=1.0,
-                        help="Classification loss weight")
+    parser.add_argument("--cls_weight", type=float, default=2.0,
+                        help="Classification loss weight (higher = more discriminative latent)")
     parser.add_argument("--kl_weight", type=float, default=0.1,
                         help="KL divergence loss weight")
     parser.add_argument("--recon_loss_type", type=str, default="l1",
                         help="Reconstruction loss type (l1 or l2)")
+    parser.add_argument("--contrastive_weight", type=float, default=0.0,
+                        help="Ordinal contrastive loss weight (0=disabled, try 0.05)")
+    parser.add_argument("--gradient_weight", type=float, default=0.0,
+                        help="Gradient/texture loss weight (0=disabled, try 0.1)")
+    parser.add_argument("--ssim_weight", type=float, default=0.0,
+                        help="SSIM loss weight (0=disabled, try 0.1)")
 
     # Hardware
     parser.add_argument("--num_gpus", type=int, default=1, help="Number of GPUs")
@@ -192,9 +198,26 @@ def load_data(json_path: str) -> list:
         # For now, accept samples with T1 even if no optional modalities
         valid_data.append(item)
 
+    # Remap labels: 3-class (NC=0, SCD+MCI=1, AD=2)
+    for item in valid_data:
+        label = item.get("label", 0)
+        if label in [1, 2]:  # SCD or MCI → merged class
+            item["label"] = 1
+        elif label == 3:  # AD → class 2
+            item["label"] = 2
+        # NC (0) stays 0
+
     if corrupted_t1 > 0:
         print(f"Warning: Skipped {corrupted_t1} corrupted T1 files")
     print(f"Loaded {len(valid_data)} valid multi-modal samples")
+
+    # Print class distribution
+    from collections import Counter
+    label_counts = Counter(item.get("label", 0) for item in valid_data)
+    class_names = ["NC", "SCD+MCI", "AD"]
+    for c in range(3):
+        print(f"  {class_names[c]}: {label_counts.get(c, 0)}")
+
     return valid_data
 
 
@@ -274,6 +297,9 @@ def main():
         "cls_weight": args.cls_weight,
         "kl_weight": args.kl_weight,
         "recon_loss_type": args.recon_loss_type,
+        "contrastive_weight": args.contrastive_weight,
+        "gradient_weight": args.gradient_weight,
+        "ssim_weight": args.ssim_weight,
         "use_amp": use_amp,
     }
 
@@ -291,7 +317,51 @@ def main():
     # Resume from checkpoint
     if args.checkpoint:
         print(f"Resuming from checkpoint: {args.checkpoint}")
-        trainer.load_checkpoint(args.checkpoint)
+        checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
+        sd = checkpoint["model_state_dict"]
+
+        # Handle DataParallel prefix
+        model_ref = model.module if hasattr(model, "module") else model
+        model_sd = model_ref.state_dict()
+        has_dp = any(k.startswith("module.") for k in sd)
+
+        if has_dp:
+            sd = {k[7:]: v for k, v in sd.items()}
+
+        # Filter: only load keys that exist and shape matches
+        filtered_sd = {}
+        skipped = []
+        for k, v in sd.items():
+            if k in model_sd and v.shape == model_sd[k].shape:
+                filtered_sd[k] = v
+            else:
+                skipped.append(k)
+
+        # Load into underlying model (bypass DataParallel)
+        model_ref.load_state_dict(filtered_sd, strict=False)
+        print(f"  Loaded {len(filtered_sd)} params, skipped {len(skipped)}")
+        if skipped:
+            print(f"  Skipped (shape mismatch): {skipped}")
+
+        trainer.current_epoch = checkpoint.get("epoch", 0)
+        trainer.best_val_loss = float("inf")
+        trainer.best_cls_acc = 0.0
+
+        # Optimizer state: always skip when resuming with different num_classes
+        # (old optimizer has stale buffers for classifier head that waste GPU memory)
+        if skipped:
+            print("  Optimizer state skipped (classifier changed, starting fresh)")
+        elif "optimizer_state_dict" in checkpoint:
+            try:
+                optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                print("  Optimizer state restored")
+            except Exception as e:
+                print(f"  Optimizer state incompatible, starting fresh: {e}")
+
+        # Free checkpoint from memory
+        del checkpoint
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # Train
     print(f"\n{'='*60}")
@@ -308,16 +378,29 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    history = trainer.train(
-        num_epochs=args.epochs,
-        save_interval=args.save_interval,
-        output_dir=args.output_dir,
-        early_stopping_patience=args.early_stopping,
-    )
+    # Clear CUDA cache before training
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        print(f"GPU memory: {torch.cuda.memory_allocated() / 1e9:.2f} GB allocated")
 
-    print("\nTraining complete!")
-    print(f"Best val_cls_acc: {trainer.best_cls_acc:.4f}")
-    print(f"Checkpoints saved to: {args.output_dir}")
+    try:
+        history = trainer.train(
+            num_epochs=args.epochs,
+            save_interval=args.save_interval,
+            output_dir=args.output_dir,
+            early_stopping_patience=args.early_stopping,
+        )
+
+        print("\nTraining complete!")
+        print(f"Best val_cls_acc: {trainer.best_cls_acc:.4f}")
+        print(f"Checkpoints saved to: {args.output_dir}")
+    except Exception as e:
+        import traceback
+        print(f"\n{'='*60}")
+        print(f"TRAINING FAILED: {e}")
+        print(f"{'='*60}")
+        traceback.print_exc()
+        raise
 
 
 if __name__ == "__main__":

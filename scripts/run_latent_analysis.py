@@ -33,9 +33,18 @@ from core_data.dataset import MultiModalDataset
 from core_data.transforms import get_multimodal_val_transforms, MULTI_MODAL_SPATIAL_SIZES
 from models.vae3d import MultiModalVAE3D
 
-CLASS_NAMES = ["NC", "SCD", "MCI", "AD"]
-COLORS = ['#2ecc71', '#3498db', '#f39c12', '#e74c3c']
-MARKERS = ['o', 's', '^', 'D']
+CLASS_NAMES_MAP = {
+    3: ["NC", "SCD+MCI", "AD"],
+    4: ["NC", "SCD", "MCI", "AD"],
+}
+COLORS_MAP = {
+    3: ['#2ecc71', '#f39c12', '#e74c3c'],
+    4: ['#2ecc71', '#3498db', '#f39c12', '#e74c3c'],
+}
+MARKERS_MAP = {
+    3: ['o', '^', 'D'],
+    4: ['o', 's', '^', 'D'],
+}
 
 
 def parse_args():
@@ -50,6 +59,8 @@ def parse_args():
     parser.add_argument("--latent_channels", type=int, default=32)
     parser.add_argument("--base_channels", type=int, default=16)
     parser.add_argument("--decoder_depth", type=int, default=4)
+    parser.add_argument("--num_classes", type=int, default=3,
+                        help="Number of disease classes (3: NC/SCD+MCI/AD, 4: NC/SCD/MCI/AD)")
     parser.add_argument("--device", type=str, default="cuda")
     return parser.parse_args()
 
@@ -275,7 +286,12 @@ def plot_variance_analysis(latents, labels, output_path):
 
 
 def main():
+    global CLASS_NAMES, COLORS, MARKERS
     args = parse_args()
+    CLASS_NAMES = CLASS_NAMES_MAP.get(args.num_classes, [f"Class_{i}" for i in range(args.num_classes)])
+    COLORS = COLORS_MAP.get(args.num_classes, ['#2ecc71', '#3498db', '#f39c12', '#e74c3c'][:args.num_classes])
+    MARKERS = MARKERS_MAP.get(args.num_classes, ['o', 's', '^', 'D'][:args.num_classes])
+
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -348,7 +364,7 @@ def main():
         "inter_class_distances": inter,
         "intra_inter_ratio": float(ratio) if intra and inter else None,
         "pca_explained_variance": pca.explained_variance_ratio_[:10].tolist(),
-        "label_counts": {CLASS_NAMES[i]: int((labels == i).sum()) for i in range(4)},
+        "label_counts": {CLASS_NAMES[i]: int((labels == i).sum()) for i in range(args.num_classes)},
         "per_class_mean_norm": {
             name: float(np.linalg.norm(class_means[name]))
             for name in class_means

@@ -35,7 +35,10 @@ from core_data.transforms import get_multimodal_val_transforms, MULTI_MODAL_SPAT
 from models.vae3d import MultiModalVAE3D
 
 
-CLASS_NAMES = ["NC", "SCD", "MCI", "AD"]
+CLASS_NAMES_MAP = {
+    3: ["NC", "SCD+MCI", "AD"],
+    4: ["NC", "SCD", "MCI", "AD"],
+}
 
 
 def parse_args():
@@ -46,7 +49,8 @@ def parse_args():
     parser.add_argument("--latent_channels", type=int, default=32)
     parser.add_argument("--base_channels", type=int, default=16)
     parser.add_argument("--decoder_depth", type=int, default=4)
-    parser.add_argument("--num_classes", type=int, default=4)
+    parser.add_argument("--num_classes", type=int, default=3,
+                        help="Number of disease classes (3: NC/SCD+MCI/AD, 4: NC/SCD/MCI/AD)")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--device", type=str, default="cuda")
     return parser.parse_args()
@@ -80,16 +84,30 @@ def load_data(json_path):
         except Exception:
             continue
         valid.append(item)
+
     return valid
 
 
 def main():
+    global CLASS_NAMES
     args = parse_args()
+    CLASS_NAMES = CLASS_NAMES_MAP.get(args.num_classes, [f"Class_{i}" for i in range(args.num_classes)])
+
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     os.makedirs(args.output_dir, exist_ok=True)
 
     # Load data
     data_list = load_data(args.json)
+
+    # Remap labels for 3-class: NC=0, SCD+MCI=1, AD=2
+    if args.num_classes == 3:
+        for item in data_list:
+            label = item.get("label", 0)
+            if label in [1, 2]:
+                item["label"] = 1
+            elif label == 3:
+                item["label"] = 2
+
     from sklearn.model_selection import train_test_split
     _, val_data = train_test_split(
         data_list, test_size=0.15,

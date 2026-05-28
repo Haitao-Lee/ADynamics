@@ -60,7 +60,8 @@ def parse_args():
                         help="Must match Stage 1 base_channels")
     parser.add_argument("--decoder_depth", type=int, default=4,
                         help="Must match Stage 1 decoder_depth")
-    parser.add_argument("--num_classes", type=int, default=4)
+    parser.add_argument("--num_classes", type=int, default=3,
+                        help="Number of disease classes (3: NC/SCD+MCI/AD, 4: NC/SCD/MCI/AD)")
     parser.add_argument("--dropout_rate", type=float, default=0.2)
 
     # CFM model params
@@ -78,6 +79,10 @@ def parse_args():
     parser.add_argument("--learning_rate", type=float, default=0.0001)
     parser.add_argument("--weight_decay", type=float, default=1e-5)
     parser.add_argument("--velocity_loss_weight", type=float, default=1.0)
+    parser.add_argument("--rectified_flow_weight", type=float, default=0.0,
+                        help="Rectified flow regularization weight (0=disabled, try 0.01)")
+    parser.add_argument("--no_distance_aware", action="store_true", default=False,
+                        help="Disable distance-aware sampling (use uniform pair sampling)")
 
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--save_interval", type=int, default=50)
@@ -127,7 +132,13 @@ def load_data(json_path: str) -> list:
     return valid_data
 
 
-def build_latent_pools(encoder, dataloader, device, num_classes=4):
+CLASS_NAMES_MAP = {
+    3: ["NC", "SCD+MCI", "AD"],
+    4: ["NC", "SCD", "MCI", "AD"],
+}
+
+
+def build_latent_pools(encoder, dataloader, device, num_classes=3):
     """
     Encode all samples and build per-class latent pools.
 
@@ -136,7 +147,7 @@ def build_latent_pools(encoder, dataloader, device, num_classes=4):
     """
     encoder.eval()
     pools = {c: [] for c in range(num_classes)}
-    class_names = ["NC", "SCD", "MCI", "AD"]
+    class_names = CLASS_NAMES_MAP.get(num_classes, [f"Class_{i}" for i in range(num_classes)])
 
     with torch.no_grad():
         for batch in dataloader:
@@ -166,56 +177,98 @@ def build_latent_pools(encoder, dataloader, device, num_classes=4):
 
 class MultiClassCFMTrainer(CFMTrainer):
     """
-    Extended CFMTrainer that supports ALL disease stage pairs (not just NC→AD).
+    Extended CFMTrainer with FORWARD-ONLY disease stage flows.
 
-    Samples source and target from different disease classes, enabling the CFM
-    to learn progression in both directions.
+    Enforces the biological constraint that disease progression is unidirectional:
+        NC(0) → SCD(1) → MCI(2) → AD(3)
+
+    Only samples pairs where src_class < tgt_class (forward flow).
+    Uses distance-aware sampling: adjacent stages (NC→SCD) are sampled more
+    frequently than distant stages (NC→AD) to learn fine-grained transitions.
+
+    This prevents the model from learning biologically meaningless reverse flows
+    (e.g., AD→MCI, SCD→NC) that would corrupt the velocity field.
     """
 
-    def __init__(self, *args, latent_pools, class_names, **kwargs):
+    def __init__(self, *args, latent_pools, class_names, distance_aware=True, **kwargs):
         super().__init__(*args, **kwargs)
         self.latent_pools = latent_pools  # {class_id: [tensor, ...]}
         self.class_names = class_names
         self.num_classes = len(class_names)
+        self.distance_aware = distance_aware
 
-    def sample_latent_pairs(self, batch_size: int, allow_same_class: bool = False):
+        # Build forward-only pair list with distance-aware weights
+        self._build_pair_distribution()
+
+    def _build_pair_distribution(self):
         """
-        Sample source and target from DIFFERENT disease stages.
+        Build all valid forward-only pairs (src < tgt) with distance-aware weights.
 
-        This is key for CFM: we want to learn how to flow between stages.
+        Closer pairs (NC→SCD, distance=1) get higher sampling weight than
+        distant pairs (NC→AD, distance=3). This ensures the model learns
+        fine-grained transitions, not just the extreme NC→AD mapping.
+
+        Weight scheme: weight = 1 / distance^alpha
+            alpha=1:  NC→SCD=1.0, NC→MCI=0.5, NC→AD=0.33
+            alpha=0.5: NC→SCD=1.0, NC→MCI=0.71, NC→AD=0.58
         """
-        # Randomly select source and target class (must be different)
-        classes = list(range(self.num_classes))
-        src_class = torch.randint(0, self.num_classes, (1,)).item()
-        tgt_class = src_class
-        while tgt_class == src_class:
-            tgt_class = torch.randint(0, self.num_classes, (1,)).item()
+        self.valid_pairs = []
+        self.pair_weights = []
+        alpha = 1.0  # Distance decay exponent
 
-        # Sample from each class pool
+        for src in range(self.num_classes):
+            for tgt in range(src + 1, self.num_classes):
+                if len(self.latent_pools[src]) > 0 and len(self.latent_pools[tgt]) > 0:
+                    distance = tgt - src
+                    weight = 1.0 / (distance ** alpha) if self.distance_aware else 1.0
+                    self.valid_pairs.append((src, tgt))
+                    self.pair_weights.append(weight)
+
+        if not self.valid_pairs:
+            raise RuntimeError("No valid forward-only pairs found. Check latent pools.")
+
+        # Normalize weights to probability distribution
+        total = sum(self.pair_weights)
+        self.pair_probs = [w / total for w in self.pair_weights]
+
+        print(f"Forward-only CFM pairs ({len(self.valid_pairs)}):")
+        for (src, tgt), prob in zip(self.valid_pairs, self.pair_probs):
+            n_pairs = len(self.latent_pools[src]) * len(self.latent_pools[tgt])
+            print(f"  {self.class_names[src]} → {self.class_names[tgt]}: "
+                  f"{n_pairs} pairs, sampling prob={prob:.3f}")
+
+    def sample_latent_pairs(self, batch_size: int):
+        """
+        Sample forward-only disease stage pairs (src_class < tgt_class).
+
+        Uses distance-aware sampling: adjacent transitions are more likely
+        than distant transitions, ensuring fine-grained flow learning.
+
+        Returns:
+            Tuple of (z0, z1, None, None, None, None)
+        """
+        if not self.valid_pairs:
+            raise RuntimeError("No valid pairs available.")
+
+        # Select a pair type based on distance-aware probabilities
+        pair_idx = torch.multinomial(
+            torch.tensor(self.pair_probs), 1
+        ).item()
+        src_class, tgt_class = self.valid_pairs[pair_idx]
+
         src_pool = self.latent_pools[src_class]
         tgt_pool = self.latent_pools[tgt_class]
 
-        if len(src_pool) == 0 or len(tgt_pool) == 0:
-            # Fallback: just sample randomly
-            all_latents = []
-            for pool in self.latent_pools.values():
-                all_latents.extend(pool)
-            if len(all_latents) < 2:
-                raise RuntimeError("Not enough latents in pools for CFM training")
-            indices = torch.randint(0, len(all_latents), (batch_size * 2,))
-            z0 = torch.stack([all_latents[i] for i in indices[:batch_size]])
-            z1 = torch.stack([all_latents[i] for i in indices[batch_size:batch_size*2]])
-            return z0, z1, None, None, None, None
-
+        # Sample individual latents from each class
         src_indices = torch.randint(0, len(src_pool), (batch_size,))
         tgt_indices = torch.randint(0, len(tgt_pool), (batch_size,))
 
         z0 = torch.stack([src_pool[i] for i in src_indices])
         z1 = torch.stack([tgt_pool[i] for i in tgt_indices])
 
-        # Log which classes are being paired
-        if torch.rand(1).item() < 0.01:  # Log ~1% of batches
-            print(f"  CFM pair: {self.class_names[src_class]} -> {self.class_names[tgt_class]}")
+        # Log which classes are being paired (for debugging)
+        if torch.rand(1).item() < 0.01:
+            print(f"  CFM pair: {self.class_names[src_class]} → {self.class_names[tgt_class]}")
 
         return z0, z1, None, None, None, None
 
@@ -293,7 +346,7 @@ def main():
     # Also build same-class pools for fallback
     same_class_pools = {c: latent_pools[c] for c in range(args.num_classes)}
 
-    class_names = ["NC", "SCD", "MCI", "AD"]
+    class_names = CLASS_NAMES_MAP.get(args.num_classes, [f"Class_{i}" for i in range(args.num_classes)])
 
     # Create CFM model
     latent_spatial = (16, 16, 12)  # After 4 downsamples from 256x256x192
@@ -330,7 +383,7 @@ def main():
     # Create GradScaler once before training loop (for AMP)
     scaler = torch.amp.GradScaler('cuda') if use_amp else None
 
-    # Create trainer
+    # Create trainer with forward-only flows and distance-aware sampling
     trainer = MultiClassCFMTrainer(
         model=cfm_model,
         optimizer=optimizer,
@@ -339,6 +392,7 @@ def main():
         scheduler=scheduler,
         latent_pools=latent_pools,
         class_names=class_names,
+        distance_aware=not args.no_distance_aware,
     )
 
     # Replace pool sampling with multi-class version
@@ -347,7 +401,7 @@ def main():
     )
 
     print(f"\n{'='*60}")
-    print("Stage 3: Conditional Flow Matching")
+    print("Stage 3: Conditional Flow Matching (Forward-Only)")
     print(f"{'='*60}")
     print(f"Encoder: {args.encoder_checkpoint}")
     print(f"Latent shape: [{args.latent_channels}, 16, 16, 12]")
@@ -355,6 +409,9 @@ def main():
     print(f"Epochs: {args.epochs}")
     print(f"Batch size: {args.batch_size} pairs/batch")
     print(f"LR: {args.learning_rate}")
+    print(f"Direction: Forward-only (NC→SCD→MCI→AD)")
+    print(f"Distance-aware sampling: {not args.no_distance_aware}")
+    print(f"Rectified flow weight: {args.rectified_flow_weight}")
     print(f"{'='*60}\n")
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -397,6 +454,15 @@ def main():
 
             target_v = z1 - z0
             loss = F.mse_loss(v_pred, target_v)
+
+            # Add rectified flow regularization if enabled
+            if args.rectified_flow_weight > 0:
+                from engine.losses import rectified_flow_regularization
+                rf_loss = rectified_flow_regularization(
+                    v_pred, z_t, t, cfm_model,
+                    lambda_reg=args.rectified_flow_weight
+                )
+                loss = loss + rf_loss
 
             if use_amp:
                 scaler.scale(loss).backward()

@@ -37,7 +37,10 @@ from core_data.transforms import get_multimodal_val_transforms, MULTI_MODAL_SPAT
 from models.vae3d import MultiModalVAE3D
 from models.vector_field import VelocityFieldNet
 
-CLASS_NAMES = ["NC", "SCD", "MCI", "AD"]
+CLASS_NAMES_MAP = {
+    3: ["NC", "SCD+MCI", "AD"],
+    4: ["NC", "SCD", "MCI", "AD"],
+}
 
 
 def parse_args():
@@ -53,6 +56,8 @@ def parse_args():
     parser.add_argument("--time_embed_dim", type=int, default=128)
     parser.add_argument("--ode_steps", type=int, default=20)
     parser.add_argument("--num_samples", type=int, default=50)
+    parser.add_argument("--num_classes", type=int, default=3,
+                        help="Number of disease classes (3: NC/SCD+MCI/AD, 4: NC/SCD/MCI/AD)")
     parser.add_argument("--device", type=str, default="cuda")
     return parser.parse_args()
 
@@ -107,7 +112,11 @@ def integrate_ode(z0, cfm_model, steps=20):
 
 
 def main():
+    global CLASS_NAMES
     args = parse_args()
+    CLASS_NAMES = CLASS_NAMES_MAP.get(args.num_classes, [f"Class_{i}" for i in range(args.num_classes)])
+    ad_label = args.num_classes - 1  # AD is the last class
+
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -183,9 +192,14 @@ def main():
     all_latents = np.concatenate(all_latents, axis=0)
     all_labels = np.concatenate(all_labels, axis=0)
 
+    # Remap labels for 3-class: NC=0, SCD+MCI=1, AD=2
+    if args.num_classes == 3:
+        all_labels = np.where(np.isin(all_labels, [1, 2]), 1, all_labels)
+        all_labels = np.where(all_labels == 3, 2, all_labels)
+
     # Sample NC sources and run ODE
     nc_mask = all_labels == 0
-    ad_mask = all_labels == 3
+    ad_mask = all_labels == ad_label
 
     if nc_mask.sum() == 0:
         print("ERROR: No NC samples found!")
@@ -273,17 +287,55 @@ def main():
 
     # Save metrics
     import json as json_mod
+
+    # Compute trajectory straightness
+    straightness_scores = []
+    for j in range(len(nc_latents)):
+        z_start = trajectory[0][j].flatten()
+        z_end = trajectory[-1][j].flatten()
+        direct_dist = torch.norm(z_end - z_start).item()
+
+        path_length = 0.0
+        for i in range(1, len(trajectory)):
+            path_length += torch.norm(
+                trajectory[i][j].flatten() - trajectory[i-1][j].flatten()
+            ).item()
+
+        if path_length > 1e-8:
+            straightness_scores.append(direct_dist / path_length)
+
+    # Compute class centroid distances
+    class_centroids = {}
+    for i, name in enumerate(CLASS_NAMES):
+        mask = all_labels == i
+        if mask.sum() > 0:
+            class_centroids[name] = float(np.mean(all_latents[mask]))
+
     metrics = {
         "ode_steps": args.ode_steps,
         "velocity_mean": float(np.mean(velocities)),
         "velocity_std": float(np.std(velocities)),
         "trajectory_smoothness_mean": float(np.mean(traj_diffs)),
         "trajectory_smoothness_std": float(np.std(traj_diffs)),
+        "trajectory_straightness_mean": float(np.mean(straightness_scores)) if straightness_scores else 0.0,
+        "trajectory_straightness_std": float(np.std(straightness_scores)) if straightness_scores else 0.0,
         "pca_explained_variance": pca.explained_variance_ratio_.tolist(),
         "n_nc_sources": len(nc_latents),
     }
     with open(os.path.join(args.output_dir, "flow_metrics.json"), "w") as f:
         json_mod.dump(metrics, f, indent=2)
+
+    # Print summary
+    print(f"\n{'='*60}")
+    print("Flow Visualization Summary")
+    print(f"{'='*60}")
+    print(f"ODE Steps: {args.ode_steps}")
+    print(f"NC Sources: {len(nc_latents)}")
+    print(f"Velocity: {metrics['velocity_mean']:.4f} ± {metrics['velocity_std']:.4f}")
+    print(f"Smoothness: {metrics['trajectory_smoothness_mean']:.4f} ± {metrics['trajectory_smoothness_std']:.4f}")
+    print(f"Straightness: {metrics['trajectory_straightness_mean']:.4f} ± {metrics['trajectory_straightness_std']:.4f}")
+    print(f"  (1.0 = perfectly straight trajectory)")
+    print(f"PCA Explained Variance: {pca.explained_variance_ratio_[0]:.3f}, {pca.explained_variance_ratio_[1]:.3f}")
 
     print(f"\nResults saved to {args.output_dir}")
     print(f"  - velocity_magnitude.png")

@@ -560,6 +560,68 @@ def cfm_loss(
     return loss
 
 
+def rectified_flow_regularization(
+    v_pred: Tensor,
+    z_t: Tensor,
+    t: Tensor,
+    model: nn.Module,
+    lambda_reg: float = 0.01,
+) -> Tensor:
+    """
+    Rectified Flow regularization to encourage straight trajectories.
+
+    Penalizes the curvature of the velocity field trajectory, pushing the model
+    toward constant-velocity (straight) ODE paths. This is inspired by
+    "Flow Straight and Fast" (Liu et al., 2022).
+
+    The regularization computes the gradient of the velocity field w.r.t. spatial
+    coordinates and penalizes large deviations, encouraging:
+        - Straight trajectories (less curvature = more efficient transport)
+        - Faster inference (straight paths need fewer ODE steps)
+        - Better generalization (simpler trajectories are less prone to artifacts)
+
+    L_RF = lambda * E_t[ ||v_theta(z_t, t) - (z1 - z0)||^2 * (1 - t) * t ]
+        + lambda * E_t[ ||grad_z v_theta(z_t, t)||^2 ]
+
+    The first term penalizes deviation from the straight-line target at intermediate t,
+    and the second term penalizes spatial gradients of the velocity field.
+
+    Args:
+        v_pred: Predicted velocity [B, C, D, H, W]
+        z_t: Interpolated latent at time t [B, C, D, H, W]
+        t: Time steps [B] in [0, 1]
+        model: The velocity field model (used for gradient computation)
+        lambda_reg: Regularization strength. Default: 0.01
+
+    Returns:
+        Scalar regularization loss
+    """
+    # Term 1: Penalize velocity magnitude at intermediate t
+    # At t=0 and t=1, velocity should be maximal; at t=0.5, it should be moderate
+    # Weight by t*(1-t) to focus on intermediate timesteps
+    t_weight = t * (1 - t)  # [B]
+    t_weight = t_weight.view(-1, 1, 1, 1, 1)  # broadcast to [B, 1, 1, 1, 1]
+
+    # Penalize large velocity magnitudes (encourages constant-velocity paths)
+    vel_magnitude = torch.mean(v_pred ** 2, dim=(1, 2, 3, 4))  # [B]
+    vel_reg = torch.mean(vel_magnitude * t_weight.squeeze())
+
+    # Term 2: Penalize spatial gradients of velocity (smoothness in latent space)
+    # This encourages the velocity field to be spatially smooth
+    grad_d = v_pred[:, :, 1:, :, :] - v_pred[:, :, :-1, :, :]
+    grad_h = v_pred[:, :, :, 1:, :] - v_pred[:, :, :, :-1, :]
+    grad_w = v_pred[:, :, :, :, 1:] - v_pred[:, :, :, :, :-1]
+
+    spatial_smooth = (
+        torch.mean(grad_d ** 2) +
+        torch.mean(grad_h ** 2) +
+        torch.mean(grad_w ** 2)
+    )
+
+    loss = lambda_reg * (vel_reg + spatial_smooth)
+    return loss
+
+
 class GradientSmoothingLoss(nn.Module):
     """
     3D Gradient Smoothing Loss for Deformation Fields.

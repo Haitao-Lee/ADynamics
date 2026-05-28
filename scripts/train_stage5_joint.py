@@ -77,7 +77,8 @@ def parse_args():
     parser.add_argument("--latent_channels", type=int, default=32)
     parser.add_argument("--base_channels", type=int, default=16)
     parser.add_argument("--decoder_depth", type=int, default=4)
-    parser.add_argument("--num_classes", type=int, default=4)
+    parser.add_argument("--num_classes", type=int, default=3,
+                        help="Number of disease classes (3: NC/SCD+MCI/AD, 4: NC/SCD/MCI/AD)")
     parser.add_argument("--dropout_rate", type=float, default=0.2)
 
     # Training
@@ -169,6 +170,8 @@ class JointTrainer:
         self.def_weight = config.get("def_weight", 0.1)
         self.smooth_weight = config.get("smooth_weight", 0.05)
         self.jacobian_weight = config.get("jacobian_weight", 0.01)
+        self.num_classes = config.get("num_classes", 3)
+        self.ad_label = self.num_classes - 1  # AD is the last class
 
         self.stn = SpatialTransformer(mode="bilinear", padding_mode="border")
         self.smooth_loss_fn = GradientSmoothingLoss(penalty_type="l2")
@@ -232,7 +235,7 @@ class JointTrainer:
                 cfm_loss = torch.tensor(0.0, device=self.device)
                 if labels is not None:
                     nc_mask = labels == 0
-                    ad_mask = labels == 3
+                    ad_mask = labels == self.ad_label
                     if nc_mask.sum() > 0 and ad_mask.sum() > 0:
                         z0 = mu[nc_mask]
                         z1 = mu[ad_mask]
@@ -254,8 +257,8 @@ class JointTrainer:
                     flow = self.def_model(z_nc)
                     warped = self.stn(t1[labels == 0][:1], flow)
                     # Target: AD image if available
-                    if (labels == 3).sum() > 0:
-                        ad_image = t1[labels == 3][:1]
+                    if (labels == self.ad_label).sum() > 0:
+                        ad_image = t1[labels == self.ad_label][:1]
                         def_loss = F.l1_loss(warped, ad_image)
                     smooth_loss = self.smooth_loss_fn(flow)
                     jacobian_loss = compute_jacobian_penalty(flow, spacing=(1.0, 1.0, 1.0))
@@ -550,6 +553,7 @@ def main():
         "smooth_weight": args.smooth_weight,
         "jacobian_weight": args.jacobian_weight,
         "use_amp": not args.no_amp,
+        "num_classes": args.num_classes,
     }
 
     trainer = JointTrainer(

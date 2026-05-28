@@ -25,12 +25,22 @@ FLAIR(optional) ─→ Encoder_FLAIR ─────┘    ┌────┴─
 
 | Stage | Script | Goal |
 |-------|--------|------|
-| **1** | `train_stage1_multimodal.py` | Train multi-modal encoder (recon + cls + KL) |
+| **1** | `train_stage1_multimodal.py` | Train multi-modal encoder (recon + cls + KL + contrastive) |
 | **2a** | `train_stage2_classifier.py` | Freeze encoder, train classifier head |
 | **2b** | `train_stage2_decoder.py` | Freeze encoder, train decoder |
-| **3** | `train_stage3_cfm.py` | Train CFM vector field in latent space |
+| **3** | `train_stage3_cfm.py` | Train CFM vector field (**forward-only** flows) |
 | **4** | `train_stage4_deformation.py` | Train deformation generator |
 | **5** | `train_stage5_joint.py` | Joint fine-tuning all modules |
+
+### Key Design Improvements
+
+- **Forward-only CFM**: Only learns NC→SCD→MCI→AD (no reverse flows)
+- **Distance-aware sampling**: Adjacent stages (NC→SCD) sampled more frequently than distant (NC→AD)
+- **Ordinal contrastive loss**: Enforces disease stage separation in latent space
+- **Rectified flow regularization**: Encourages straight, efficient trajectories
+- **Baseline comparisons**: Validates CFM vs linear/KNN/regression baselines
+- **Cross-validation**: 5-fold stratified CV for reliable metrics
+- **Ablation framework**: Systematic component analysis
 
 ---
 
@@ -52,7 +62,7 @@ pip install monai==1.4.0 nibabel SimpleITK torchdiffeq scikit-learn matplotlib t
 ### Train
 
 ```powershell
-# Stage 1: Multi-modal VAE
+# Stage 1: Multi-modal VAE (with contrastive loss)
 .\run_stage1.ps1
 
 # After Stage 1: Check latent quality
@@ -64,7 +74,7 @@ pip install monai==1.4.0 nibabel SimpleITK torchdiffeq scikit-learn matplotlib t
 # Stage 2b: Improve decoder
 .\run_stage2b.ps1
 
-# Stage 3: Train CFM
+# Stage 3: Train CFM (forward-only, distance-aware)
 .\run_stage3.ps1
 
 # Stage 4: Train deformation
@@ -74,11 +84,20 @@ pip install monai==1.4.0 nibabel SimpleITK torchdiffeq scikit-learn matplotlib t
 .\run_stage5.ps1
 ```
 
-### Validate
+### Validate & Analyze
 
 ```powershell
 # Run all validations
 .\run_validation.ps1
+
+# Baseline comparison (CFM vs linear/KNN/regression)
+.\run_baseline.ps1
+
+# Cross-validation (5-fold stratified)
+.\run_crossval.ps1
+
+# Ablation experiments
+.\run_ablation.ps1
 ```
 
 ---
@@ -93,15 +112,18 @@ ADynamics/
 ├── run_stage2a.ps1 / run_stage2b.ps1
 ├── run_stage3.ps1 / run_stage4.ps1 / run_stage5.ps1
 ├── run_validation.ps1
+├── run_baseline.ps1            # NEW: Baseline comparison
+├── run_crossval.ps1            # NEW: Cross-validation
+├── run_ablation.ps1            # NEW: Ablation experiments
 │
 ├── core_data/                   # Data layer
 │   ├── dataset.py              # MultiModalDataset, collate_fn
 │   └── transforms.py           # MONAI preprocessing transforms
 │
 ├── engine/                      # Training layer
-│   ├── trainer_vae.py          # MultiModalVAETrainer (with KL loss)
+│   ├── trainer_vae.py          # MultiModalVAETrainer (with KL + contrastive)
 │   ├── trainer_cfm.py          # CFMTrainer
-│   └── losses.py               # All loss functions
+│   └── losses.py               # All loss functions (incl. rectified flow)
 │
 ├── models/                      # Model layer
 │   ├── vae3d.py                # MultiModalVAE3D, ModalityEncoder3D
@@ -112,14 +134,17 @@ ADynamics/
 │   ├── train_stage1_multimodal.py
 │   ├── train_stage2_classifier.py
 │   ├── train_stage2_decoder.py
-│   ├── train_stage3_cfm.py
+│   ├── train_stage3_cfm.py     # Forward-only CFM with rectified flow
 │   ├── train_stage4_deformation.py
 │   ├── train_stage5_joint.py
 │   ├── run_latent_analysis.py  # Latent analysis (PCA/t-SNE/silhouette)
 │   ├── run_cls_validation.py   # Classification validation
 │   ├── run_recon_validation.py # Reconstruction validation
-│   ├── run_flow_visualization.py # CFM flow visualization
+│   ├── run_flow_visualization.py # CFM flow visualization + straightness
 │   ├── run_deform_validation.py  # Deformation validation
+│   ├── run_baseline_comparison.py # NEW: CFM vs baselines
+│   ├── run_cross_validation.py   # NEW: 5-fold stratified CV
+│   ├── run_ablation.py           # NEW: Systematic ablation
 │   └── inference_pipeline.py   # End-to-end inference
 │
 └── utils/                       # Utilities
@@ -156,11 +181,13 @@ T1 is required. Other modalities are optional (model handles missing modalities 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `--latent_channels` | 32 | Latent channels per modality encoder |
-| `--base_channels` | 16 | Encoder base channels |
+| `--base_channels` | 32 | Encoder base channels |
 | `--decoder_depth` | 4 | Decoder upsampling levels (4 = 16x) |
-| `--cls_weight` | 1.0 | Classification loss weight |
+| `--cls_weight` | 3.0 | Classification loss weight (higher = more discriminative) |
 | `--kl_weight` | 0.1 | KL divergence weight |
+| `--contrastive_weight` | 0.05 | Ordinal contrastive loss weight |
 | `--dropout_rate` | 0.2 | Optional modality dropout |
+| `--rectified_flow_weight` | 0.01 | Rectified flow regularization (Stage 3) |
 
 ---
 
@@ -169,6 +196,12 @@ T1 is required. Other modalities are optional (model handles missing modalities 
 $$L_{CFM} = \| v_\theta(z_t, t) - (z_1 - z_0) \|^2$$
 
 Where $z_t = (1-t) \cdot z_0 + t \cdot z_1$ and $z_0 \sim p_{NC}$, $z_1 \sim p_{AD}$.
+
+**Forward-only constraint**: Only pairs where `src_class < tgt_class` are used (NC→SCD, NC→MCI, NC→AD, SCD→MCI, SCD→AD, MCI→AD). Distance-aware sampling gives higher weight to adjacent transitions.
+
+**Rectified flow regularization** (optional):
+$$L_{RF} = \lambda \cdot \mathbb{E}_t[\|v_\theta(z_t, t)\|^2 \cdot t(1-t)] + \lambda \cdot \|\nabla_z v_\theta\|^2$$
+Encourages straight trajectories for efficient ODE integration.
 
 ---
 

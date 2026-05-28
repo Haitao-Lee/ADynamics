@@ -51,6 +51,8 @@ def parse_args():
     parser.add_argument("--base_channels", type=int, default=16)
     parser.add_argument("--decoder_depth", type=int, default=4)
     parser.add_argument("--num_samples", type=int, default=10)
+    parser.add_argument("--num_classes", type=int, default=3,
+                        help="Number of disease classes (3: NC/SCD+MCI/AD, 4: NC/SCD/MCI/AD)")
     parser.add_argument("--device", type=str, default="cuda")
     return parser.parse_args()
 
@@ -97,7 +99,7 @@ def main():
         in_channels=1,
         latent_channels=args.latent_channels,
         base_channels=args.base_channels,
-        num_classes=4,
+        num_classes=args.num_classes,
         decoder_depth=args.decoder_depth,
         optional_modalities=["fmri", "asl", "qsm", "flair"],
     )

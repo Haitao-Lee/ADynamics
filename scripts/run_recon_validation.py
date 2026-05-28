@@ -46,6 +46,8 @@ def parse_args():
     parser.add_argument("--decoder_depth", type=int, default=4)
     parser.add_argument("--num_samples", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--num_classes", type=int, default=3,
+                        help="Number of disease classes (3: NC/SCD+MCI/AD, 4: NC/SCD/MCI/AD)")
     parser.add_argument("--device", type=str, default="cuda")
     return parser.parse_args()
 
@@ -135,7 +137,7 @@ def main():
         in_channels=1,
         latent_channels=args.latent_channels,
         base_channels=args.base_channels,
-        num_classes=4,
+        num_classes=args.num_classes,
         decoder_depth=args.decoder_depth,
         optional_modalities=["fmri", "asl", "qsm", "flair"],
     )
@@ -154,7 +156,11 @@ def main():
     all_ssim = []
     sample_idx = 0
 
-    CLASS_NAMES = ["NC", "SCD", "MCI", "AD"]
+    CLASS_NAMES_MAP = {
+        3: ["NC", "SCD+MCI", "AD"],
+        4: ["NC", "SCD", "MCI", "AD"],
+    }
+    CLASS_NAMES = CLASS_NAMES_MAP.get(args.num_classes, [f"Class_{i}" for i in range(args.num_classes)])
 
     with torch.no_grad():
         for batch in val_loader:

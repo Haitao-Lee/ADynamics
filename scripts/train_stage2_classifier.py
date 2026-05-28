@@ -53,7 +53,8 @@ def parse_args():
     parser.add_argument("--latent_channels", type=int, default=32)
     parser.add_argument("--base_channels", type=int, default=16)
     parser.add_argument("--decoder_depth", type=int, default=4)
-    parser.add_argument("--num_classes", type=int, default=4)
+    parser.add_argument("--num_classes", type=int, default=3,
+                        help="Number of disease classes (3: NC/SCD+MCI/AD, 4: NC/SCD/MCI/AD)")
     parser.add_argument("--dropout_rate", type=float, default=0.2)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=100)
@@ -288,7 +289,11 @@ class ClassifierTrainer:
         os.makedirs(self.output_dir, exist_ok=True)
         write_header = not os.path.exists(log_file)
 
-        class_names = ["NC", "SCD", "MCI", "AD"]
+        CLASS_NAMES_MAP = {
+            3: ["NC", "SCD+MCI", "AD"],
+            4: ["NC", "SCD", "MCI", "AD"],
+        }
+        class_names = CLASS_NAMES_MAP.get(self.num_classes, [f"Class_{i}" for i in range(self.num_classes)])
 
         for epoch in range(num_epochs):
             self.current_epoch = epoch

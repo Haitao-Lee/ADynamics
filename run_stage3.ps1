@@ -1,5 +1,6 @@
-# Stage 3: Conditional Flow Matching
+# Stage 3: Conditional Flow Matching (Forward-Only)
 # Learns disease progression vector field in latent space
+# Key: Only forward flows (NC→SCD→MCI→AD), distance-aware sampling
 # Usage: .\run_stage3.ps1
 
 python scripts/train_stage3_cfm.py `
@@ -11,5 +12,6 @@ python scripts/train_stage3_cfm.py `
     --cfm_base_channels 64 `
     --time_embed_dim 128 `
     --cond_embed_dim 64 `
+    --rectified_flow_weight 0.01 `
     --early_stopping 50 `
     --output_dir ./checkpoints/stage3_cfm

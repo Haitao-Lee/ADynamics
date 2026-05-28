@@ -70,7 +70,8 @@ def parse_args():
     parser.add_argument("--latent_channels", type=int, default=32)
     parser.add_argument("--base_channels", type=int, default=16)
     parser.add_argument("--decoder_depth", type=int, default=4)
-    parser.add_argument("--num_classes", type=int, default=4)
+    parser.add_argument("--num_classes", type=int, default=3,
+                        help="Number of disease classes (3: NC/SCD+MCI/AD, 4: NC/SCD/MCI/AD)")
     parser.add_argument("--dropout_rate", type=float, default=0.2)
 
     # Training
@@ -245,9 +246,10 @@ class DeformationTrainer:
                 # Compute losses
                 # Primary: similarity between warped and target (AD if available, else original)
                 # When NC->AD progression, target is AD image from same subject or paired sample
-                if (labels == 3).sum() > 0:  # AD subjects available
-                    ad_idx = (labels == 3).nonzero(as_tuple=True)[0][0]
-                    ad_target = t1[(labels == 3).nonzero(as_tuple=True)[0]]
+                ad_label = args.num_classes - 1  # AD is the last class
+                if (labels == ad_label).sum() > 0:  # AD subjects available
+                    ad_idx = (labels == ad_label).nonzero(as_tuple=True)[0][0]
+                    ad_target = t1[(labels == ad_label).nonzero(as_tuple=True)[0]]
                     sim_loss = F.l1_loss(warped_image, ad_target)
                 else:
                     # Fallback: compare warped to original (deformation should be small)
