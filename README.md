@@ -6,22 +6,107 @@
 [![MONAI 1.4+](https://img.shields.io/badge/monai-1.4+-green.svg)](https://monai.io/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 
-**ADynamics** models Alzheimer's Disease progression from NC to AD using **Conditional Flow Matching (CFM)** on cross-sectional multi-modal MRI data.
+**ADynamics** models Alzheimer's Disease progression using **MMSE-Conditional Flow Matching** on cross-sectional multi-modal MRI data.
 
-> **Key Insight**: We have cross-sectional data (different patients at different stages), NOT longitudinal data. CFM learns population-level disease trajectories without paired data.
+> **Key Insight**: We have cross-sectional data (different patients at different stages) with continuous MMSE cognitive scores. CFM learns individualized disease trajectories conditioned on target MMSE, enabling fine-grained progression prediction.
 
 ---
 
-## Multi-Modal 5-Stage Pipeline
+## Technical Pipeline
+
+### Stage 1: Multi-Modal VAE (Encoder Training)
 
 ```
-T1 (required) ──→ Encoder_T1 ─────────┐
-fMRI (optional) ─→ Encoder_fMRI ──────┤
-ASL  (optional) ─→ Encoder_ASL  ──────┼──→ Fusion → Latent z
-QSM  (optional) ─→ Encoder_QSM  ──────┤         ↓
-FLAIR(optional) ─→ Encoder_FLAIR ─────┘    ┌────┴────┐
-                                        Decoder  Classifier
+MRI Input:
+  T1 (required) ──→ Encoder_T1 ─────────┐
+  fMRI (optional) ─→ Encoder_fMRI ──────┤
+  ASL  (optional) ─→ Encoder_ASL  ──────┼──→ Fusion ──→ μ, σ ──→ Reparameterize → z
+  QSM  (optional) ─→ Encoder_QSM  ──────┤                    ↓
+  FLAIR(optional) ─→ Encoder_FLAIR ─────┘              ┌────┴────┐
+                                                   Decoder   Classifier
+                                                      ↓         ↓
+                                                  Recon MRI   3-Class
+                                                              (NC/SCD+MCI/AD)
+
+Loss = Recon + ordinal CE + KL + contrastive
 ```
+
+### Stage 2: Encoder Validation
+
+```
+Stage 2a: Freeze Encoder → Train Classifier Head (validate latent discriminability)
+Stage 2b: Freeze Encoder → Train Decoder Head   (validate latent reconstructability)
+```
+
+### Stage 3: MMSE-Conditional Flow Matching (Core Innovation)
+
+```
+Training Pairs (forward-only, distance-aware):
+  z_source (MMSE=X) ──→ z_target (MMSE=Y),  where X > Y
+  Distance-aware: adjacent MMSE pairs sampled more frequently
+
+Velocity Field:
+  v = VelocityFieldNet(z_t, t, mmse_target)
+      ├── FiLM conditioning on time t
+      └── FiLM conditioning on target MMSE
+
+Loss = ||v_pred - (z_target - z_source)||² + λ_RF · rectified_flow_reg
+```
+
+### Stage 4: Deformation Generator
+
+```
+z_latent ──→ DeformationGenerator ──→ 3D Displacement Field
+                                           ↓
+Original MRI ──→ SpatialTransformer(field) ──→ Warped MRI
+```
+
+### Stage 5: Joint Fine-Tuning
+
+```
+All modules end-to-end:
+  Encoder + CFM + DeformationGenerator
+  Loss = recon + λ_cfm · cfm + λ_def · deformation + smooth + jacobian
+```
+
+### Inference Pipeline
+
+```
+Patient MRI ──→ Encoder ──→ z₀ (current latent)
+                                │
+                    CFM: v(z_t, t | mmse_target)
+                                │
+                                ↓
+                    z₁ (evolved latent at target MMSE)
+                       ├──→ Decoder ──→ Predicted MRI
+                       └──→ DeformGen → Warp(original MRI)
+```
+
+---
+
+## 5-Stage Training Summary
+
+| Stage | Script | Goal | Key Loss |
+|-------|--------|------|----------|
+| **1** | `train_stage1_multimodal.py` | Train multi-modal encoder | recon + ordinal CE + KL + contrastive |
+| **2a** | `train_stage2_classifier.py` | Validate encoder (classifier) | ordinal CE |
+| **2b** | `train_stage2_decoder.py` | Validate encoder (decoder) | recon |
+| **3** | `train_stage3_cfm.py` | MMSE-conditional flow | velocity + rectified flow |
+| **4** | `train_stage4_deformation.py` | Deformation generator | similarity + smooth + jacobian |
+| **5** | `train_stage5_joint.py` | Joint fine-tuning | all combined |
+
+### Evaluation & Analysis
+
+| Script | Purpose |
+|--------|---------|
+| `run_latent_analysis.py` | PCA/t-SNE/silhouette (latent quality) |
+| `run_cls_validation.py` | Per-class accuracy, confusion matrix |
+| `run_recon_validation.py` | MAE/PSNR/SSIM (reconstruction quality) |
+| `run_flow_visualization.py` | Trajectory straightness, velocity analysis |
+| `run_deform_validation.py` | Jacobian/folding analysis |
+| `run_baseline_comparison.py` | CFM vs linear/KNN/regression baselines |
+| `run_cross_validation.py` | 5-fold stratified CV |
+| `run_ablation.py` | Systematic component ablation |
 
 | Stage | Script | Goal |
 |-------|--------|------|
@@ -62,7 +147,7 @@ pip install monai==1.4.0 nibabel SimpleITK torchdiffeq scikit-learn matplotlib t
 ### Train
 
 ```powershell
-# Stage 1: Multi-modal VAE (with contrastive loss)
+# Stage 1: Multi-modal VAE (3-class, with contrastive loss)
 .\run_stage1.ps1
 
 # After Stage 1: Check latent quality
@@ -74,7 +159,7 @@ pip install monai==1.4.0 nibabel SimpleITK torchdiffeq scikit-learn matplotlib t
 # Stage 2b: Improve decoder
 .\run_stage2b.ps1
 
-# Stage 3: Train CFM (forward-only, distance-aware)
+# Stage 3: MMSE-conditional CFM (forward-only, distance-aware)
 .\run_stage3.ps1
 
 # Stage 4: Train deformation
@@ -106,46 +191,48 @@ pip install monai==1.4.0 nibabel SimpleITK torchdiffeq scikit-learn matplotlib t
 
 ```
 ADynamics/
-├── run_stage1.ps1              # Run scripts (PowerShell)
-├── run_stage1_resume.ps1
-├── run_analysis.ps1
-├── run_stage2a.ps1 / run_stage2b.ps1
-├── run_stage3.ps1 / run_stage4.ps1 / run_stage5.ps1
-├── run_validation.ps1
-├── run_baseline.ps1            # NEW: Baseline comparison
-├── run_crossval.ps1            # NEW: Cross-validation
-├── run_ablation.ps1            # NEW: Ablation experiments
+├── run_stage1.ps1              # Stage 1: Multi-modal VAE (3-class)
+├── run_stage1_resume.ps1       # Resume from checkpoint
+├── run_analysis.ps1            # Latent space analysis
+├── run_stage2a.ps1 / run_stage2b.ps1  # Stage 2: Encoder validation
+├── run_stage3.ps1              # Stage 3: MMSE-conditional CFM
+├── run_stage4.ps1              # Stage 4: Deformation generator
+├── run_stage5.ps1              # Stage 5: Joint fine-tuning
+├── run_validation.ps1          # Full validation suite
+├── run_baseline.ps1            # CFM vs baseline comparison
+├── run_crossval.ps1            # 5-fold cross-validation
+├── run_ablation.ps1            # Systematic ablation
 │
 ├── core_data/                   # Data layer
 │   ├── dataset.py              # MultiModalDataset, collate_fn
 │   └── transforms.py           # MONAI preprocessing transforms
 │
 ├── engine/                      # Training layer
-│   ├── trainer_vae.py          # MultiModalVAETrainer (with KL + contrastive)
+│   ├── trainer_vae.py          # MultiModalVAETrainer (KL + contrastive)
 │   ├── trainer_cfm.py          # CFMTrainer
-│   └── losses.py               # All loss functions (incl. rectified flow)
+│   └── losses.py               # All losses (incl. rectified flow)
 │
 ├── models/                      # Model layer
 │   ├── vae3d.py                # MultiModalVAE3D, ModalityEncoder3D
-│   ├── vector_field.py         # VelocityFieldNet (FiLM conditioning)
+│   ├── vector_field.py         # VelocityFieldNet (FiLM + MMSE conditioning)
 │   └── spatial_transform.py    # DeformationGenerator, SpatialTransformer
 │
 ├── scripts/                     # All Python entry points
-│   ├── train_stage1_multimodal.py
-│   ├── train_stage2_classifier.py
-│   ├── train_stage2_decoder.py
-│   ├── train_stage3_cfm.py     # Forward-only CFM with rectified flow
-│   ├── train_stage4_deformation.py
-│   ├── train_stage5_joint.py
-│   ├── run_latent_analysis.py  # Latent analysis (PCA/t-SNE/silhouette)
-│   ├── run_cls_validation.py   # Classification validation
-│   ├── run_recon_validation.py # Reconstruction validation
-│   ├── run_flow_visualization.py # CFM flow visualization + straightness
-│   ├── run_deform_validation.py  # Deformation validation
-│   ├── run_baseline_comparison.py # NEW: CFM vs baselines
-│   ├── run_cross_validation.py   # NEW: 5-fold stratified CV
-│   ├── run_ablation.py           # NEW: Systematic ablation
-│   └── inference_pipeline.py   # End-to-end inference
+│   ├── train_stage1_multimodal.py    # 3-class VAE training
+│   ├── train_stage2_classifier.py    # Classifier validation
+│   ├── train_stage2_decoder.py       # Decoder validation
+│   ├── train_stage3_cfm.py           # MMSE-conditional CFM
+│   ├── train_stage4_deformation.py   # Deformation training
+│   ├── train_stage5_joint.py         # Joint fine-tuning
+│   ├── run_latent_analysis.py        # PCA/t-SNE/silhouette
+│   ├── run_cls_validation.py         # Classification metrics
+│   ├── run_recon_validation.py       # Reconstruction metrics
+│   ├── run_flow_visualization.py     # Flow trajectory analysis
+│   ├── run_deform_validation.py      # Deformation analysis
+│   ├── run_baseline_comparison.py    # CFM vs baselines
+│   ├── run_cross_validation.py       # 5-fold stratified CV
+│   ├── run_ablation.py               # Component ablation
+│   └── inference_pipeline.py         # End-to-end inference
 │
 └── utils/                       # Utilities
     ├── io_utils.py             # NIfTI I/O
@@ -165,12 +252,15 @@ ADynamics/
     "asl": "/path/to/asl.nii.gz",
     "qsm": "/path/to/qsm.nii.gz",
     "flair": "/path/to/flair.nii.gz",
-    "label": 0
+    "label": 0,
+    "mmse": 28
   }
 ]
 ```
 
-Labels: `0=NC, 1=SCD, 2=MCI, 3=AD`
+Labels: `0=NC, 1=SCD, 2=MCI, 3=AD` (auto-remapped to 3-class: 0=NC, 1=SCD+MCI, 2=AD)
+
+MMSE: 1-30 continuous cognitive score (used in Stage 3 for conditional flow)
 
 T1 is required. Other modalities are optional (model handles missing modalities via dropout).
 
@@ -181,11 +271,11 @@ T1 is required. Other modalities are optional (model handles missing modalities 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `--latent_channels` | 32 | Latent channels per modality encoder |
-| `--base_channels` | 32 | Encoder base channels |
+| `--base_channels` | 16 | Encoder base channels |
 | `--decoder_depth` | 4 | Decoder upsampling levels (4 = 16x) |
-| `--cls_weight` | 3.0 | Classification loss weight (higher = more discriminative) |
+| `--num_classes` | 3 | Disease classes (3: NC/SCD+MCI/AD, 4: NC/SCD/MCI/AD) |
+| `--cls_weight` | 2.0 | Classification loss weight |
 | `--kl_weight` | 0.1 | KL divergence weight |
-| `--contrastive_weight` | 0.05 | Ordinal contrastive loss weight |
 | `--dropout_rate` | 0.2 | Optional modality dropout |
 | `--rectified_flow_weight` | 0.01 | Rectified flow regularization (Stage 3) |
 
@@ -193,15 +283,17 @@ T1 is required. Other modalities are optional (model handles missing modalities 
 
 ## CFM Loss
 
-$$L_{CFM} = \| v_\theta(z_t, t) - (z_1 - z_0) \|^2$$
+$$L_{CFM} = \| v_\theta(z_t, t, \text{mmse\_target}) - (z_1 - z_0) \|^2$$
 
-Where $z_t = (1-t) \cdot z_0 + t \cdot z_1$ and $z_0 \sim p_{NC}$, $z_1 \sim p_{AD}$.
+Where $z_t = (1-t) \cdot z_0 + t \cdot z_1$ and $z_0 \sim p_{\text{MMSE}=X}$, $z_1 \sim p_{\text{MMSE}=Y}$, $X > Y$.
 
-**Forward-only constraint**: Only pairs where `src_class < tgt_class` are used (NC→SCD, NC→MCI, NC→AD, SCD→MCI, SCD→AD, MCI→AD). Distance-aware sampling gives higher weight to adjacent transitions.
+**Forward-only constraint**: Only pairs where `source_MMSE > target_MMSE` are used. Distance-aware sampling gives higher weight to adjacent MMSE ranges.
 
 **Rectified flow regularization** (optional):
-$$L_{RF} = \lambda \cdot \mathbb{E}_t[\|v_\theta(z_t, t)\|^2 \cdot t(1-t)] + \lambda \cdot \|\nabla_z v_\theta\|^2$$
+$$L_{RF} = \lambda \cdot \mathbb{E}_t[\|v_\theta(z_t, t, \text{mmse})\|^2 \cdot t(1-t)] + \lambda \cdot \|\nabla_z v_\theta\|^2$$
 Encourages straight trajectories for efficient ODE integration.
+
+**MMSE conditioning**: Target MMSE is injected via FiLM (Feature-wise Linear Modulation) at every U-Net block, enabling fine-grained control over progression degree.
 
 ---
 
