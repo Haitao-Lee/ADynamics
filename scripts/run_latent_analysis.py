@@ -48,7 +48,24 @@ MARKERS_MAP = {
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Latent Space Analysis")
+    from utils.config_loader import apply_yaml_defaults
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", type=str, default=None, help="YAML config file")
+    pre_args, _ = pre.parse_known_args()
+
+    mapping = [
+        (("input", "encoder_checkpoint"), "checkpoint"),
+        (("input", "num_classes"), "num_classes"),
+        (("model", "latent_channels"), "latent_channels"),
+        (("model", "base_channels"), "base_channels"),
+        (("model", "decoder_depth"), "decoder_depth"),
+        (("latent_analysis", "output_dir"), "output_dir"),
+        (("latent_analysis", "num_samples"), "num_samples"),
+    ]
+    config_defaults = apply_yaml_defaults(pre_args.config, mapping) if pre_args.config else {}
+
+    parser = argparse.ArgumentParser(description="Latent Space Analysis", parents=[pre])
+    parser.set_defaults(**config_defaults)
     parser.add_argument("--checkpoint", type=str,
                         default="./checkpoints/stage1_multimodal/vae_best.pt")
     parser.add_argument("--json", type=str,
@@ -102,7 +119,7 @@ def load_model(checkpoint_path, device, args):
         in_channels=1,
         latent_channels=args.latent_channels,
         base_channels=args.base_channels,
-        num_classes=4,
+        num_classes=args.num_classes,
         decoder_depth=args.decoder_depth,
         optional_modalities=["fmri", "asl", "qsm", "flair"],
     )

@@ -46,7 +46,44 @@ from engine.trainer_cfm import CFMTrainer
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Stage 3 CFM Training")
+    from utils.config_loader import apply_yaml_defaults
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", type=str, default=None, help="YAML config file")
+    pre_args, _ = pre.parse_known_args()
+
+    mapping = [
+        (("input", "encoder_checkpoint"), "encoder_checkpoint"),
+        (("input", "num_classes"), "num_classes"),
+        (("model", "latent_channels"), "latent_channels"),
+        (("model", "base_channels"), "base_channels"),
+        (("model", "decoder_depth"), "decoder_depth"),
+        (("model", "latent_spatial"), "latent_spatial"),
+        (("model", "time_embed_dim"), "time_embed_dim"),
+        (("model", "time_hidden_dim"), "time_hidden_dim"),
+        (("model", "cond_embed_dim"), "cond_embed_dim"),
+        (("model", "cond_hidden_dim"), "cond_hidden_dim"),
+        (("model", "num_conditions"), "num_conditions"),
+        (("model", "channel_mults"), "channel_mults"),
+        (("model", "num_res_blocks"), "num_res_blocks"),
+        (("model", "use_demographics"), "use_demographics"),
+        (("training", "batch_size"), "batch_size"),
+        (("training", "learning_rate"), "learning_rate"),
+        (("training", "weight_decay"), "weight_decay"),
+        (("training", "epochs"), "epochs"),
+        (("training", "early_stopping_patience"), "early_stopping"),
+        (("training", "num_gpus"), "num_gpus"),
+        (("training", "use_amp"), "no_amp"),
+        (("loss", "velocity_loss_weight"), "velocity_loss_weight"),
+        (("loss", "rectified_flow_weight"), "rectified_flow_weight"),
+        (("cfm", "forward_only"), "cfm_forward_only"),
+        (("cfm", "distance_aware"), "cfm_distance_aware"),
+        (("output", "dir"), "output_dir"),
+        (("seed",), "seed"),
+    ]
+    config_defaults = apply_yaml_defaults(pre_args.config, mapping) if pre_args.config else {}
+
+    parser = argparse.ArgumentParser(description="Stage 3 CFM Training", parents=[pre])
+    parser.set_defaults(**config_defaults)
     parser.add_argument("--json", type=str, default="./core_data/dataset_manifest_merged_v2.json")
     parser.add_argument("--output_dir", type=str, default="./checkpoints/stage3_cfm")
     parser.add_argument("--encoder_checkpoint", type=str,
@@ -180,14 +217,15 @@ class MultiClassCFMTrainer(CFMTrainer):
     Extended CFMTrainer with FORWARD-ONLY disease stage flows.
 
     Enforces the biological constraint that disease progression is unidirectional:
-        NC(0) → SCD(1) → MCI(2) → AD(3)
+        NC(0) → SCD+MCI(1) → AD(2)   [3-class mode]
+        or NC(0) → SCD(1) → MCI(2) → AD(3)   [4-class mode]
 
     Only samples pairs where src_class < tgt_class (forward flow).
-    Uses distance-aware sampling: adjacent stages (NC→SCD) are sampled more
+    Uses distance-aware sampling: adjacent stages (NC→SCD+MCI) are sampled more
     frequently than distant stages (NC→AD) to learn fine-grained transitions.
 
     This prevents the model from learning biologically meaningless reverse flows
-    (e.g., AD→MCI, SCD→NC) that would corrupt the velocity field.
+    that would corrupt the velocity field.
     """
 
     def __init__(self, *args, latent_pools, class_names, distance_aware=True, **kwargs):
@@ -409,7 +447,8 @@ def main():
     print(f"Epochs: {args.epochs}")
     print(f"Batch size: {args.batch_size} pairs/batch")
     print(f"LR: {args.learning_rate}")
-    print(f"Direction: Forward-only (NC→SCD→MCI→AD)")
+    direction_label = "NC→SCD+MCI→AD" if args.num_classes == 3 else "NC→SCD→MCI→AD"
+    print(f"Direction: Forward-only ({direction_label})")
     print(f"Distance-aware sampling: {not args.no_distance_aware}")
     print(f"Rectified flow weight: {args.rectified_flow_weight}")
     print(f"{'='*60}\n")

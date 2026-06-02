@@ -1,9 +1,8 @@
 # Post-Stage 1: Latent Space Analysis
-# Checks if encoder learned discriminative latent representation
-# Usage: .\run_analysis.ps1
+# All defaults loaded from configs/analysis.yaml. CLI overrides YAML.
+# Usage: .\run_analysis_latent.ps1
 
 python scripts/run_latent_analysis.py `
+    --config ./configs/analysis.yaml `
     --checkpoint ./checkpoints/stage1_multimodal_v4/vae_best.pt `
-    --output_dir ./inference_results/latent_analysis_v4 `
-    --num_classes 3 `
-    --num_samples 500
+    --output_dir ./inference_results/latent_analysis_v4

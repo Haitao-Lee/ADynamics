@@ -1,0 +1,59 @@
+# =============================================================================
+# ADynamics Analysis & Validation Configuration
+# =============================================================================
+# Shared settings for all run_analysis_*.py and run_validation.ps1 scripts.
+
+# Shared inputs
+input:
+  encoder_checkpoint: "./checkpoints/stage1_multimodal/vae_best.pt"
+  cfm_checkpoint: "./checkpoints/stage3_cfm/cfm_best.pt"
+  deform_checkpoint: "./checkpoints/stage4_def/def_best.pt"
+  num_classes: 3
+
+# Model dimensions (must match training)
+model:
+  latent_channels: 32
+  base_channels: 32
+  decoder_depth: 4
+  in_channels: 1
+  spatial_size: [256, 256, 192]
+  cfm_base_channels: 64
+  time_embed_dim: 128
+  cond_embed_dim: 64
+
+# Per-script settings
+latent_analysis:
+  output_dir: "./inference_results/latent_analysis"
+  num_samples: 500
+
+recon_validation:
+  output_dir: "./inference_results/recon_validation"
+  num_samples: 20
+
+cls_validation:
+  output_dir: "./inference_results/cls_validation"
+
+flow_visualization:
+  output_dir: "./inference_results/flow_visualization"
+  ode_steps: 20
+  num_samples: 50
+
+deform_validation:
+  output_dir: "./inference_results/deform_validation"
+  num_samples: 10
+
+baseline_comparison:
+  output_dir: "./inference_results/baseline_comparison"
+  num_test: 50
+
+cross_validation:
+  output_dir: "./inference_results/cross_validation"
+  n_folds: 5
+  epochs_per_fold: 100
+
+ablation:
+  output_dir: "./inference_results/ablation"
+  epochs: 50
+
+# Reproducibility
+seed: 42

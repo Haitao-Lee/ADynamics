@@ -823,6 +823,7 @@ class MultiModalVAETrainer:
         recon_loss_type = self.config.get("recon_loss_type", "l1")
         cls_weight = self.config.get("cls_weight", 1.0)
         kl_weight = getattr(self, 'current_kl_weight', self.config.get("kl_weight", 0.01))
+        num_classes = self.config.get("num_classes", 3)
 
         from tqdm import tqdm
         pbar = tqdm(enumerate(self.train_loader), total=len(self.train_loader), desc="Train", leave=False)
@@ -858,9 +859,9 @@ class MultiModalVAETrainer:
                 # Classification loss with ordinal structure
                 if labels is not None:
                     # Use ordinal CE: penalizes distant misclassification more
-                    cls_loss = ordinal_cross_entropy_loss(cls_logits, labels, num_classes=4)
+                    cls_loss = ordinal_cross_entropy_loss(cls_logits, labels, num_classes=num_classes)
                     # Add ordinal regression loss on latent mean
-                    ordinal_reg_loss = ordinal_regression_loss(mu, labels, num_classes=4)
+                    ordinal_reg_loss = ordinal_regression_loss(mu, labels, num_classes=num_classes)
                 else:
                     cls_loss = torch.tensor(0.0, device=self.device)
                     ordinal_reg_loss = torch.tensor(0.0, device=self.device)
@@ -936,6 +937,7 @@ class MultiModalVAETrainer:
         recon_loss_type = self.config.get("recon_loss_type", "l1")
         cls_weight = self.config.get("cls_weight", 1.0)
         kl_weight = getattr(self, 'current_kl_weight', self.config.get("kl_weight", 0.01))
+        num_classes = self.config.get("num_classes", 3)
 
         from tqdm import tqdm
         pbar = tqdm(enumerate(self.val_loader), total=len(self.val_loader), desc="Val", leave=False)
@@ -964,8 +966,8 @@ class MultiModalVAETrainer:
                 recon_loss = F.l1_loss(recon, x_dict["t1"])
 
                 if labels is not None:
-                    cls_loss = ordinal_cross_entropy_loss(cls_logits, labels, num_classes=4)
-                    ordinal_reg_loss = ordinal_regression_loss(mu, labels, num_classes=4)
+                    cls_loss = ordinal_cross_entropy_loss(cls_logits, labels, num_classes=num_classes)
+                    ordinal_reg_loss = ordinal_regression_loss(mu, labels, num_classes=num_classes)
                     preds = cls_logits.argmax(dim=1)
                     cls_acc = (preds == labels).float().mean().item()
                 else:
@@ -1011,14 +1013,41 @@ class MultiModalVAETrainer:
         torch.save(checkpoint, filepath)
 
     def load_checkpoint(self, filepath: str) -> None:
-        """Load model checkpoint."""
-        checkpoint = torch.load(filepath, map_location=self.device)
-        self.model.load_state_dict(checkpoint["model_state_dict"])
+        """Load model checkpoint with DataParallel and num_classes-mismatch handling."""
+        checkpoint = torch.load(filepath, map_location=self.device, weights_only=False)
+        sd = checkpoint["model_state_dict"]
+
+        # Handle DataParallel prefix
+        model_ref = self.model.module if hasattr(self.model, "module") else self.model
+        model_sd = model_ref.state_dict()
+        has_dp = any(k.startswith("module.") for k in sd)
+
+        if has_dp:
+            sd = {k[7:]: v for k, v in sd.items()}
+
+        # Filter: only load keys that exist and shape matches (e.g. classifier head may differ)
+        filtered_sd = {}
+        skipped = []
+        for k, v in sd.items():
+            if k in model_sd and v.shape == model_sd[k].shape:
+                filtered_sd[k] = v
+            else:
+                skipped.append(k)
+
+        model_ref.load_state_dict(filtered_sd, strict=False)
+        if skipped:
+            print(f"  Loaded {len(filtered_sd)} params, skipped {len(skipped)} (shape mismatch)")
+        else:
+            print(f"  Loaded {len(filtered_sd)} params")
+
         self.current_epoch = checkpoint.get("epoch", 0)
         self.best_val_loss = float("inf")
         self.best_cls_acc = 0.0
-        if "optimizer_state_dict" in checkpoint:
-            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if "optimizer_state_dict" in checkpoint and not skipped:
+            try:
+                self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            except Exception as e:
+                print(f"  Optimizer state incompatible: {e}")
 
     def train(
         self,

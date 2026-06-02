@@ -56,7 +56,39 @@ from engine.losses import GradientSmoothingLoss
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Stage 4 Deformation Generator")
+    from utils.config_loader import apply_yaml_defaults
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", type=str, default=None, help="YAML config file")
+    pre_args, _ = pre.parse_known_args()
+
+    mapping = [
+        (("input", "encoder_checkpoint"), "encoder_checkpoint"),
+        (("input", "cfm_checkpoint"), "cfm_checkpoint"),
+        (("input", "num_classes"), "num_classes"),
+        (("model", "latent_channels"), "latent_channels"),
+        (("model", "base_channels"), "base_channels"),
+        (("model", "decoder_depth"), "decoder_depth"),
+        (("model", "latent_spatial"), "latent_spatial"),
+        (("model", "output_spatial"), "output_spatial"),
+        (("model", "channel_mults"), "channel_mults"),
+        (("model", "num_res_blocks"), "num_res_blocks"),
+        (("training", "batch_size"), "batch_size"),
+        (("training", "learning_rate"), "learning_rate"),
+        (("training", "weight_decay"), "weight_decay"),
+        (("training", "epochs"), "epochs"),
+        (("training", "early_stopping_patience"), "early_stopping"),
+        (("training", "num_gpus"), "num_gpus"),
+        (("training", "use_amp"), "no_amp"),
+        (("loss", "sim_weight"), "sim_weight"),
+        (("loss", "smooth_weight"), "smooth_weight"),
+        (("loss", "jacobian_weight"), "jacobian_weight"),
+        (("output", "dir"), "output_dir"),
+        (("seed",), "seed"),
+    ]
+    config_defaults = apply_yaml_defaults(pre_args.config, mapping) if pre_args.config else {}
+
+    parser = argparse.ArgumentParser(description="Stage 4 Deformation Generator", parents=[pre])
+    parser.set_defaults(**config_defaults)
     parser.add_argument("--json", type=str, default="./core_data/dataset_manifest_merged_v2.json")
     parser.add_argument("--output_dir", type=str, default="./checkpoints/stage4_def")
     parser.add_argument("--encoder_checkpoint", type=str,

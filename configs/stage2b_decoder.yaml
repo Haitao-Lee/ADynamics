@@ -1,0 +1,40 @@
+# =============================================================================
+# ADynamics Stage 2b: Freeze Encoder, Train Decoder Head
+# =============================================================================
+# Validates that the Stage 1 encoder learned a reconstructable latent space.
+
+# Inputs
+input:
+  encoder_checkpoint: "./checkpoints/stage1_multimodal/vae_best.pt"
+  num_classes: 3
+
+# Training
+training:
+  batch_size: 2
+  learning_rate: 0.0001
+  weight_decay: 0.00001
+  epochs: 200
+  early_stopping_patience: 30
+  num_gpus: 2
+  use_amp: false
+
+# Loss
+loss:
+  recon_loss_type: "l1"
+  kl_weight: 0.0               # KL off (encoder frozen)
+
+# Model dimensions (must match Stage 1)
+model:
+  latent_channels: 32
+  base_channels: 32
+  decoder_depth: 4
+  in_channels: 1
+  spatial_size: [256, 256, 192]
+  dropout_rate: 0.2
+
+# Output
+output:
+  dir: "./checkpoints/stage2_decoder"
+
+# Reproducibility
+seed: 42

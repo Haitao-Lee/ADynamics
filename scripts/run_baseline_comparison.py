@@ -48,7 +48,23 @@ from models.vector_field import VelocityFieldNet
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Baseline Comparison")
+    from utils.config_loader import apply_yaml_defaults
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", type=str, default=None, help="YAML config file")
+    pre_args, _ = pre.parse_known_args()
+
+    mapping = [
+        (("input", "num_classes"), "num_classes"),
+        (("model", "latent_channels"), "latent_channels"),
+        (("model", "base_channels"), "base_channels"),
+        (("model", "decoder_depth"), "decoder_depth"),
+        (("baseline_comparison", "output_dir"), "output_dir"),
+        (("baseline_comparison", "num_test"), "num_test"),
+    ]
+    config_defaults = apply_yaml_defaults(pre_args.config, mapping) if pre_args.config else {}
+
+    parser = argparse.ArgumentParser(description="Baseline Comparison", parents=[pre])
+    parser.set_defaults(**config_defaults)
     parser.add_argument("--json", type=str, default="./core_data/dataset_manifest_merged_v2.json")
     parser.add_argument("--encoder_checkpoint", type=str, required=True)
     parser.add_argument("--cfm_checkpoint", type=str, default=None)

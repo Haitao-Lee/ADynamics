@@ -62,7 +62,41 @@ from engine.losses import GradientSmoothingLoss
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Stage 5 Joint Fine-tuning")
+    from utils.config_loader import apply_yaml_defaults
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", type=str, default=None, help="YAML config file")
+    pre_args, _ = pre.parse_known_args()
+
+    mapping = [
+        (("input", "encoder_checkpoint"), "encoder_checkpoint"),
+        (("input", "cfm_checkpoint"), "cfm_checkpoint"),
+        (("input", "deform_checkpoint"), "deform_checkpoint"),
+        (("input", "num_classes"), "num_classes"),
+        (("model", "latent_channels"), "latent_channels"),
+        (("model", "base_channels"), "base_channels"),
+        (("model", "decoder_depth"), "decoder_depth"),
+        (("model", "in_channels"), "in_channels"),
+        (("model", "spatial_size"), "spatial_size"),
+        (("model", "dropout_rate"), "dropout_rate"),
+        (("training", "batch_size"), "batch_size"),
+        (("training", "learning_rate"), "learning_rate"),
+        (("training", "weight_decay"), "weight_decay"),
+        (("training", "epochs"), "epochs"),
+        (("training", "early_stopping_patience"), "early_stopping"),
+        (("training", "num_gpus"), "num_gpus"),
+        (("training", "use_amp"), "no_amp"),
+        (("loss", "recon_weight"), "recon_weight"),
+        (("loss", "cfm_weight"), "cfm_weight"),
+        (("loss", "def_weight"), "def_weight"),
+        (("loss", "smooth_weight"), "smooth_weight"),
+        (("loss", "jacobian_weight"), "jacobian_weight"),
+        (("output", "dir"), "output_dir"),
+        (("seed",), "seed"),
+    ]
+    config_defaults = apply_yaml_defaults(pre_args.config, mapping) if pre_args.config else {}
+
+    parser = argparse.ArgumentParser(description="Stage 5 Joint Fine-tuning", parents=[pre])
+    parser.set_defaults(**config_defaults)
     parser.add_argument("--json", type=str, default="./core_data/dataset_manifest_merged_v2.json")
     parser.add_argument("--output_dir", type=str, default="./checkpoints/stage5_joint")
     parser.add_argument("--encoder_checkpoint", type=str,

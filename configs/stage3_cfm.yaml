@@ -1,0 +1,51 @@
+# =============================================================================
+# ADynamics Stage 3: MMSE-Conditional Flow Matching
+# =============================================================================
+# Learns forward-only disease progression flow in the latent space of Stage 1.
+# v = VelocityFieldNet(z_t, t, mmse_target) via FiLM conditioning.
+
+# Inputs
+input:
+  encoder_checkpoint: "./checkpoints/stage1_multimodal/vae_best.pt"
+  num_classes: 3
+
+# Model architecture (VelocityFieldNet)
+model:
+  latent_channels: 32
+  latent_spatial: [16, 16, 12]   # after 4 downsamples from 256x256x192
+  time_embed_dim: 128
+  time_hidden_dim: 256
+  cond_embed_dim: 64
+  cond_hidden_dim: 128
+  num_conditions: 1             # MMSE (1-D)
+  base_channels: 64
+  channel_mults: [1, 2, 4]
+  num_res_blocks: 2
+  use_demographics: false
+
+# Training
+training:
+  batch_size: 16              # pairs per batch
+  learning_rate: 0.0001
+  weight_decay: 0.00001
+  epochs: 300
+  early_stopping_patience: 50
+  num_gpus: 2
+  use_amp: false
+
+# Loss
+loss:
+  velocity_loss_weight: 1.0
+  rectified_flow_weight: 0.01   # 0 = disabled, 0.01-0.1 for straighter trajectories
+
+# CFM behavior
+cfm:
+  forward_only: true             # only src < tgt disease progression
+  distance_aware: true           # higher weight on adjacent transitions
+
+# Output
+output:
+  dir: "./checkpoints/stage3_cfm"
+
+# Reproducibility
+seed: 42

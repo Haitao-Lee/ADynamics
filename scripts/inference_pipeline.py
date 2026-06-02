@@ -790,6 +790,12 @@ def main():
         default="cuda" if torch.cuda.is_available() else "cpu",
         help="Device for inference",
     )
+    parser.add_argument(
+        "--num_classes",
+        type=int,
+        default=3,
+        help="Number of disease classes (3: NC/SCD+MCI/AD, 4: NC/SCD/MCI/AD)",
+    )
 
     args = parser.parse_args()
 
@@ -846,7 +852,7 @@ def main():
         in_channels=1,
         latent_channels=latent_channels,
         base_channels=32,
-        num_classes=4,
+        num_classes=args.num_classes,
         dropout_rate=0.0,  # No dropout in inference
         decoder_depth=4,
         optional_modalities=["fmri", "asl", "qsm", "flair"],

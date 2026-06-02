@@ -1,0 +1,49 @@
+# =============================================================================
+# ADynamics Stage 1: Multi-Modal VAE Training Configuration
+# =============================================================================
+# Trains the multi-modal encoder + lightweight decoder + classifier.
+# Loss = recon + cls_weight * ordinal_ce + kl_weight * KL (with free bits) + 0.1 * ordinal_reg
+
+# Data
+data:
+  json: "./core_data/dataset_manifest_merged_v2.json"
+  num_classes: 3               # 3 = NC / SCD+MCI / AD, 4 = NC / SCD / MCI / AD
+  optional_modalities: ["fmri", "asl", "qsm", "flair"]
+
+# Model architecture
+model:
+  spatial_size: [256, 256, 192]  # [D, H, W]
+  in_channels: 1
+  latent_channels: 32
+  base_channels: 32
+  decoder_depth: 4
+  dropout_rate: 0.2
+
+# Training hyperparameters
+training:
+  batch_size: 2
+  learning_rate: 0.00005
+  weight_decay: 0.00001
+  epochs: 300
+  early_stopping_patience: 50
+  save_interval: 50
+  num_gpus: 2
+  use_amp: false
+
+# Loss weights
+loss:
+  recon_loss_type: "l1"
+  cls_weight: 1.0
+  kl_weight: 0.5               # target weight after warmup
+  kl_warmup_epochs: 20          # linear ramp from 0 -> kl_weight
+  free_bits: 0.01               # minimum KL per latent dim (prevents collapse)
+  contrastive_weight: 0.0       # optional: 0.05 to enable
+  gradient_weight: 0.0          # optional: gradient loss on reconstruction
+  ssim_weight: 0.0             # optional: SSIM loss
+
+# Output
+output:
+  dir: "./checkpoints/stage1_multimodal"
+
+# Reproducibility
+seed: 42

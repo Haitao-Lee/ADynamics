@@ -1,0 +1,43 @@
+# =============================================================================
+# ADynamics Stage 4: Deformation Generator
+# =============================================================================
+# Learns 3D displacement fields that morph NC-like brains toward AD-like brains.
+# Sim + smooth + jacobian-determinant (no-folding) losses.
+
+# Inputs
+input:
+  encoder_checkpoint: "./checkpoints/stage1_multimodal/vae_best.pt"
+  cfm_checkpoint: "./checkpoints/stage3_cfm/cfm_best.pt"
+  num_classes: 3
+
+# Model architecture (DeformationGenerator)
+model:
+  latent_channels: 32
+  latent_spatial: [16, 16, 12]
+  output_spatial: [256, 256, 192]
+  base_channels: 16
+  channel_mults: [1, 2, 4, 8]
+  num_res_blocks: 2
+
+# Training
+training:
+  batch_size: 2
+  learning_rate: 0.0001
+  weight_decay: 0.00001
+  epochs: 200
+  early_stopping_patience: 50
+  num_gpus: 2
+  use_amp: false
+
+# Loss
+loss:
+  sim_weight: 1.0               # L1 between warped and AD target
+  smooth_weight: 0.1
+  jacobian_weight: 0.01         # prevents topology-breaking folding
+
+# Output
+output:
+  dir: "./checkpoints/stage4_def"
+
+# Reproducibility
+seed: 42

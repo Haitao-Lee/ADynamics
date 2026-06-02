@@ -44,7 +44,28 @@ CLASS_NAMES_MAP = {
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="CFM Flow Visualization")
+    from utils.config_loader import apply_yaml_defaults
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", type=str, default=None, help="YAML config file")
+    pre_args, _ = pre.parse_known_args()
+
+    mapping = [
+        (("input", "encoder_checkpoint"), "encoder_checkpoint"),
+        (("input", "num_classes"), "num_classes"),
+        (("model", "latent_channels"), "latent_channels"),
+        (("model", "base_channels"), "base_channels"),
+        (("model", "decoder_depth"), "decoder_depth"),
+        (("model", "cfm_base_channels"), "cfm_base_channels"),
+        (("model", "time_embed_dim"), "time_embed_dim"),
+        (("model", "cond_embed_dim"), "cond_embed_dim"),
+        (("flow_visualization", "output_dir"), "output_dir"),
+        (("flow_visualization", "ode_steps"), "ode_steps"),
+        (("flow_visualization", "num_samples"), "num_samples"),
+    ]
+    config_defaults = apply_yaml_defaults(pre_args.config, mapping) if pre_args.config else {}
+
+    parser = argparse.ArgumentParser(description="CFM Flow Visualization", parents=[pre])
+    parser.set_defaults(**config_defaults)
     parser.add_argument("--encoder_checkpoint", type=str, required=True)
     parser.add_argument("--cfm_checkpoint", type=str, required=True)
     parser.add_argument("--json", type=str, default="./core_data/dataset_manifest_merged_v2.json")
@@ -126,7 +147,7 @@ def main():
         in_channels=1,
         latent_channels=args.latent_channels,
         base_channels=args.base_channels,
-        num_classes=4,
+        num_classes=args.num_classes,
         decoder_depth=args.decoder_depth,
         optional_modalities=["fmri", "asl", "qsm", "flair"],
     )

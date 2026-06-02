@@ -44,7 +44,25 @@ from engine.trainer_vae import MultiModalVAETrainer
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Cross-Validation for ADynamics")
+    from utils.config_loader import apply_yaml_defaults
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", type=str, default=None, help="YAML config file")
+    pre_args, _ = pre.parse_known_args()
+
+    mapping = [
+        (("input", "num_classes"), "num_classes"),
+        (("model", "latent_channels"), "latent_channels"),
+        (("model", "base_channels"), "base_channels"),
+        (("model", "decoder_depth"), "decoder_depth"),
+        (("model", "dropout_rate"), "dropout_rate"),
+        (("cross_validation", "output_dir"), "output_dir"),
+        (("cross_validation", "n_folds"), "n_folds"),
+        (("cross_validation", "epochs_per_fold"), "epochs_per_fold"),
+    ]
+    config_defaults = apply_yaml_defaults(pre_args.config, mapping) if pre_args.config else {}
+
+    parser = argparse.ArgumentParser(description="Cross-Validation for ADynamics", parents=[pre])
+    parser.set_defaults(**config_defaults)
     parser.add_argument("--json", type=str, default="./core_data/dataset_manifest_merged_v2.json")
     parser.add_argument("--output_dir", type=str, default="./inference_results/cross_validation")
     parser.add_argument("--n_folds", type=int, default=5, help="Number of CV folds")

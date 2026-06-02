@@ -85,8 +85,50 @@ class MultiModalDataParallel(DataParallel):
         return tuple(gathered)
 
 
+def _load_yaml_defaults(config_path: str) -> dict:
+    """Load YAML config and map nested keys to argparse argument names."""
+    from utils.config_loader import apply_yaml_defaults
+    mapping = [
+        (("data", "json"), "json"),
+        (("data", "num_classes"), "num_classes"),
+        (("model", "latent_channels"), "latent_channels"),
+        (("model", "base_channels"), "base_channels"),
+        (("model", "decoder_depth"), "decoder_depth"),
+        (("model", "dropout_rate"), "dropout_rate"),
+        (("training", "batch_size"), "batch_size"),
+        (("training", "learning_rate"), "learning_rate"),
+        (("training", "weight_decay"), "weight_decay"),
+        (("training", "epochs"), "epochs"),
+        (("training", "early_stopping_patience"), "early_stopping"),
+        (("training", "save_interval"), "save_interval"),
+        (("training", "num_gpus"), "num_gpus"),
+        (("training", "use_amp"), "use_amp"),
+        (("loss", "recon_loss_type"), "recon_loss_type"),
+        (("loss", "cls_weight"), "cls_weight"),
+        (("loss", "kl_weight"), "kl_weight"),
+        (("loss", "kl_warmup_epochs"), "kl_warmup_epochs"),
+        (("loss", "free_bits"), "free_bits"),
+        (("loss", "contrastive_weight"), "contrastive_weight"),
+        (("loss", "gradient_weight"), "gradient_weight"),
+        (("loss", "ssim_weight"), "ssim_weight"),
+        (("output", "dir"), "output_dir"),
+        (("seed",), "seed"),
+    ]
+    return apply_yaml_defaults(config_path, mapping)
+
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="Stage 1 Multi-Modal VAE Training")
+    # Pre-parse config file (if provided) to set defaults
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", type=str, default=None, help="YAML config file")
+    pre_args, _ = pre.parse_known_args()
+
+    config_defaults = {}
+    if pre_args.config and os.path.exists(pre_args.config):
+        config_defaults = _load_yaml_defaults(pre_args.config)
+
+    parser = argparse.ArgumentParser(description="Stage 1 Multi-Modal VAE Training", parents=[pre])
+    parser.set_defaults(**config_defaults)
 
     # Data
     parser.add_argument("--json", type=str, default="./core_data/dataset_manifest_merged_v2.json",
@@ -306,6 +348,7 @@ def main():
         "contrastive_weight": args.contrastive_weight,
         "gradient_weight": args.gradient_weight,
         "ssim_weight": args.ssim_weight,
+        "num_classes": args.num_classes,
         "use_amp": use_amp,
     }
 

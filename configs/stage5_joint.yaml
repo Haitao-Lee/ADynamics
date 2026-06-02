@@ -1,0 +1,51 @@
+# =============================================================================
+# ADynamics Stage 5: Joint Fine-Tuning
+# =============================================================================
+# End-to-end fine-tuning of all modules together with differential learning rates.
+
+# Inputs
+input:
+  encoder_checkpoint: "./checkpoints/stage1_multimodal/vae_best.pt"
+  cfm_checkpoint: "./checkpoints/stage3_cfm/cfm_best.pt"
+  deform_checkpoint: "./checkpoints/stage4_def/def_best.pt"
+  num_classes: 3
+
+# Model dimensions (must match Stage 1)
+model:
+  latent_channels: 32
+  base_channels: 32
+  decoder_depth: 4
+  in_channels: 1
+  spatial_size: [256, 256, 192]
+  dropout_rate: 0.2
+
+# Training
+training:
+  batch_size: 2
+  learning_rate: 0.00001
+  weight_decay: 0.00001
+  epochs: 100
+  early_stopping_patience: 30
+  num_gpus: 2
+  use_amp: false
+
+# Loss
+loss:
+  recon_weight: 1.0
+  cfm_weight: 0.1
+  def_weight: 0.1
+  smooth_weight: 0.05
+  jacobian_weight: 0.01
+
+# Differential learning rates (relative to base learning_rate)
+lr_multipliers:
+  encoder: 0.1                 # VAE updated 10x slower
+  cfm: 1.0
+  deform: 1.0
+
+# Output
+output:
+  dir: "./checkpoints/stage5_joint"
+
+# Reproducibility
+seed: 42
