@@ -822,7 +822,7 @@ class MultiModalVAETrainer:
 
         recon_loss_type = self.config.get("recon_loss_type", "l1")
         cls_weight = self.config.get("cls_weight", 1.0)
-        kl_weight = self.config.get("kl_weight", 0.01)
+        kl_weight = getattr(self, 'current_kl_weight', self.config.get("kl_weight", 0.01))
 
         from tqdm import tqdm
         pbar = tqdm(enumerate(self.train_loader), total=len(self.train_loader), desc="Train", leave=False)
@@ -865,8 +865,12 @@ class MultiModalVAETrainer:
                     cls_loss = torch.tensor(0.0, device=self.device)
                     ordinal_reg_loss = torch.tensor(0.0, device=self.device)
 
-                # KL loss (true VAE)
-                kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+                # KL loss with Free Bits
+                free_bits = self.config.get("free_bits", 0.0)
+                kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+                if free_bits > 0:
+                    kl_per_dim = torch.clamp(kl_per_dim, min=free_bits)
+                kl_loss = kl_per_dim.mean()
 
                 # Total loss
                 loss = recon_loss + cls_weight * cls_loss + kl_weight * kl_loss + 0.1 * ordinal_reg_loss
@@ -931,7 +935,7 @@ class MultiModalVAETrainer:
 
         recon_loss_type = self.config.get("recon_loss_type", "l1")
         cls_weight = self.config.get("cls_weight", 1.0)
-        kl_weight = self.config.get("kl_weight", 0.01)
+        kl_weight = getattr(self, 'current_kl_weight', self.config.get("kl_weight", 0.01))
 
         from tqdm import tqdm
         pbar = tqdm(enumerate(self.val_loader), total=len(self.val_loader), desc="Val", leave=False)
@@ -969,7 +973,11 @@ class MultiModalVAETrainer:
                     ordinal_reg_loss = torch.tensor(0.0, device=self.device)
                     cls_acc = 0.0
 
-                kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+                free_bits = self.config.get("free_bits", 0.0)
+                kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+                if free_bits > 0:
+                    kl_per_dim = torch.clamp(kl_per_dim, min=free_bits)
+                kl_loss = kl_per_dim.mean()
                 loss = recon_loss + cls_weight * cls_loss + kl_weight * kl_loss + 0.1 * ordinal_reg_loss
 
             total_loss += loss.item()
@@ -1059,9 +1067,19 @@ class MultiModalVAETrainer:
         epochs_without_improvement = 0
         early_stopped = False
 
+        # KL annealing: warmup from 0 to target over kl_warmup_epochs
+        target_kl_weight = self.config.get("kl_weight", 0.01)
+        kl_warmup_epochs = self.config.get("kl_warmup_epochs", 20)
+
         for epoch in range(num_epochs):
             self.current_epoch = epoch
             epoch_start_time = time.time()
+
+            # Compute current kl_weight with annealing
+            if epoch < kl_warmup_epochs:
+                self.current_kl_weight = target_kl_weight * (epoch + 1) / kl_warmup_epochs
+            else:
+                self.current_kl_weight = target_kl_weight
 
             train_metrics = self.train_epoch()
             val_metrics = self.validate_epoch()

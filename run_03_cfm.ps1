@@ -1,10 +1,11 @@
-# Stage 3: Conditional Flow Matching (Forward-Only)
+# Stage 3: MMSE-Conditional Flow Matching (Forward-Only)
 # Learns disease progression vector field in latent space
-# Key: Only forward flows (NC→SCD→MCI→AD), distance-aware sampling
-# Usage: .\run_stage3.ps1
+# Key: Only forward flows, distance-aware sampling, rectified flow regularization
+# Usage: .\run_03_cfm.ps1
 
 python scripts/train_stage3_cfm.py `
-    --encoder_checkpoint ./checkpoints/stage1_multimodal/vae_best.pt `
+    --encoder_checkpoint ./checkpoints/stage1_multimodal_v4/vae_best.pt `
+    --num_classes 3 `
     --batch_size 16 `
     --epochs 300 `
     --learning_rate 0.0001 `
@@ -14,4 +15,4 @@ python scripts/train_stage3_cfm.py `
     --cond_embed_dim 64 `
     --rectified_flow_weight 0.01 `
     --early_stopping 50 `
-    --output_dir ./checkpoints/stage3_cfm
+    --output_dir ./checkpoints/stage3_cfm_v4

@@ -3,7 +3,8 @@
 # Usage: .\run_stage2b.ps1
 
 python scripts/train_stage2_decoder.py `
-    --checkpoint ./checkpoints/stage1_multimodal/vae_best.pt `
+    --checkpoint ./checkpoints/stage1_multimodal_v4/vae_best.pt `
+    --num_classes 3 `
     --batch_size 2 `
     --epochs 200 `
     --learning_rate 0.0001 `
@@ -11,4 +12,4 @@ python scripts/train_stage2_decoder.py `
     --recon_loss_type l1 `
     --kl_weight 0.0 `
     --early_stopping 30 `
-    --output_dir ./checkpoints/stage2_decoder
+    --output_dir ./checkpoints/stage2_decoder_v4

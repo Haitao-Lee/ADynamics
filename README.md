@@ -108,15 +108,6 @@ Patient MRI ──→ Encoder ──→ z₀ (current latent)
 | `run_cross_validation.py` | 5-fold stratified CV |
 | `run_ablation.py` | Systematic component ablation |
 
-| Stage | Script | Goal |
-|-------|--------|------|
-| **1** | `train_stage1_multimodal.py` | Train multi-modal encoder (recon + cls + KL + contrastive) |
-| **2a** | `train_stage2_classifier.py` | Freeze encoder, train classifier head |
-| **2b** | `train_stage2_decoder.py` | Freeze encoder, train decoder |
-| **3** | `train_stage3_cfm.py` | Train CFM vector field (**forward-only** flows) |
-| **4** | `train_stage4_deformation.py` | Train deformation generator |
-| **5** | `train_stage5_joint.py` | Joint fine-tuning all modules |
-
 ### Key Design Improvements
 
 - **Forward-only CFM**: Only learns NC→SCD→MCI→AD (no reverse flows)
@@ -147,38 +138,38 @@ pip install monai==1.4.0 nibabel SimpleITK torchdiffeq scikit-learn matplotlib t
 ### Train
 
 ```powershell
-# Stage 1: Multi-modal VAE (3-class, with contrastive loss)
-.\run_stage1.ps1
-
-# After Stage 1: Check latent quality
-.\run_analysis.ps1
+# Stage 1: Multi-modal VAE (3-class, free bits + KL annealing)
+.\run_01_train.ps1
 
 # Stage 2a: Validate encoder with classifier
-.\run_stage2a.ps1
+.\run_02a_classifier.ps1
 
-# Stage 2b: Improve decoder
-.\run_stage2b.ps1
+# Stage 2b: Validate encoder with decoder
+.\run_02b_decoder.ps1
 
 # Stage 3: MMSE-conditional CFM (forward-only, distance-aware)
-.\run_stage3.ps1
+.\run_03_cfm.ps1
 
-# Stage 4: Train deformation
-.\run_stage4.ps1
+# Stage 4: Deformation generator
+.\run_04_deformation.ps1
 
 # Stage 5: Joint fine-tuning
-.\run_stage5.ps1
+.\run_05_joint.ps1
 ```
 
-### Validate & Analyze
+### Analyze & Validate
 
 ```powershell
-# Run all validations
-.\run_validation.ps1
+# Latent space analysis (PCA/t-SNE/silhouette)
+.\run_analysis_latent.ps1
+
+# Full validation suite
+.\run_analysis_all.ps1
 
 # Baseline comparison (CFM vs linear/KNN/regression)
 .\run_baseline.ps1
 
-# Cross-validation (5-fold stratified)
+# 5-fold cross-validation
 .\run_crossval.ps1
 
 # Ablation experiments
@@ -191,14 +182,14 @@ pip install monai==1.4.0 nibabel SimpleITK torchdiffeq scikit-learn matplotlib t
 
 ```
 ADynamics/
-├── run_stage1.ps1              # Stage 1: Multi-modal VAE (3-class)
-├── run_stage1_resume.ps1       # Resume from checkpoint
-├── run_analysis.ps1            # Latent space analysis
-├── run_stage2a.ps1 / run_stage2b.ps1  # Stage 2: Encoder validation
-├── run_stage3.ps1              # Stage 3: MMSE-conditional CFM
-├── run_stage4.ps1              # Stage 4: Deformation generator
-├── run_stage5.ps1              # Stage 5: Joint fine-tuning
-├── run_validation.ps1          # Full validation suite
+├── run_01_train.ps1            # Stage 1: Multi-modal VAE (free bits + KL annealing)
+├── run_02a_classifier.ps1      # Stage 2a: Freeze encoder, train classifier
+├── run_02b_decoder.ps1         # Stage 2b: Freeze encoder, train decoder
+├── run_03_cfm.ps1              # Stage 3: MMSE-conditional CFM
+├── run_04_deformation.ps1      # Stage 4: Deformation generator
+├── run_05_joint.ps1            # Stage 5: Joint fine-tuning
+├── run_analysis_latent.ps1     # Latent space analysis
+├── run_analysis_all.ps1        # Full validation suite
 ├── run_baseline.ps1            # CFM vs baseline comparison
 ├── run_crossval.ps1            # 5-fold cross-validation
 ├── run_ablation.ps1            # Systematic ablation
@@ -208,7 +199,7 @@ ADynamics/
 │   └── transforms.py           # MONAI preprocessing transforms
 │
 ├── engine/                      # Training layer
-│   ├── trainer_vae.py          # MultiModalVAETrainer (KL + contrastive)
+│   ├── trainer_vae.py          # MultiModalVAETrainer (KL + contrastive + free bits)
 │   ├── trainer_cfm.py          # CFMTrainer
 │   └── losses.py               # All losses (incl. rectified flow)
 │
@@ -233,6 +224,10 @@ ADynamics/
 │   ├── run_cross_validation.py       # 5-fold stratified CV
 │   ├── run_ablation.py               # Component ablation
 │   └── inference_pipeline.py         # End-to-end inference
+│
+├── docs/                        # Documentation
+│   ├── TRAINING_PIPELINE.md    # Detailed training pipeline docs
+│   └── CODE_REVIEW_GUIDE.md   # Code review methodology
 │
 └── utils/                       # Utilities
     ├── io_utils.py             # NIfTI I/O
@@ -274,8 +269,10 @@ T1 is required. Other modalities are optional (model handles missing modalities 
 | `--base_channels` | 16 | Encoder base channels |
 | `--decoder_depth` | 4 | Decoder upsampling levels (4 = 16x) |
 | `--num_classes` | 3 | Disease classes (3: NC/SCD+MCI/AD, 4: NC/SCD/MCI/AD) |
-| `--cls_weight` | 2.0 | Classification loss weight |
-| `--kl_weight` | 0.1 | KL divergence weight |
+| `--cls_weight` | 1.0 | Classification loss weight |
+| `--kl_weight` | 0.5 | KL divergence weight |
+| `--kl_warmup_epochs` | 20 | KL weight annealing warmup |
+| `--free_bits` | 0.01 | Minimum KL per dimension (prevents collapse) |
 | `--dropout_rate` | 0.2 | Optional modality dropout |
 | `--rectified_flow_weight` | 0.01 | Rectified flow regularization (Stage 3) |
 

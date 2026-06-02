@@ -115,6 +115,10 @@ def parse_args():
                         help="Classification loss weight (higher = more discriminative latent)")
     parser.add_argument("--kl_weight", type=float, default=0.1,
                         help="KL divergence loss weight")
+    parser.add_argument("--kl_warmup_epochs", type=int, default=20,
+                        help="Epochs for KL weight annealing from 0 to kl_weight")
+    parser.add_argument("--free_bits", type=float, default=0.0,
+                        help="Free bits per latent dimension (minimum KL, prevents collapse)")
     parser.add_argument("--recon_loss_type", type=str, default="l1",
                         help="Reconstruction loss type (l1 or l2)")
     parser.add_argument("--contrastive_weight", type=float, default=0.0,
@@ -296,6 +300,8 @@ def main():
     config = {
         "cls_weight": args.cls_weight,
         "kl_weight": args.kl_weight,
+        "kl_warmup_epochs": args.kl_warmup_epochs,
+        "free_bits": args.free_bits,
         "recon_loss_type": args.recon_loss_type,
         "contrastive_weight": args.contrastive_weight,
         "gradient_weight": args.gradient_weight,
