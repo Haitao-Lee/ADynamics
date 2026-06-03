@@ -4,5 +4,5 @@
 
 python scripts/train_stage3_cfm.py `
     --config ./configs/stage3_cfm.yaml `
-    --encoder_checkpoint ./checkpoints/stage1_multimodal_v4/vae_best.pt `
-    --output_dir ./checkpoints/stage3_cfm_v4
+    --encoder_checkpoint ./checkpoints/stage1_multimodal/vae_best.pt `
+    --output_dir ./checkpoints/stage3_cfm

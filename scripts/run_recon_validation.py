@@ -54,7 +54,6 @@ def parse_args():
     config_defaults = apply_yaml_defaults(pre_args.config, mapping) if pre_args.config else {}
 
     parser = argparse.ArgumentParser(description="Reconstruction Validation", parents=[pre])
-    parser.set_defaults(**config_defaults)
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--json", type=str, default="./core_data/dataset_manifest_merged_v2.json")
     parser.add_argument("--output_dir", type=str, default="./inference_results/recon_validation")
@@ -63,9 +62,12 @@ def parse_args():
     parser.add_argument("--decoder_depth", type=int, default=4)
     parser.add_argument("--num_samples", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--num_classes", type=int, default=3,
+    parser.add_argument("--num_classes", type=int, default=4,
                         help="Number of disease classes (3: NC/SCD+MCI/AD, 4: NC/SCD/MCI/AD)")
     parser.add_argument("--device", type=str, default="cuda")
+    # Apply YAML config defaults AFTER all add_argument calls
+    # (set_defaults must come last so it isn't overridden by argparse defaults)
+    parser.set_defaults(**config_defaults)
     return parser.parse_args()
 
 

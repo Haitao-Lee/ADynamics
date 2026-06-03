@@ -57,17 +57,19 @@ def parse_args():
     config_defaults = apply_yaml_defaults(pre_args.config, mapping) if pre_args.config else {}
 
     parser = argparse.ArgumentParser(description="Classification Validation", parents=[pre])
-    parser.set_defaults(**config_defaults)
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--json", type=str, default="./core_data/dataset_manifest_merged_v2.json")
     parser.add_argument("--output_dir", type=str, default="./inference_results/cls_validation")
     parser.add_argument("--latent_channels", type=int, default=32)
     parser.add_argument("--base_channels", type=int, default=16)
     parser.add_argument("--decoder_depth", type=int, default=4)
-    parser.add_argument("--num_classes", type=int, default=3,
+    parser.add_argument("--num_classes", type=int, default=4,
                         help="Number of disease classes (3: NC/SCD+MCI/AD, 4: NC/SCD/MCI/AD)")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--device", type=str, default="cuda")
+    # Apply YAML config defaults AFTER all add_argument calls
+    # (set_defaults must come last so it isn't overridden by argparse defaults)
+    parser.set_defaults(**config_defaults)
     return parser.parse_args()
 
 
@@ -116,12 +118,9 @@ def main():
 
     # Remap labels for 3-class: NC=0, SCD+MCI=1, AD=2
     if args.num_classes == 3:
-        for item in data_list:
-            label = item.get("label", 0)
-            if label in [1, 2]:
-                item["label"] = 1
-            elif label == 3:
-                item["label"] = 2
+        from utils.config_loader import remap_labels_3class
+        remap_labels_3class(data_list)
+        print("Remapped labels to 3-class (NC / SCD+MCI / AD)")
 
     from sklearn.model_selection import train_test_split
     _, val_data = train_test_split(

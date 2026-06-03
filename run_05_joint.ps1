@@ -4,7 +4,7 @@
 
 python scripts/train_stage5_joint.py `
     --config ./configs/stage5_joint.yaml `
-    --encoder_checkpoint ./checkpoints/stage1_multimodal_v4/vae_best.pt `
-    --cfm_checkpoint ./checkpoints/stage3_cfm_v4/cfm_best.pt `
-    --deform_checkpoint ./checkpoints/stage4_def_v4/def_best.pt `
-    --output_dir ./checkpoints/stage5_joint_v4
+    --encoder_checkpoint ./checkpoints/stage1_multimodal/vae_best.pt `
+    --cfm_checkpoint ./checkpoints/stage3_cfm/cfm_best.pt `
+    --deform_checkpoint ./checkpoints/stage4_def/def_best.pt `
+    --output_dir ./checkpoints/stage5_joint

@@ -105,6 +105,12 @@ def run_stage1_ablation(config: AblationConfig, args, device):
     with open(args.json, "r") as f:
         data_list = json.load(f)
 
+    # Remap labels for 3-class: NC=0, SCD+MCI=1, AD=2
+    if args.num_classes == 3:
+        from utils.config_loader import remap_labels_3class
+        remap_labels_3class(data_list)
+        print("Remapped labels to 3-class (NC / SCD+MCI / AD)")
+
     train_transforms = get_multimodal_train_transforms()
     val_transforms = get_multimodal_val_transforms()
 
@@ -207,14 +213,13 @@ def main():
     config_defaults = apply_yaml_defaults(pre_args.config, mapping) if pre_args.config else {}
 
     parser = argparse.ArgumentParser(description="Ablation Experiments", parents=[pre])
-    parser.set_defaults(**config_defaults)
     parser.add_argument("--json", type=str, default="./core_data/dataset_manifest_merged_v2.json")
     parser.add_argument("--output_dir", type=str, default="./inference_results/ablation")
     parser.add_argument("--ablation", type=str, default="all",
                         help="Ablation to run: all, kl_weight, contrastive, cls_weight, encoder_capacity, cfm_direction, rectified_flow")
     parser.add_argument("--latent_channels", type=int, default=32)
     parser.add_argument("--decoder_depth", type=int, default=4)
-    parser.add_argument("--num_classes", type=int, default=3,
+    parser.add_argument("--num_classes", type=int, default=4,
                         help="Number of disease classes (3: NC/SCD+MCI/AD, 4: NC/SCD/MCI/AD)")
     parser.add_argument("--dropout_rate", type=float, default=0.2)
     parser.add_argument("--num_gpus", type=int, default=2)

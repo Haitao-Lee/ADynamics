@@ -58,7 +58,6 @@ def parse_args():
     config_defaults = apply_yaml_defaults(pre_args.config, mapping) if pre_args.config else {}
 
     parser = argparse.ArgumentParser(description="Deformation Validation", parents=[pre])
-    parser.set_defaults(**config_defaults)
     parser.add_argument("--encoder_checkpoint", type=str, required=True)
     parser.add_argument("--deform_checkpoint", type=str, required=True)
     parser.add_argument("--json", type=str, default="./core_data/dataset_manifest_merged_v2.json")
@@ -67,9 +66,12 @@ def parse_args():
     parser.add_argument("--base_channels", type=int, default=16)
     parser.add_argument("--decoder_depth", type=int, default=4)
     parser.add_argument("--num_samples", type=int, default=10)
-    parser.add_argument("--num_classes", type=int, default=3,
+    parser.add_argument("--num_classes", type=int, default=4,
                         help="Number of disease classes (3: NC/SCD+MCI/AD, 4: NC/SCD/MCI/AD)")
     parser.add_argument("--device", type=str, default="cuda")
+    # Apply YAML config defaults AFTER all add_argument calls
+    # (set_defaults must come last so it isn't overridden by argparse defaults)
+    parser.set_defaults(**config_defaults)
     return parser.parse_args()
 
 
@@ -145,6 +147,13 @@ def main():
 
     # Load data
     data_list = load_data(args.json)
+
+    # Remap labels for 3-class: NC=0, SCD+MCI=1, AD=2
+    if args.num_classes == 3:
+        from utils.config_loader import remap_labels_3class
+        remap_labels_3class(data_list)
+        print("Remapped labels to 3-class (NC / SCD+MCI / AD)")
+
     from sklearn.model_selection import train_test_split
     _, val_data = train_test_split(
         data_list, test_size=0.15,

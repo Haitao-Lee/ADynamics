@@ -1,5 +1,5 @@
 # Cross-Validation: 5-fold stratified CV for reliable performance estimates
-# Reports mean ± std for all metrics
+# Reports mean +/- std for all metrics
 # Usage: .\run_crossval.ps1
 
 python scripts/run_cross_validation.py `

@@ -65,7 +65,6 @@ def parse_args():
     config_defaults = apply_yaml_defaults(pre_args.config, mapping) if pre_args.config else {}
 
     parser = argparse.ArgumentParser(description="Latent Space Analysis", parents=[pre])
-    parser.set_defaults(**config_defaults)
     parser.add_argument("--checkpoint", type=str,
                         default="./checkpoints/stage1_multimodal/vae_best.pt")
     parser.add_argument("--json", type=str,
@@ -76,9 +75,12 @@ def parse_args():
     parser.add_argument("--latent_channels", type=int, default=32)
     parser.add_argument("--base_channels", type=int, default=16)
     parser.add_argument("--decoder_depth", type=int, default=4)
-    parser.add_argument("--num_classes", type=int, default=3,
+    parser.add_argument("--num_classes", type=int, default=4,
                         help="Number of disease classes (3: NC/SCD+MCI/AD, 4: NC/SCD/MCI/AD)")
     parser.add_argument("--device", type=str, default="cuda")
+    # Apply YAML config defaults AFTER all add_argument calls
+    # (set_defaults must come last so it isn't overridden by argparse defaults)
+    parser.set_defaults(**config_defaults)
     return parser.parse_args()
 
 
@@ -320,16 +322,26 @@ def main():
     data_list = load_data(args.json)
     print(f"Valid samples: {len(data_list)}")
 
-    from sklearn.model_selection import train_test_split
-    _, val_data = train_test_split(
-        data_list, test_size=0.15,
-        stratify=[d.get("label", 0) for d in data_list],
-        random_state=42,
-    )
-    print(f"Validation samples: {len(val_data)}")
+    # Remap 4-class labels to 3-class (SCD+MCI merged) if needed
+    if args.num_classes == 3:
+        from utils.config_loader import remap_labels_3class
+        remap_labels_3class(data_list)
+        print("Remapped labels to 3-class (NC / SCD+MCI / AD)")
+    # Use full dataset if num_samples is large (>= 10000), otherwise subsample
+    if args.num_samples >= 10000 or args.num_samples >= len(data_list):
+        analysis_data = data_list
+        print(f"Analyzing all {len(analysis_data)} samples (full dataset)")
+    else:
+        from sklearn.model_selection import train_test_split
+        _, analysis_data = train_test_split(
+            data_list, test_size=0.15,
+            stratify=[d.get("label", 0) for d in data_list],
+            random_state=42,
+        )
+        print(f"Analyzing {len(analysis_data)} samples (val split)")
 
     val_transforms = get_multimodal_val_transforms()
-    val_dataset = MultiModalDataset(val_data, transform=val_transforms)
+    val_dataset = MultiModalDataset(analysis_data, transform=val_transforms)
     from core_data.dataset import multimodal_collate_fn
     dataloader = torch.utils.data.DataLoader(
         val_dataset, batch_size=4, shuffle=False,

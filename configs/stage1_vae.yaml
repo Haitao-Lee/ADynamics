@@ -7,7 +7,7 @@
 # Data
 data:
   json: "./core_data/dataset_manifest_merged_v2.json"
-  num_classes: 3               # 3 = NC / SCD+MCI / AD, 4 = NC / SCD / MCI / AD
+  num_classes: 4               # 4 = NC / SCD / MCI / AD (v6: keep all 4 stages for richer CFM transitions)
   optional_modalities: ["fmri", "asl", "qsm", "flair"]
 
 # Model architecture
@@ -15,35 +15,36 @@ model:
   spatial_size: [256, 256, 192]  # [D, H, W]
   in_channels: 1
   latent_channels: 32
-  base_channels: 32
+  base_channels: 16             # must match stage1 checkpoint (--base_channels 16)
   decoder_depth: 4
   dropout_rate: 0.2
 
 # Training hyperparameters
 training:
-  batch_size: 2
-  learning_rate: 0.00005
+  batch_size: 2                # TOTAL batch size (each GPU gets 1 via DataParallel scatter)
+  learning_rate: 0.00003        # reduced for stable retraining with stronger KL
   weight_decay: 0.00001
   epochs: 300
   early_stopping_patience: 50
   save_interval: 50
-  num_gpus: 2
-  use_amp: false
+  num_gpus: 2                   # dual-GPU training (2x RTX 3090)
+  use_amp: false               # v5: AMP caused NaN in VAE loss (KL+recon scale mismatch)
 
 # Loss weights
 loss:
   recon_loss_type: "l1"
   cls_weight: 1.0
-  kl_weight: 0.5               # target weight after warmup
-  kl_warmup_epochs: 20          # linear ramp from 0 -> kl_weight
+  kl_weight: 1.0               # v5: stronger (was 0.5) -- prevent NC/SCD+MCI collapse
+  kl_warmup_epochs: 30          # v5: longer warmup (was 20)
   free_bits: 0.01               # minimum KL per latent dim (prevents collapse)
-  contrastive_weight: 0.0       # optional: 0.05 to enable
+  contrastive_weight: 0.3       # v6: 3x stronger (was 0.1 in v5) to overcome cls_weight=1.0 dominance
+  contrastive_temperature: 0.1 # NT-Xent temperature
   gradient_weight: 0.0          # optional: gradient loss on reconstruction
   ssim_weight: 0.0             # optional: SSIM loss
 
 # Output
 output:
-  dir: "./checkpoints/stage1_multimodal"
+  dir: "./checkpoints/stage1_multimodal"   # v6: 4-class + contrastive 0.3
 
 # Reproducibility
 seed: 42

@@ -26,7 +26,7 @@ loss:
 # Model dimensions (must match Stage 1)
 model:
   latent_channels: 32
-  base_channels: 32
+  base_channels: 16             # must match stage1 checkpoint (--base_channels 16)
   decoder_depth: 4
   in_channels: 1
   spatial_size: [256, 256, 192]

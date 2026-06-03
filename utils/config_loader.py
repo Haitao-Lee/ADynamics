@@ -31,7 +31,7 @@ def load_yaml_config(config_path: Optional[str]) -> Dict[str, Any]:
             "PyYAML is required for YAML config support. "
             "Install with: pip install pyyaml"
         )
-    with open(config_path, "r") as f:
+    with open(config_path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
 
 
@@ -87,3 +87,19 @@ def merge_config(
         if not hasattr(merged, k) or getattr(merged, k) is None:
             setattr(merged, k, v)
     return merged
+
+
+def remap_labels_3class(data_list: List[Dict[str, Any]]) -> None:
+    """
+    Remap 4-class labels (NC=0, SCD=1, MCI=2, AD=3) to 3-class
+    (NC=0, SCD+MCI=1, AD=2) in-place.
+
+    Only remaps when labels are in the 4-class format. Idempotent
+    (safe to call on already-remapped data).
+    """
+    for item in data_list:
+        label = item.get("label", 0)
+        if label == 1 or label == 2:
+            item["label"] = 1
+        elif label == 3:
+            item["label"] = 2

@@ -71,7 +71,6 @@ def parse_args():
     config_defaults = apply_yaml_defaults(pre_args.config, mapping) if pre_args.config else {}
 
     parser = argparse.ArgumentParser(description="Stage 2 Classifier Fine-Tuning", parents=[pre])
-    parser.set_defaults(**config_defaults)
     parser.add_argument("--json", type=str, default="./core_data/dataset_manifest_merged_v2.json")
     parser.add_argument("--output_dir", type=str, default="./checkpoints/stage2_classifier")
     parser.add_argument("--checkpoint", type=str,
@@ -80,7 +79,7 @@ def parse_args():
     parser.add_argument("--latent_channels", type=int, default=32)
     parser.add_argument("--base_channels", type=int, default=16)
     parser.add_argument("--decoder_depth", type=int, default=4)
-    parser.add_argument("--num_classes", type=int, default=3,
+    parser.add_argument("--num_classes", type=int, default=4,
                         help="Number of disease classes (3: NC/SCD+MCI/AD, 4: NC/SCD/MCI/AD)")
     parser.add_argument("--dropout_rate", type=float, default=0.2)
     parser.add_argument("--batch_size", type=int, default=4)
@@ -91,6 +90,9 @@ def parse_args():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--early_stopping", type=int, default=30)
     parser.add_argument("--no_amp", action="store_true", default=False)
+    # Apply YAML config defaults AFTER all add_argument calls
+    # (set_defaults must come last so it isn't overridden by argparse defaults)
+    parser.set_defaults(**config_defaults)
     return parser.parse_args()
 
 
@@ -402,6 +404,12 @@ def main():
     data_list = load_data(args.json)
     print(f"Total samples: {len(data_list)}")
 
+    # Remap 4-class labels to 3-class (SCD+MCI merged) if needed
+    if args.num_classes == 3:
+        from utils.config_loader import remap_labels_3class
+        remap_labels_3class(data_list)
+        print("Remapped labels to 3-class (NC / SCD+MCI / AD)")
+
     train_transforms = get_multimodal_train_transforms()
     val_transforms = get_multimodal_val_transforms()
 
@@ -418,7 +426,8 @@ def main():
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True,
         num_workers=0, pin_memory=torch.cuda.is_available(),
-        collate_fn=multimodal_collate_fn
+        collate_fn=multimodal_collate_fn,
+        drop_last=True,  # avoid uneven last batch (replication bug if batch < num_gpus)
     )
     val_loader = DataLoader(
         val_dataset, batch_size=args.batch_size, shuffle=False,
@@ -457,6 +466,12 @@ def main():
     model = model.to(device)
     print(f"Model loaded from Stage 1 checkpoint")
 
+    # Multi-GPU: wrap encoder with DataParallel
+    from utils.multi_gpu import setup_data_parallel
+    import torch as _torch
+    print(f"[DEBUG] args.num_gpus = {args.num_gpus}, cuda.device_count = {_torch.cuda.device_count() if _torch.cuda.is_available() else 0}")
+    model = setup_data_parallel(model, args.num_gpus)
+
     # Optimizer: only classifier head
     optimizer = AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
@@ -466,7 +481,8 @@ def main():
 
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
 
-    use_amp = not args.no_amp
+    # Honor config: use_amp must come from YAML; --no_amp is a CLI override
+    use_amp = getattr(args, "use_amp", False) and not args.no_amp
 
     # Get class totals for per-class reporting
     val_labels = [d.get("label", 0) for d in val_data]

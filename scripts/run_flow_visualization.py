@@ -2,7 +2,7 @@
 Stage 3 CFM Flow Visualization.
 
 Visualizes disease progression trajectories in latent space:
-- NC → AD trajectory via ODE integration
+- NC ->?AD trajectory via ODE integration
 - Velocity field magnitude over time
 - Latent trajectory PCA projection
 - Trajectory smoothness metrics
@@ -65,7 +65,6 @@ def parse_args():
     config_defaults = apply_yaml_defaults(pre_args.config, mapping) if pre_args.config else {}
 
     parser = argparse.ArgumentParser(description="CFM Flow Visualization", parents=[pre])
-    parser.set_defaults(**config_defaults)
     parser.add_argument("--encoder_checkpoint", type=str, required=True)
     parser.add_argument("--cfm_checkpoint", type=str, required=True)
     parser.add_argument("--json", type=str, default="./core_data/dataset_manifest_merged_v2.json")
@@ -77,9 +76,12 @@ def parse_args():
     parser.add_argument("--time_embed_dim", type=int, default=128)
     parser.add_argument("--ode_steps", type=int, default=20)
     parser.add_argument("--num_samples", type=int, default=50)
-    parser.add_argument("--num_classes", type=int, default=3,
+    parser.add_argument("--num_classes", type=int, default=4,
                         help="Number of disease classes (3: NC/SCD+MCI/AD, 4: NC/SCD/MCI/AD)")
     parser.add_argument("--device", type=str, default="cuda")
+    # Apply YAML config defaults AFTER all add_argument calls
+    # (set_defaults must come last so it isn't overridden by argparse defaults)
+    parser.set_defaults(**config_defaults)
     return parser.parse_args()
 
 
@@ -116,7 +118,7 @@ def load_data(json_path):
 
 @torch.no_grad()
 def integrate_ode(z0, cfm_model, steps=20):
-    """Euler ODE integration: z0 → z1."""
+    """Euler ODE integration: z0 ->?z1."""
     z_t = z0.clone()
     dt = 1.0 / steps
     trajectory = [z_t.clone().cpu()]
@@ -175,6 +177,13 @@ def main():
 
     # Load data
     data_list = load_data(args.json)
+
+    # Remap labels for 3-class: NC=0, SCD+MCI=1, AD=2
+    if args.num_classes == 3:
+        from utils.config_loader import remap_labels_3class
+        remap_labels_3class(data_list)
+        print("Remapped labels to 3-class (NC / SCD+MCI / AD)")
+
     from sklearn.model_selection import train_test_split
     _, val_data = train_test_split(
         data_list, test_size=0.15,
@@ -352,9 +361,9 @@ def main():
     print(f"{'='*60}")
     print(f"ODE Steps: {args.ode_steps}")
     print(f"NC Sources: {len(nc_latents)}")
-    print(f"Velocity: {metrics['velocity_mean']:.4f} ± {metrics['velocity_std']:.4f}")
-    print(f"Smoothness: {metrics['trajectory_smoothness_mean']:.4f} ± {metrics['trajectory_smoothness_std']:.4f}")
-    print(f"Straightness: {metrics['trajectory_straightness_mean']:.4f} ± {metrics['trajectory_straightness_std']:.4f}")
+    print(f"Velocity: {metrics['velocity_mean']:.4f} +/- {metrics['velocity_std']:.4f}")
+    print(f"Smoothness: {metrics['trajectory_smoothness_mean']:.4f} +/- {metrics['trajectory_smoothness_std']:.4f}")
+    print(f"Straightness: {metrics['trajectory_straightness_mean']:.4f} +/- {metrics['trajectory_straightness_std']:.4f}")
     print(f"  (1.0 = perfectly straight trajectory)")
     print(f"PCA Explained Variance: {pca.explained_variance_ratio_[0]:.3f}, {pca.explained_variance_ratio_[1]:.3f}")
 

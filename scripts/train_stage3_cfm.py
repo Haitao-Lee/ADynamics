@@ -6,8 +6,8 @@ for all disease stages (NC/SCD/MCI/AD), then train a VelocityFieldNet using
 Conditional Flow Matching to model disease progression in latent space.
 
 The CFM learns to morph between disease stages:
-    - NC (0) → SCD (1) → MCI (2) → AD (3)
-    - Training pairs: NC→MCI, NC→AD, SCD→MCI, SCD→AD, MCI→AD, etc.
+    - NC (0) ->?SCD (1) ->?MCI (2) ->?AD (3)
+    - Training pairs: NC->MCI, NC->AD, SCD->MCI, SCD->AD, MCI->AD, etc.
 
 CFM Loss: L = || v_theta(z_t, t) - (z_target - z_source) ||^2
 where z_t = (1-t)*z_source + t*z_target (linear interpolation)
@@ -83,7 +83,6 @@ def parse_args():
     config_defaults = apply_yaml_defaults(pre_args.config, mapping) if pre_args.config else {}
 
     parser = argparse.ArgumentParser(description="Stage 3 CFM Training", parents=[pre])
-    parser.set_defaults(**config_defaults)
     parser.add_argument("--json", type=str, default="./core_data/dataset_manifest_merged_v2.json")
     parser.add_argument("--output_dir", type=str, default="./checkpoints/stage3_cfm")
     parser.add_argument("--encoder_checkpoint", type=str,
@@ -97,7 +96,7 @@ def parse_args():
                         help="Must match Stage 1 base_channels")
     parser.add_argument("--decoder_depth", type=int, default=4,
                         help="Must match Stage 1 decoder_depth")
-    parser.add_argument("--num_classes", type=int, default=3,
+    parser.add_argument("--num_classes", type=int, default=4,
                         help="Number of disease classes (3: NC/SCD+MCI/AD, 4: NC/SCD/MCI/AD)")
     parser.add_argument("--dropout_rate", type=float, default=0.2)
 
@@ -125,6 +124,9 @@ def parse_args():
     parser.add_argument("--save_interval", type=int, default=50)
     parser.add_argument("--early_stopping", type=int, default=50)
     parser.add_argument("--no_amp", action="store_true", default=False)
+    # Apply YAML config defaults AFTER all add_argument calls
+    # (set_defaults must come last so it isn't overridden by argparse defaults)
+    parser.set_defaults(**config_defaults)
     return parser.parse_args()
 
 
@@ -175,7 +177,7 @@ CLASS_NAMES_MAP = {
 }
 
 
-def build_latent_pools(encoder, dataloader, device, num_classes=3):
+def build_latent_pools(encoder, dataloader, device, num_classes=4):
     """
     Encode all samples and build per-class latent pools.
 
@@ -217,12 +219,12 @@ class MultiClassCFMTrainer(CFMTrainer):
     Extended CFMTrainer with FORWARD-ONLY disease stage flows.
 
     Enforces the biological constraint that disease progression is unidirectional:
-        NC(0) → SCD+MCI(1) → AD(2)   [3-class mode]
-        or NC(0) → SCD(1) → MCI(2) → AD(3)   [4-class mode]
+        NC(0) ->?SCD+MCI(1) ->?AD(2)   [3-class mode]
+        or NC(0) ->?SCD(1) ->?MCI(2) ->?AD(3)   [4-class mode]
 
     Only samples pairs where src_class < tgt_class (forward flow).
-    Uses distance-aware sampling: adjacent stages (NC→SCD+MCI) are sampled more
-    frequently than distant stages (NC→AD) to learn fine-grained transitions.
+    Uses distance-aware sampling: adjacent stages (NC->SCD+MCI) are sampled more
+    frequently than distant stages (NC->AD) to learn fine-grained transitions.
 
     This prevents the model from learning biologically meaningless reverse flows
     that would corrupt the velocity field.
@@ -242,13 +244,13 @@ class MultiClassCFMTrainer(CFMTrainer):
         """
         Build all valid forward-only pairs (src < tgt) with distance-aware weights.
 
-        Closer pairs (NC→SCD, distance=1) get higher sampling weight than
-        distant pairs (NC→AD, distance=3). This ensures the model learns
-        fine-grained transitions, not just the extreme NC→AD mapping.
+        Closer pairs (NC->SCD, distance=1) get higher sampling weight than
+        distant pairs (NC->AD, distance=3). This ensures the model learns
+        fine-grained transitions, not just the extreme NC->AD mapping.
 
         Weight scheme: weight = 1 / distance^alpha
-            alpha=1:  NC→SCD=1.0, NC→MCI=0.5, NC→AD=0.33
-            alpha=0.5: NC→SCD=1.0, NC→MCI=0.71, NC→AD=0.58
+            alpha=1:  NC->SCD=1.0, NC->MCI=0.5, NC->AD=0.33
+            alpha=0.5: NC->SCD=1.0, NC->MCI=0.71, NC->AD=0.58
         """
         self.valid_pairs = []
         self.pair_weights = []
@@ -272,7 +274,7 @@ class MultiClassCFMTrainer(CFMTrainer):
         print(f"Forward-only CFM pairs ({len(self.valid_pairs)}):")
         for (src, tgt), prob in zip(self.valid_pairs, self.pair_probs):
             n_pairs = len(self.latent_pools[src]) * len(self.latent_pools[tgt])
-            print(f"  {self.class_names[src]} → {self.class_names[tgt]}: "
+            print(f"  {self.class_names[src]} ->?{self.class_names[tgt]}: "
                   f"{n_pairs} pairs, sampling prob={prob:.3f}")
 
     def sample_latent_pairs(self, batch_size: int):
@@ -306,7 +308,7 @@ class MultiClassCFMTrainer(CFMTrainer):
 
         # Log which classes are being paired (for debugging)
         if torch.rand(1).item() < 0.01:
-            print(f"  CFM pair: {self.class_names[src_class]} → {self.class_names[tgt_class]}")
+            print(f"  CFM pair: {self.class_names[src_class]} ->?{self.class_names[tgt_class]}")
 
         return z0, z1, None, None, None, None
 
@@ -320,6 +322,12 @@ def main():
     # Load data
     data_list = load_data(args.json)
     print(f"Total samples: {len(data_list)}")
+
+    # Remap 4-class labels to 3-class (SCD+MCI merged) if needed
+    if args.num_classes == 3:
+        from utils.config_loader import remap_labels_3class
+        remap_labels_3class(data_list)
+        print("Remapped labels to 3-class (NC / SCD+MCI / AD)")
 
     # Transforms for encoding (no augmentation, just preprocessing)
     val_transforms = get_multimodal_val_transforms()
@@ -359,6 +367,10 @@ def main():
     encoder.load_state_dict(sd, strict=False)
     encoder = encoder.to(device)
     encoder.eval()
+
+    # Multi-GPU: wrap encoder with DataParallel
+    from utils.multi_gpu import setup_data_parallel
+    encoder = setup_data_parallel(encoder, args.num_gpus)
 
     # Freeze encoder completely
     for param in encoder.parameters():
@@ -447,7 +459,7 @@ def main():
     print(f"Epochs: {args.epochs}")
     print(f"Batch size: {args.batch_size} pairs/batch")
     print(f"LR: {args.learning_rate}")
-    direction_label = "NC→SCD+MCI→AD" if args.num_classes == 3 else "NC→SCD→MCI→AD"
+    direction_label = "NC->SCD+MCI->AD" if args.num_classes == 3 else "NC->SCD->MCI->AD"
     print(f"Direction: Forward-only ({direction_label})")
     print(f"Distance-aware sampling: {not args.no_distance_aware}")
     print(f"Rectified flow weight: {args.rectified_flow_weight}")

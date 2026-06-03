@@ -2,7 +2,7 @@
 Cross-Validation Framework for ADynamics.
 
 Performs K-fold stratified cross-validation to provide reliable performance estimates
-with mean ± std reporting. Essential for small medical imaging datasets.
+with mean +/- std reporting. Essential for small medical imaging datasets.
 
 Metrics reported per fold and aggregated:
     - Classification accuracy (per-class and overall)
@@ -62,7 +62,6 @@ def parse_args():
     config_defaults = apply_yaml_defaults(pre_args.config, mapping) if pre_args.config else {}
 
     parser = argparse.ArgumentParser(description="Cross-Validation for ADynamics", parents=[pre])
-    parser.set_defaults(**config_defaults)
     parser.add_argument("--json", type=str, default="./core_data/dataset_manifest_merged_v2.json")
     parser.add_argument("--output_dir", type=str, default="./inference_results/cross_validation")
     parser.add_argument("--n_folds", type=int, default=5, help="Number of CV folds")
@@ -75,12 +74,15 @@ def parse_args():
     parser.add_argument("--latent_channels", type=int, default=32)
     parser.add_argument("--base_channels", type=int, default=32)
     parser.add_argument("--decoder_depth", type=int, default=4)
-    parser.add_argument("--num_classes", type=int, default=3,
+    parser.add_argument("--num_classes", type=int, default=4,
                         help="Number of disease classes (3: NC/SCD+MCI/AD, 4: NC/SCD/MCI/AD)")
     parser.add_argument("--dropout_rate", type=float, default=0.2)
     parser.add_argument("--num_gpus", type=int, default=2)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--no_amp", action="store_true", default=False)
+    # Apply YAML config defaults AFTER all add_argument calls
+    # (set_defaults must come last so it isn't overridden by argparse defaults)
+    parser.set_defaults(**config_defaults)
     return parser.parse_args()
 
 
@@ -181,6 +183,12 @@ def main():
     # Load data
     with open(args.json, "r") as f:
         data_list = json.load(f)
+
+    # Remap labels for 3-class: NC=0, SCD+MCI=1, AD=2
+    if args.num_classes == 3:
+        from utils.config_loader import remap_labels_3class
+        remap_labels_3class(data_list)
+        print("Remapped labels to 3-class (NC / SCD+MCI / AD)")
 
     CLASS_NAMES_MAP = {
         3: ["NC", "SCD+MCI", "AD"],

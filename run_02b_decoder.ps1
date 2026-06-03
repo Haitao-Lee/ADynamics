@@ -4,5 +4,5 @@
 
 python scripts/train_stage2_decoder.py `
     --config ./configs/stage2b_decoder.yaml `
-    --checkpoint ./checkpoints/stage1_multimodal_v4/vae_best.pt `
-    --output_dir ./checkpoints/stage2_decoder_v4
+    --checkpoint ./checkpoints/stage1_multimodal/vae_best.pt `
+    --output_dir ./checkpoints/stage2_decoder

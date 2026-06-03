@@ -28,7 +28,6 @@ import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.nn.parallel import DataParallel
 
 # Additional warning suppression for main process
 warnings.filterwarnings("ignore")
@@ -41,48 +40,7 @@ from core_data.dataset import MultiModalDataset
 from core_data.transforms import get_multimodal_train_transforms, get_multimodal_val_transforms, MULTI_MODAL_SPATIAL_SIZES
 from engine.trainer_vae import MultiModalVAETrainer
 from models.vae3d import MultiModalVAE3D
-
-
-class MultiModalDataParallel(DataParallel):
-    """DataParallel wrapper that properly handles dict inputs for MultiModalVAE3D."""
-
-    def forward(self, x_dict, **kwargs):
-        """Scatter dict inputs across GPUs and gather outputs."""
-        if not self.device_ids or len(self.device_ids) == 1:
-            return self.module(x_dict, **kwargs)
-
-        batch_size = next(iter(x_dict.values())).shape[0]
-        num_gpus = len(self.device_ids)
-
-        # Handle case where batch_size < num_gpus by replicating
-        if batch_size < num_gpus:
-            replicas = self.replicate(self.module, self.device_ids[:batch_size])
-            outputs = []
-            for i in range(batch_size):
-                device = self.device_ids[i]
-                sub_dict = {k: v.to(device) for k, v in x_dict.items()}
-                outputs.append(replicas[i](sub_dict, **kwargs))
-            gathered = []
-            for component_tuple in zip(*outputs):
-                gathered.append(self.gather(component_tuple, self.output_device))
-            return tuple(gathered)
-
-        # Normal case: batch_size >= num_gpus
-        replicas = self.replicate(self.module, self.device_ids)
-        chunk_size = batch_size // num_gpus
-        remainder = batch_size % num_gpus
-        outputs = []
-        start = 0
-        for i, replica in enumerate(replicas):
-            end = start + chunk_size + (1 if i < remainder else 0)
-            sub_dict = {k: v[start:end].to(self.device_ids[i]) for k, v in x_dict.items()}
-            outputs.append(replica(sub_dict, **kwargs))
-            start = end
-
-        gathered = []
-        for component_tuple in zip(*outputs):
-            gathered.append(self.gather(component_tuple, self.output_device))
-        return tuple(gathered)
+from utils.multi_gpu import setup_data_parallel
 
 
 def _load_yaml_defaults(config_path: str) -> dict:
@@ -128,7 +86,6 @@ def parse_args():
         config_defaults = _load_yaml_defaults(pre_args.config)
 
     parser = argparse.ArgumentParser(description="Stage 1 Multi-Modal VAE Training", parents=[pre])
-    parser.set_defaults(**config_defaults)
 
     # Data
     parser.add_argument("--json", type=str, default="./core_data/dataset_manifest_merged_v2.json",
@@ -145,8 +102,8 @@ def parse_args():
                         help="Decoder depth (4 for full upsampling)")
     parser.add_argument("--dropout_rate", type=float, default=0.2,
                         help="Modality dropout rate during training")
-    parser.add_argument("--num_classes", type=int, default=3,
-                        help="Number of disease classes (3: NC, SCD+MCI, AD)")
+    parser.add_argument("--num_classes", type=int, default=4,
+                        help="Number of disease classes (4: NC, SCD, MCI, AD)")
 
     # Training
     parser.add_argument("--batch_size", type=int, default=2, help="Batch size")
@@ -188,10 +145,14 @@ def parse_args():
     parser.add_argument("--no_amp", action="store_true", default=False,
                         help="Disable AMP")
 
+    # Apply YAML config defaults AFTER all add_argument calls
+    # (set_defaults must come last so it isn't overridden by argparse defaults)
+    parser.set_defaults(**config_defaults)
+
     return parser.parse_args()
 
 
-def load_data(json_path: str) -> list:
+def load_data(json_path: str, num_classes: int = 4) -> list:
     """Load and validate multi-modal dataset."""
     import nibabel as nib
     from monai.transforms import LoadImaged, EnsureChannelFirstd, Orientationd, CropForegroundd, Spacingd, ScaleIntensityRangePercentilesd, ResizeWithPadOrCropd, Compose
@@ -244,14 +205,19 @@ def load_data(json_path: str) -> list:
         # For now, accept samples with T1 even if no optional modalities
         valid_data.append(item)
 
-    # Remap labels: 3-class (NC=0, SCD+MCI=1, AD=2)
-    for item in valid_data:
-        label = item.get("label", 0)
-        if label in [1, 2]:  # SCD or MCI → merged class
-            item["label"] = 1
-        elif label == 3:  # AD → class 2
-            item["label"] = 2
-        # NC (0) stays 0
+    # Conditionally remap labels: only when num_classes=3 (merge SCD+MCI)
+    # When num_classes=4, keep all 4 stages: NC=0, SCD=1, MCI=2, AD=3
+    if num_classes == 3:
+        for item in valid_data:
+            label = item.get("label", 0)
+            if label in [1, 2]:  # SCD or MCI -> merged class
+                item["label"] = 1
+            elif label == 3:  # AD -> class 2
+                item["label"] = 2
+            # NC (0) stays 0
+        print("Remapped labels to 3-class (NC / SCD+MCI / AD)")
+    else:
+        print(f"Keeping labels as {num_classes}-class (NC / SCD / MCI / AD)")
 
     if corrupted_t1 > 0:
         print(f"Warning: Skipped {corrupted_t1} corrupted T1 files")
@@ -260,8 +226,11 @@ def load_data(json_path: str) -> list:
     # Print class distribution
     from collections import Counter
     label_counts = Counter(item.get("label", 0) for item in valid_data)
-    class_names = ["NC", "SCD+MCI", "AD"]
-    for c in range(3):
+    if num_classes == 3:
+        class_names = ["NC", "SCD+MCI", "AD"]
+    else:
+        class_names = ["NC", "SCD", "MCI", "AD"]
+    for c in range(num_classes):
         print(f"  {class_names[c]}: {label_counts.get(c, 0)}")
 
     return valid_data
@@ -278,7 +247,7 @@ def main():
     print(f"Using device: {device}")
 
     # Load data
-    data_list = load_data(args.json)
+    data_list = load_data(args.json, num_classes=args.num_classes)
     print(f"Total samples: {len(data_list)}")
 
     # Transforms
@@ -301,12 +270,14 @@ def main():
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True,
         num_workers=0, pin_memory=torch.cuda.is_available(),
-        collate_fn=multimodal_collate_fn
+        collate_fn=multimodal_collate_fn,
+        drop_last=True,  # avoid uneven last batch (replication bug if batch < num_gpus)
     )
     val_loader = torch.utils.data.DataLoader(
         val_dataset, batch_size=args.batch_size, shuffle=False,
         num_workers=0, pin_memory=torch.cuda.is_available(),
-        collate_fn=multimodal_collate_fn
+        collate_fn=multimodal_collate_fn,
+        drop_last=True,
     )
 
     # Model
@@ -321,9 +292,9 @@ def main():
         optional_modalities=["fmri", "asl", "qsm", "flair"],
     )
 
-    # Multi-GPU support with custom DataParallel for dict inputs
-    if args.num_gpus > 1:
-        model = MultiModalDataParallel(model, device_ids=list(range(args.num_gpus)))
+    # Multi-GPU support via shared utils (replaces buggy local DataParallel)
+    print(f"[DEBUG] args.num_gpus = {args.num_gpus}, cuda.device_count = {torch.cuda.device_count() if torch.cuda.is_available() else 0}")
+    model = setup_data_parallel(model, args.num_gpus)
 
     model = model.to(device)
     print(f"Model created with {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M parameters")

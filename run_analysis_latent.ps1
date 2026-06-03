@@ -4,5 +4,5 @@
 
 python scripts/run_latent_analysis.py `
     --config ./configs/analysis.yaml `
-    --checkpoint ./checkpoints/stage1_multimodal_v4/vae_best.pt `
-    --output_dir ./inference_results/latent_analysis_v4
+    --checkpoint ./checkpoints/stage1_multimodal/vae_best.pt `
+    --output_dir ./inference_results/latent_analysis
