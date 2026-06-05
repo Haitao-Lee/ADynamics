@@ -86,7 +86,8 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--learning_rate", type=float, default=0.0001)
     parser.add_argument("--weight_decay", type=float, default=1e-5)
-    parser.add_argument("--num_gpus", type=int, default=1)
+    parser.add_argument("--num_gpus", type=int, default=2,
+                        help="Number of GPUs for DataParallel (default 2; canonical setup is 2x RTX 3090)")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--early_stopping", type=int, default=30)
     parser.add_argument("--no_amp", action="store_true", default=False)

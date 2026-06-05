@@ -140,7 +140,8 @@ def parse_args():
                         help="SSIM loss weight (0=disabled, try 0.1)")
 
     # Hardware
-    parser.add_argument("--num_gpus", type=int, default=1, help="Number of GPUs")
+    parser.add_argument("--num_gpus", type=int, default=2,
+                        help="Number of GPUs for DataParallel (default 2; canonical setup is 2x RTX 3090)")
     parser.add_argument("--device", type=str, default="cuda", help="Device")
 
     # Checkpoint

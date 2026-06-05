@@ -93,6 +93,8 @@ def parse_args():
     parser.add_argument("--kl_weight", type=float, default=0.0,
                         help="KL weight (encoder frozen, so mainly regularizes latent usage)")
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--num_gpus", type=int, default=2,
+                        help="Number of GPUs for DataParallel (default 2; canonical setup is 2x RTX 3090)")
     parser.add_argument("--early_stopping", type=int, default=30)
     parser.add_argument("--no_amp", action="store_true", default=False)
     # Apply YAML config defaults AFTER all add_argument calls
