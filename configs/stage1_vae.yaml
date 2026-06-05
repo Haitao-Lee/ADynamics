@@ -18,6 +18,16 @@ model:
   base_channels: 16             # must match stage1 checkpoint (--base_channels 16)
   decoder_depth: 4
   dropout_rate: 0.2
+  # Multi-axis 3D attention (NeuroQuant CVPR Findings 2026).
+  # use_attention: true  -> add MultiAxisAttention3D after the specified
+  #   encoder stages. The block is zero-initialized, so the first forward
+  #   pass is bitwise identical to no-attention. The encoder params grow
+  #   by ~4M (one block per modality encoder).
+  # attention_levels: 1-indexed-by-stage numbers (0..3 for 4 downsample stages).
+  #   (3) = bottleneck only. (2,3) = last two stages.
+  use_attention: true
+  attention_levels: [3]
+  attention_heads: 8
 
 # Training hyperparameters
 training:

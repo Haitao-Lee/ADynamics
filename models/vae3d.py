@@ -23,6 +23,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+# Local import: the new multi-axis 3D attention module.
+# Cyclic-import safe: attention_3d.py only depends on torch.
+from models.attention_3d import MultiAxisAttention3D
+
 
 class ResidualBlock3D(nn.Module):
     """
@@ -745,6 +749,19 @@ class ModalityEncoder3D(nn.Module):
 
     Used as building block for MultiModalVAE3D. Each modality gets its own encoder
     to capture modality-specific features, followed by fusion to a shared latent space.
+
+    Optional multi-axis 3D attention: when use_attention=True, a MultiAxisAttention3D
+    block is inserted AFTER the last (DownBlock + ResidualBlock) pair at each index
+    in attention_levels.  The block is zero-initialized so it starts as an identity
+    function -> safe to add without changing the existing training dynamics on the
+    first iteration.
+
+    Stage-wise channel map (default base_channels=16, num_downsamples=4):
+        after conv_in   :  16
+        after stage 0   :  32   (spatial /2)
+        after stage 1   :  64   (spatial /4)
+        after stage 2   : 128   (spatial /8)
+        after stage 3   : 256   (spatial /16)
     """
 
     def __init__(
@@ -753,6 +770,9 @@ class ModalityEncoder3D(nn.Module):
         base_channels: int = 16,
         num_downsamples: int = 4,
         latent_channels: int = 64,
+        use_attention: bool = True,
+        attention_levels: tuple = (3,),
+        attention_heads: int = 8,
     ) -> None:
         """
         Initialize the modality encoder.
@@ -762,9 +782,36 @@ class ModalityEncoder3D(nn.Module):
             base_channels: Base channel count for conv layers
             num_downsamples: Number of downsampling blocks (default: 4)
             latent_channels: Number of channels in output latent
+            use_attention: If True, insert MultiAxisAttention3D at the levels
+                           specified by attention_levels. Default: True.
+            attention_levels: Tuple of 0-indexed stage numbers where attention
+                              is inserted (after the corresponding DownBlock +
+                              ResidualBlock). Default: (3,) — only the last
+                              (deepest) stage. Use (2, 3) for last two stages.
+                              Must be a subset of range(num_downsamples).
+            attention_heads: Number of heads per axial attention block. Default 8
+                             (auto-reduced if it doesn't divide the channel count).
         """
         super().__init__()
 
+        # Validate attention_levels
+        for lvl in attention_levels:
+            if not (0 <= lvl < num_downsamples):
+                raise ValueError(
+                    f"attention_levels entry {lvl} out of range "
+                    f"[0, {num_downsamples})"
+                )
+
+        self.in_channels = in_channels
+        self.base_channels = base_channels
+        self.num_downsamples = num_downsamples
+        self.latent_channels = latent_channels
+        self.use_attention = use_attention
+        # Keep attention_levels sorted so order is deterministic
+        self.attention_levels = tuple(sorted(attention_levels))
+        self.attention_heads = attention_heads
+
+        # Pre-block (no change from before)
         self.encoder_conv_in = nn.Conv3d(
             in_channels, base_channels, kernel_size=3, padding=1
         )
@@ -774,6 +821,10 @@ class ModalityEncoder3D(nn.Module):
         self.encoder_norm_in = nn.GroupNorm(encoder_norm_groups, base_channels)
         self.encoder_act_in = nn.LeakyReLU(negative_slope=0.2, inplace=True)
 
+        # Stages: each stage = DownBlock + ResidualBlock.  We keep the same
+        # structure (encoder_layers ModuleList) for backward-compat with existing
+        # checkpoints; attention is added as a separate nn.ModuleList so checkpoint
+        # state_dict keys for encoder_layers.* remain unchanged.
         self.encoder_layers = nn.ModuleList()
         ch = base_channels
         for _ in range(num_downsamples):
@@ -784,6 +835,20 @@ class ModalityEncoder3D(nn.Module):
                 ResidualBlock3D(ch * 2, ch * 2, num_groups=8)
             )
             ch *= 2
+
+        # Optional multi-axis attention: one block per requested stage.
+        # Each block is zero-initialized at construction so the layer is an
+        # exact identity for the first forward pass — see models/attention_3d.py.
+        self.attention_blocks = nn.ModuleList()
+        if use_attention:
+            ch_at_stage = [base_channels * (2 ** (i + 1)) for i in range(num_downsamples)]
+            for lvl in self.attention_levels:
+                self.attention_blocks.append(
+                    MultiAxisAttention3D(
+                        channels=ch_at_stage[lvl],
+                        num_heads=attention_heads,
+                    )
+                )
 
         self.latent_conv = nn.Conv3d(
             ch, latent_channels, kernel_size=3, padding=1
@@ -801,17 +866,34 @@ class ModalityEncoder3D(nn.Module):
             x: Input tensor of shape [B, in_channels, D, H, W]
 
         Returns:
-            Latent tensor of shape [B, latent_channels, 8, 8, 6]
+            Latent tensor of shape [B, latent_channels, 16, 16, 12]
+            (after adaptive pool)
         """
         h = self.encoder_conv_in(x)
         h = self.encoder_norm_in(h)
         h = self.encoder_act_in(h)
 
-        for layer in self.encoder_layers:
+        # Build an iterator over attention blocks, applied in attention_levels order.
+        # Each stage = 2 layers in encoder_layers; after the 2nd layer of a stage we
+        # are at the end of that stage. If that stage is in attention_levels, we
+        # pop the next attention block and apply it.
+        if self.use_attention and len(self.attention_blocks) > 0:
+            attn_iter = iter(self.attention_blocks)
+        else:
+            attn_iter = None
+        # Map: stage index -> attention block (or None if not requested at that stage)
+        stage_to_block = {lvl: blk for lvl, blk in zip(self.attention_levels, self.attention_blocks)}
+
+        for li, layer in enumerate(self.encoder_layers):
             h = layer(h)
+            # After even-indexed entry (1, 3, 5, ...) we just finished a ResBlock,
+            # which is the end of a stage. stage_idx = (li + 1) // 2 - 1
+            if (li + 1) % 2 == 0:
+                stage_idx = (li + 1) // 2 - 1
+                if attn_iter is not None and stage_idx in stage_to_block:
+                    h = stage_to_block[stage_idx](h)
 
         latent = self.latent_conv(h)
-        # Adaptive pooling to ensure fixed output size
         latent = self.pool(latent)
         return latent
 
@@ -900,6 +982,9 @@ class MultiModalVAE3D(nn.Module):
         dropout_rate: float = 0.2,
         decoder_depth: int = 3,
         optional_modalities: Optional[List[str]] = None,
+        use_attention: bool = True,
+        attention_levels: Tuple[int, ...] = (3,),
+        attention_heads: int = 8,
     ) -> None:
         """
         Initialize the Multi-Modal VAE.
@@ -913,6 +998,12 @@ class MultiModalVAE3D(nn.Module):
             dropout_rate: Probability of dropping optional modalities during training. Default: 0.2
             decoder_depth: Number of decoder upsampling blocks. Default: 3
             optional_modalities: List of optional modality names to use. Default: ['fmri', 'asl', 'qsm', 'flair']
+            use_attention: Insert multi-axis 3D attention into each modality
+                           encoder. Default: True.
+            attention_levels: Stages at which to insert attention (passed through
+                              to each ModalityEncoder3D). Default: (3,) — the
+                              deepest (bottleneck) stage only.
+            attention_heads: Number of attention heads per axial block. Default 8.
         """
         super().__init__()
 
@@ -935,6 +1026,9 @@ class MultiModalVAE3D(nn.Module):
             base_channels=base_channels,
             num_downsamples=4,
             latent_channels=latent_channels,
+            use_attention=use_attention,
+            attention_levels=attention_levels,
+            attention_heads=attention_heads,
         )
 
         # Optional modality encoders
@@ -948,6 +1042,9 @@ class MultiModalVAE3D(nn.Module):
                 base_channels=base_channels,
                 num_downsamples=4,
                 latent_channels=latent_channels,
+                use_attention=use_attention,
+                attention_levels=attention_levels,
+                attention_heads=attention_heads,
             )
             self.optional_dropouts[mod] = ModalityDropout(p=dropout_rate)
 

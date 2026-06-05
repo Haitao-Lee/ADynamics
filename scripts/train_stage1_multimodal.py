@@ -53,6 +53,8 @@ def _load_yaml_defaults(config_path: str) -> dict:
         (("model", "base_channels"), "base_channels"),
         (("model", "decoder_depth"), "decoder_depth"),
         (("model", "dropout_rate"), "dropout_rate"),
+        (("model", "use_attention"), "use_attention"),
+        (("model", "attention_heads"), "attention_heads"),
         (("training", "batch_size"), "batch_size"),
         (("training", "learning_rate"), "learning_rate"),
         (("training", "weight_decay"), "weight_decay"),
@@ -104,6 +106,16 @@ def parse_args():
                         help="Modality dropout rate during training")
     parser.add_argument("--num_classes", type=int, default=4,
                         help="Number of disease classes (4: NC, SCD, MCI, AD)")
+
+    # Encoder: multi-axis 3D attention (from NeuroQuant, CVPR Findings 2026)
+    parser.add_argument("--use_attention", action="store_true", default=True,
+                        help="Insert multi-axis 3D attention into encoder (default ON)")
+    parser.add_argument("--no_attention", action="store_true", default=False,
+                        help="Disable multi-axis 3D attention (revert to plain ResNet)")
+    parser.add_argument("--attention_levels", type=str, default="3",
+                        help="Comma-separated 0-indexed stage numbers for attention, e.g. '3' or '2,3'")
+    parser.add_argument("--attention_heads", type=int, default=8,
+                        help="Number of heads per axial attention block (auto-reduced if it doesn't divide channels)")
 
     # Training
     parser.add_argument("--batch_size", type=int, default=2, help="Batch size")
@@ -281,6 +293,18 @@ def main():
     )
 
     # Model
+    # Parse attention_levels: accept either CLI comma-separated string ("2,3")
+    # or YAML list ([2, 3]) or single int / str.
+    use_attention = args.use_attention and not args.no_attention
+    al_raw = args.attention_levels
+    if isinstance(al_raw, (list, tuple)):
+        attn_levels = tuple(int(x) for x in al_raw)
+    else:
+        try:
+            attn_levels = tuple(int(x.strip()) for x in str(al_raw).split(",") if str(x).strip())
+        except (ValueError, AttributeError):
+            raise ValueError(f"--attention_levels must be comma-separated ints, got {al_raw!r}")
+    print(f"[Encoder] use_attention={use_attention}  attention_levels={attn_levels}  attention_heads={args.attention_heads}")
     model = MultiModalVAE3D(
         spatial_size=MULTI_MODAL_SPATIAL_SIZES["t1"],
         in_channels=1,
@@ -290,6 +314,9 @@ def main():
         dropout_rate=args.dropout_rate,
         decoder_depth=args.decoder_depth,
         optional_modalities=["fmri", "asl", "qsm", "flair"],
+        use_attention=use_attention,
+        attention_levels=attn_levels,
+        attention_heads=args.attention_heads,
     )
 
     # Multi-GPU support via shared utils (replaces buggy local DataParallel)

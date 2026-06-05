@@ -17,6 +17,7 @@ from models.spatial_transform import (
     flow_to_displacement_voxel,
     compute_determinant_jacobian,
 )
+from models.attention_3d import AxialAttention3D, MultiAxisAttention3D
 
 __all__ = [
     "ADynamicsVAE3D",
@@ -29,4 +30,6 @@ __all__ = [
     "create_identity_flow",
     "flow_to_displacement_voxel",
     "compute_determinant_jacobian",
+    "AxialAttention3D",
+    "MultiAxisAttention3D",
 ]
