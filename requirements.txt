@@ -1,6 +1,10 @@
 # ADynamics Dependencies
 # Conditional Flow Matching for AD MRI Disease Progression Modeling
-# Verified for RTX 3090 / CUDA 12.1 / Python 3.11
+# Verified for RTX 3090 (24 GB) / CUDA 12.1 / Python 3.11
+# Tested PyTorch: 2.5.1
+#
+# To reproduce a pinned environment from a clean install, prefer the
+# `install_env.ps1` script (Windows) or the `environment.yml` (Conda).
 
 # Core Deep Learning Framework
 torch>=2.5.0
@@ -14,6 +18,10 @@ SimpleITK>=2.2.0
 
 # Math & ODE
 torchdiffeq>=0.2.5
+
+# ANTsPy (used by utils/preprocessing/denoise.py and n4_bias_correction.py)
+# Install with: pip install antspy
+# The CLI tools (FSL-FAST, hd-bet) are external — see install_env.ps1 for setup.
 
 # Scientific Computing
 numpy>=1.24.0,<2.0

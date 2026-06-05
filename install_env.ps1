@@ -1,7 +1,7 @@
 # ADynamics Environment Installation Script
-# For RTX 3090 (CUDA 12.1) / RTX 3090 / A100 / Similar GPUs
+# For RTX 3090 (CUDA 12.1) / A100 / Similar NVIDIA GPUs
 # Author: ADynamics Development Team
-# Last Updated: 2026-04-22
+# Last Updated: 2026-06-03
 
 #Requires -RunAsAdministrator
 
@@ -107,7 +107,19 @@ Write-Host "[STEP 5] Installing Math & ODE packages..." -ForegroundColor Cyan
 # torchdiffeq - ODE integration for CFM
 & pip install --no-cache-dir torchdiffeq>=0.2.5 2>&1 | Out-Null
 
+# antspy - registration & denoising (used by utils/preprocessing/)
+& pip install --no-cache-dir antspy 2>&1 | Out-Null
+
 Write-Host "[OK] Math & ODE packages installed" -ForegroundColor Green
+
+# Step 5b: Install external CLI tools (FSL, HD-BET, ANTs)
+Write-Host ""
+Write-Host "[STEP 5b] External CLI tools (FSL-FAST, HD-BET)..." -ForegroundColor Cyan
+Write-Host "[INFO] These are NOT pip packages and must be installed via:" -ForegroundColor Yellow
+Write-Host "       FSL:     https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/FslInstallation" -ForegroundColor White
+Write-Host "       HD-BET:  pip install hd-bet  (or follow https://github.com/MIC-DKFZ/HD-BET)" -ForegroundColor White
+Write-Host "[INFO] Skip this section if you only need the model training; FSL/HD-BET are only required" -ForegroundColor Yellow
+Write-Host "       for the utils/preprocessing/* tools." -ForegroundColor Yellow
 
 # Step 6: Install Data & Utils packages
 Write-Host ""

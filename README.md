@@ -303,9 +303,9 @@ Results are written to `inference_results/<task>/`.
 ADynamics/
 ├── README.md
 ├── LICENSE                              # MIT
-├── requirements.txt                     # verified for CUDA 12.1
+├── requirements.txt                     # verified for CUDA 12.1 / PyTorch 2.5.1
 ├── environment.yml                      # conda environment
-├── install_env.ps1                      # one-shot installer
+├── install_env.ps1                      # one-shot installer (incl. FSL/HD-BET notes)
 │
 ├── run_01_train.ps1                     # Stage 1
 ├── run_02a_classifier.ps1               # Stage 2a
@@ -319,8 +319,13 @@ ADynamics/
 ├── run_crossval.ps1                     # 5-fold CV
 ├── run_ablation.ps1                     # component ablation
 │
+├── tests/                               # self-contained test suite
+│   ├── README.md                        # how to run
+│   ├── test_encoder_upgrade.py          # 6 integration tests for the multi-axis 3D attention upgrade
+│   └── test_cli_smoke.py                # CLI + YAML + model build smoke test
+│
 ├── configs/                             # all hyper-parameters (YAML)
-│   ├── stage1_vae.yaml                  # 4-class, kl=1.0, contrastive=0.3
+│   ├── stage1_vae.yaml                  # 4-class, kl=1.0, contrastive=0.3, use_attention=true
 │   ├── stage2a_classifier.yaml
 │   ├── stage2b_decoder.yaml
 │   ├── stage3_cfm.yaml                  # forward-only, distance-aware
@@ -334,17 +339,18 @@ ADynamics/
 │   └── dataset_manifest_merged_v2.json  # canonical 4-class manifest
 │
 ├── engine/                              # training layer
-│   ├── trainer_vae.py                   # MultiModalVAETrainer (KL + contrastive + free bits)
+│   ├── trainer_vae.py                   # VAETrainer + MultiModalVAETrainer (KL + contrastive + free bits)
 │   ├── trainer_cfm.py                   # CFMTrainer
-│   └── losses.py                        # all losses (incl. rectified flow)
+│   └── losses.py                        # all losses (incl. rectified flow, ordinal CE, SSIM)
 │
 ├── models/                              # model layer
-│   ├── vae3d.py                         # MultiModalVAE3D, ModalityEncoder3D
+│   ├── vae3d.py                         # MultiModalVAE3D, ModalityEncoder3D, ADynamicsVAE3D
 │   ├── vector_field.py                  # VelocityFieldNet (FiLM + MMSE)
-│   └── spatial_transform.py             # DeformationGenerator, SpatialTransformer
+│   ├── spatial_transform.py             # DeformationGenerator, SpatialTransformer, flow utils
+│   └── attention_3d.py                  # AxialAttention3D + MultiAxisAttention3D (NeuroQuant CVPR 2026)
 │
 ├── scripts/                             # all Python entry points
-│   ├── train_stage1_multimodal.py       # Stage 1 training
+│   ├── train_stage1_multimodal.py       # Stage 1 training (multi-modal, 4-class, w/ attention)
 │   ├── train_stage2_classifier.py
 │   ├── train_stage2_decoder.py
 │   ├── train_stage3_cfm.py
@@ -361,10 +367,19 @@ ADynamics/
 │   └── inference_pipeline.py            # end-to-end inference
 │
 ├── utils/                               # utilities
-│   ├── config_loader.py                 # YAML → argparse defaults
+│   ├── config_loader.py                 # YAML → argparse defaults bridge
 │   ├── multi_gpu.py                     # MultiModalDataParallel (dict inputs)
 │   ├── io_utils.py                      # NIfTI I/O
-│   └── preprocessing/                   # denoise, N4 bias correction, registration
+│   └── preprocessing/                   # FSL-FAST wrapper, N4 bias correction, registration
+│       ├── denoise.py                   # ANTsPy
+│       ├── n4_bias_correction.py        # ANTsPy
+│       ├── normalization.py             # percentile clipping
+│       ├── registration.py              # ANTs / SimpleITK
+│       ├── hdbet_brainmask.py           # HD-BET CLI wrapper
+│       ├── seg_tissue.py                # FSL-FAST wrapper
+│       ├── seg_tissue_LHT.py            # PVE -> GM/WM/CSF volume metrics
+│       ├── seg_region.py                # cortical / subcortical parcellation
+│       └── get_metadata.py
 │
 ├── docs/                                # additional documentation
 │   ├── TRAINING_PIPELINE.md             # detailed Chinese training guide
