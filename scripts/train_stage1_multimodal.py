@@ -71,6 +71,8 @@ def _load_yaml_defaults(config_path: str) -> dict:
         (("loss", "contrastive_weight"), "contrastive_weight"),
         (("loss", "gradient_weight"), "gradient_weight"),
         (("loss", "ssim_weight"), "ssim_weight"),
+        (("loss", "encoder_grad_boost"), "encoder_grad_boost"),
+        (("loss", "ordinal_reg_weight"), "ordinal_reg_weight"),
         (("output", "dir"), "output_dir"),
         (("seed",), "seed"),
     ]
@@ -138,6 +140,10 @@ def parse_args():
                         help="Gradient/texture loss weight (0=disabled, try 0.1)")
     parser.add_argument("--ssim_weight", type=float, default=0.0,
                         help="SSIM loss weight (0=disabled, try 0.1)")
+    parser.add_argument("--encoder_grad_boost", type=float, default=1.0,
+                        help="Scale factor for encoder gradients (default 1.0; with fMRI fix, no boost needed)")
+    parser.add_argument("--ordinal_reg_weight", type=float, default=0.1,
+                        help="Weight for ordinal regression loss on latent mean")
 
     # Hardware
     parser.add_argument("--num_gpus", type=int, default=2,
@@ -347,6 +353,8 @@ def main():
         "contrastive_weight": args.contrastive_weight,
         "gradient_weight": args.gradient_weight,
         "ssim_weight": args.ssim_weight,
+        "encoder_grad_boost": args.encoder_grad_boost,
+        "ordinal_reg_weight": args.ordinal_reg_weight,
         "num_classes": args.num_classes,
         "use_amp": use_amp,
     }

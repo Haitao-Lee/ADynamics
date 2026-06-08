@@ -44,13 +44,27 @@ training:
 loss:
   recon_loss_type: "l1"
   cls_weight: 1.0
-  kl_weight: 1.0               # v5: stronger (was 0.5) -- prevent NC/SCD+MCI collapse
+  kl_weight: 0.3               # v7: reduced from 1.0 — Phase 0 diagnostics showed
+                                # latent under-spread (std 0.02-0.08) because KL was
+                                # too strong, compressing all class info to N(0,1) center
   kl_warmup_epochs: 30          # v5: longer warmup (was 20)
-  free_bits: 0.01               # minimum KL per latent dim (prevents collapse)
-  contrastive_weight: 0.3       # v6: 3x stronger (was 0.1 in v5) to overcome cls_weight=1.0 dominance
+  free_bits: 0.05               # v7: raised from 0.01 — stronger floor prevents
+                                # KL from collapsing any dimension below 0.05 nats
+  contrastive_weight: 0.0       # v7: set to 0 (dead code in MultiModalVAETrainer —
+                                # ordinal_contrastive_loss is not wired there).
+                                # Making config honest rather than misleading.
   contrastive_temperature: 0.1 # NT-Xent temperature
   gradient_weight: 0.0          # optional: gradient loss on reconstruction
   ssim_weight: 0.0             # optional: SSIM loss
+  encoder_grad_boost: 1.0       # v7: scale encoder gradients. Phase 0 found starvation
+                                # (1/5x) but that was because fMRI was being discarded
+                                # (4D→3D bug in dataset.py). With fMRI properly loaded,
+                                # encoder grad is already 3.4x classifier grad. No boost needed.
+                                # by this factor before clip_grad_norm.
+                                # Phase 0 found encoder_t1 grad=0.87 vs classifier=4.4
+                                # (1/5x). Boosting encoder grads lets it learn
+                                # discriminative features instead of just matching prior.
+  ordinal_reg_weight: 0.1       # v7: make configurable (was hardcoded 0.1 in trainer)
 
 # Output
 output:

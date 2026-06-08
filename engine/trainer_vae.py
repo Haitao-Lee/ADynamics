@@ -804,6 +804,24 @@ class MultiModalVAETrainer:
         self.best_val_loss = float("inf")
         self.best_cls_acc = 0.0
 
+    def _apply_encoder_grad_boost(self) -> None:
+        """Scale up encoder gradients by encoder_grad_boost factor.
+
+        Phase 0 diagnostic found encoder_t1 grad=0.87 vs classifier=4.4
+        (encoder starved). Boosting encoder gradients lets it learn
+        discriminative features instead of just matching the KL prior.
+
+        Only applies to parameters whose name contains 'encoder' (covers
+        encoder_t1 and optional_encoders, but not fusion_proj/logvar_proj).
+        """
+        boost = self.config.get("encoder_grad_boost", 1.0)
+        if boost == 1.0:
+            return
+        model_ref = self.model.module if hasattr(self.model, "module") else self.model
+        for name, param in model_ref.named_parameters():
+            if param.grad is not None and "encoder" in name:
+                param.grad.data.mul_(boost)
+
     def train_epoch(self) -> Dict[str, float]:
         """
         Run one training epoch.
@@ -874,17 +892,20 @@ class MultiModalVAETrainer:
                 kl_loss = kl_per_dim.mean()
 
                 # Total loss
-                loss = recon_loss + cls_weight * cls_loss + kl_weight * kl_loss + 0.1 * ordinal_reg_loss
+                ordinal_reg_weight = self.config.get("ordinal_reg_weight", 0.1)
+                loss = recon_loss + cls_weight * cls_loss + kl_weight * kl_loss + ordinal_reg_weight * ordinal_reg_loss
 
             # Backward pass
             if self.use_amp:
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
+                self._apply_encoder_grad_boost()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
                 loss.backward()
+                self._apply_encoder_grad_boost()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
 

@@ -518,7 +518,14 @@ class MultiModalDataset(Dataset):
                     img = nib.load(str(path))
                     data = img.get_fdata().astype(np.float32)
                     # Skip corrupted files with zero dimensions
-                    if data.ndim != 3 or any(s == 0 for s in data.shape):
+                    if any(s == 0 for s in data.shape):
+                        result[mod] = None
+                        continue
+                    # Handle 4D modalities (e.g. fMRI with 220 timepoints)
+                    # by averaging over the time dimension (last axis)
+                    if data.ndim == 4:
+                        data = data.mean(axis=-1)  # [D, H, W] - average over time
+                    elif data.ndim != 3:
                         result[mod] = None
                         continue
                     tensor = torch.from_numpy(data).unsqueeze(0).unsqueeze(0)  # [1, 1, D, H, W]
