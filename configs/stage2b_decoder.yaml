@@ -6,7 +6,7 @@
 # Inputs
 input:
   encoder_checkpoint: "./checkpoints/stage1_multimodal/vae_best.pt"
-  num_classes: 3
+  num_classes: 4               # 4 = NC / SCD / MCI / AD (canonical, must match Stage 1)
 
 # Training
 training:
