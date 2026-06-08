@@ -97,6 +97,9 @@ def parse_args():
                         help="Number of GPUs for DataParallel (default 2; canonical setup is 2x RTX 3090)")
     parser.add_argument("--early_stopping", type=int, default=30)
     parser.add_argument("--no_amp", action="store_true", default=False)
+    parser.add_argument("--use_amp", action="store_true", default=False,
+                        help="Enable AMP (default OFF for canonical 2x RTX 3090 setup; "
+                             "YAML use_amp: false maps to --no_amp via set_defaults)")
     # Apply YAML config defaults AFTER all add_argument calls
     # (set_defaults must come last so it isn't overridden by argparse defaults)
     parser.set_defaults(**config_defaults)
@@ -180,13 +183,8 @@ class DecoderTrainer:
         total = sum(p.numel() for p in model.parameters())
         print(f"Trainable params: {trainable:,} / {total:,} ({trainable/total*100:.1f}%)")
 
-        # Decoder layer names for reporting
-        decoder_parts = []
-        for name, _ in model.named_parameters():
-            if any(k in name for k in ["decoder", "fusion_proj", "logvar_proj"]):
-                if "encoder" not in name and "optional_enc" not in name and "encoder_t1" not in name:
-                    pass
-        print("Trainable decoder layers: decoder_latent_conv, decoder_layers, decoder_conv_out")
+        # (Removed dead `decoder_parts` build block — it never appended
+        # anything and just printed a hard-coded summary.)
 
         self.best_recon_loss = float("inf")
         self.current_epoch = 0
@@ -233,7 +231,11 @@ class DecoderTrainer:
             x_dict = {"t1": t1}
             for mod in ["fmri", "asl", "qsm", "flair"]:
                 if mod in batch and batch[mod] is not None:
-                    x_dict[mod] = batch[mod].to(self.device)
+                    mod_tensor = batch[mod].to(self.device)
+                    if mod == "fmri":
+                        from utils.stage23_compat import normalize_fmri_batch
+                        mod_tensor = normalize_fmri_batch(mod_tensor)
+                    x_dict[mod] = mod_tensor
 
             labels = batch.get("label")
             if labels is not None:
@@ -291,7 +293,11 @@ class DecoderTrainer:
             x_dict = {"t1": t1}
             for mod in ["fmri", "asl", "qsm", "flair"]:
                 if mod in batch and batch[mod] is not None:
-                    x_dict[mod] = batch[mod].to(self.device)
+                    mod_tensor = batch[mod].to(self.device)
+                    if mod == "fmri":
+                        from utils.stage23_compat import normalize_fmri_batch
+                        mod_tensor = normalize_fmri_batch(mod_tensor)
+                    x_dict[mod] = mod_tensor
 
             with autocast('cuda', enabled=self.use_amp):
                 recon, cls_logits, mu, logvar = self.model(x_dict, return_components=True)
@@ -446,16 +452,8 @@ def main():
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     sd = checkpoint["model_state_dict"]
 
-    model_sd = model.state_dict()
-    has_module_prefix = any(k.startswith("module.") for k in sd)
-    model_has_module = any(k.startswith("module.") for k in model_sd)
-
-    if has_module_prefix and not model_has_module:
-        sd = {k[7:]: v for k, v in sd.items()}
-    elif not has_module_prefix and model_has_module:
-        sd = {f"module.{k}": v for k, v in sd.items()}
-
-    model.load_state_dict(sd, strict=False)
+    from utils.stage23_compat import shape_filtered_load_state_dict
+    shape_filtered_load_state_dict(model, sd, strict=False, verbose=True)
     model = model.to(device)
     print("Model loaded successfully")
 
@@ -472,7 +470,10 @@ def main():
     optimizer = AdamW(trainable_params, lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
 
-    use_amp = not args.no_amp
+    # Honor YAML use_amp AND CLI --no_amp. If YAML says use_amp: false
+    # (canonical 2x RTX 3090), set_defaults pre-fills args.use_amp=False;
+    # CLI --no_amp would also be respected. Only turn AMP on if BOTH say so.
+    use_amp = getattr(args, "use_amp", False) and not args.no_amp
 
     trainer = DecoderTrainer(
         model=model,

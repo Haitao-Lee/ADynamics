@@ -73,8 +73,9 @@ class CFMTrainer:
         # Loss weight with default value
         self.velocity_loss_weight = config.get("velocity_loss_weight", 1.0)
 
-        # AMP configuration: only create scaler when use_amp is True
-        self.use_amp = config.get("use_amp", True)
+        # AMP configuration: default OFF for canonical 2x RTX 3090 setup.
+        # Plan A/B pipeline uses fp32 throughout.
+        self.use_amp = config.get("use_amp", False)
         self.scaler = GradScaler() if self.use_amp else None
 
         # Move model to device

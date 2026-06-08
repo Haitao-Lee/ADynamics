@@ -72,7 +72,7 @@ def parse_args():
         (("training", "epochs"), "epochs"),
         (("training", "early_stopping_patience"), "early_stopping"),
         (("training", "num_gpus"), "num_gpus"),
-        (("training", "use_amp"), "no_amp"),
+        (("training", "use_amp"), "use_amp"),
         (("loss", "velocity_loss_weight"), "velocity_loss_weight"),
         (("loss", "rectified_flow_weight"), "rectified_flow_weight"),
         (("cfm", "forward_only"), "cfm_forward_only"),
@@ -124,6 +124,8 @@ def parse_args():
     parser.add_argument("--save_interval", type=int, default=50)
     parser.add_argument("--early_stopping", type=int, default=50)
     parser.add_argument("--no_amp", action="store_true", default=False)
+    parser.add_argument("--use_amp", action="store_true", default=False,
+                        help="Enable AMP (default OFF; YAML use_amp: false maps here)")
     parser.add_argument("--num_gpus", type=int, default=2,
                         help="Number of GPUs for DataParallel (default 2; canonical setup is 2x RTX 3090)")
     # Apply YAML config defaults AFTER all add_argument calls
@@ -196,7 +198,11 @@ def build_latent_pools(encoder, dataloader, device, num_classes=4):
             x_dict = {"t1": t1}
             for mod in ["fmri", "asl", "qsm", "flair"]:
                 if mod in batch and batch[mod] is not None:
-                    x_dict[mod] = batch[mod].to(device)
+                    mod_tensor = batch[mod].to(device)
+                    if mod == "fmri":
+                        from utils.stage23_compat import normalize_fmri_batch
+                        mod_tensor = normalize_fmri_batch(mod_tensor)
+                    x_dict[mod] = mod_tensor
 
             labels = batch.get("label", torch.tensor([])).to(device)
             if labels.dim() > 1:
@@ -357,16 +363,8 @@ def main():
     checkpoint = torch.load(args.encoder_checkpoint, map_location=device, weights_only=False)
     sd = checkpoint["model_state_dict"]
 
-    encoder_sd = encoder.state_dict()
-    has_module_prefix = any(k.startswith("module.") for k in sd)
-    model_has_module = any(k.startswith("module.") for k in encoder_sd)
-
-    if has_module_prefix and not model_has_module:
-        sd = {k[7:]: v for k, v in sd.items()}
-    elif not has_module_prefix and model_has_module:
-        sd = {f"module.{k}": v for k, v in sd.items()}
-
-    encoder.load_state_dict(sd, strict=False)
+    from utils.stage23_compat import shape_filtered_load_state_dict
+    shape_filtered_load_state_dict(encoder, sd, strict=False, verbose=True)
     encoder = encoder.to(device)
     encoder.eval()
 
@@ -427,10 +425,10 @@ def main():
     config = {
         "batch_size": args.batch_size,
         "velocity_loss_weight": args.velocity_loss_weight,
-        "use_amp": not args.no_amp,
+        "use_amp": getattr(args, "use_amp", False) and not args.no_amp,
     }
 
-    use_amp = not args.no_amp
+    use_amp = getattr(args, "use_amp", False) and not args.no_amp
 
     # Create GradScaler once before training loop (for AMP)
     scaler = torch.amp.GradScaler('cuda') if use_amp else None
@@ -529,7 +527,10 @@ def main():
                 optimizer.step()
 
             train_loss += loss.item()
-            train_vel += loss.item()
+            # `train_vel` is the pure CFM velocity MSE — exclude any
+            # rectified-flow regularizer so the logged column reflects
+            # only the CFM objective (consistent across runs).
+            train_vel += F.mse_loss(v_pred, target_v).item()
             n_train += 1
 
         train_loss /= max(1, n_train)

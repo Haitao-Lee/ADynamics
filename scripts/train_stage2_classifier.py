@@ -202,7 +202,14 @@ class ClassifierTrainer:
             x_dict = {"t1": t1}
             for mod in ["fmri", "asl", "qsm", "flair"]:
                 if mod in batch and batch[mod] is not None:
-                    x_dict[mod] = batch[mod].to(self.device)
+                    mod_tensor = batch[mod].to(self.device)
+                    if mod == "fmri":
+                        # Plan C: dataset may return 5D fMRI (preserve_temporal_dim=True).
+                        # Normalize to 6D so the model's fMRITemporalEncoder gets a
+                        # consistent shape regardless of preserve_temporal_dim.
+                        from utils.stage23_compat import normalize_fmri_batch
+                        mod_tensor = normalize_fmri_batch(mod_tensor)
+                    x_dict[mod] = mod_tensor
 
             labels = batch.get("label")
             if labels is not None:
@@ -266,7 +273,14 @@ class ClassifierTrainer:
             x_dict = {"t1": t1}
             for mod in ["fmri", "asl", "qsm", "flair"]:
                 if mod in batch and batch[mod] is not None:
-                    x_dict[mod] = batch[mod].to(self.device)
+                    mod_tensor = batch[mod].to(self.device)
+                    if mod == "fmri":
+                        # Plan C: dataset may return 5D fMRI (preserve_temporal_dim=True).
+                        # Normalize to 6D so the model's fMRITemporalEncoder gets a
+                        # consistent shape regardless of preserve_temporal_dim.
+                        from utils.stage23_compat import normalize_fmri_batch
+                        mod_tensor = normalize_fmri_batch(mod_tensor)
+                    x_dict[mod] = mod_tensor
 
             labels = batch.get("label")
             if labels is not None:
@@ -296,6 +310,12 @@ class ClassifierTrainer:
             c: class_correct[c] / max(1, class_total[c])
             for c in range(self.num_classes)
         }
+
+        # Cache per-class sample counts so the trainer can print them in
+        # train_epoch (avoids the bug where the previous code referenced
+        # self.class_total which was never populated and always 0).
+        self.class_total = class_total
+        self.class_correct = class_correct
 
         return {
             "loss": total_loss / num_batches,
@@ -452,17 +472,12 @@ def main():
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     sd = checkpoint["model_state_dict"]
 
-    # Handle DataParallel prefix
-    model_sd = model.state_dict()
-    has_module_prefix = any(k.startswith("module.") for k in sd)
-    model_has_module = any(k.startswith("module.") for k in model_sd)
-
-    if has_module_prefix and not model_has_module:
-        sd = {k[7:]: v for k, v in sd.items()}
-    elif not has_module_prefix and model_has_module:
-        sd = {f"module.{k}": v for k, v in sd.items()}
-
-    model.load_state_dict(sd, strict=False)
+    # Handle DataParallel prefix AND filter shape mismatches.
+    # Plan C may have introduced modules (e.g. fMRITemporalEncoder inside
+    # optional_encoders.fmri) that the downstream stage doesn't build.
+    # shape_filtered_load_state_dict silently drops those.
+    from utils.stage23_compat import shape_filtered_load_state_dict
+    shape_filtered_load_state_dict(model, sd, strict=False, verbose=True)
 
     model = model.to(device)
     print(f"Model loaded from Stage 1 checkpoint")

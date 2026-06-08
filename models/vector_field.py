@@ -636,7 +636,7 @@ class VelocityFieldNet(nn.Module):
 
     def __init__(
         self,
-        latent_channels: int = 64,
+        latent_channels: int = 32,
         latent_spatial: Tuple[int, int, int] = (16, 16, 12),
         time_embed_dim: int = 128,
         time_hidden_dim: int = 256,

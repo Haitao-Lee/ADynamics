@@ -78,7 +78,7 @@ def parse_args():
         (("training", "epochs"), "epochs"),
         (("training", "early_stopping_patience"), "early_stopping"),
         (("training", "num_gpus"), "num_gpus"),
-        (("training", "use_amp"), "no_amp"),
+        (("training", "use_amp"), "use_amp"),
         (("loss", "sim_weight"), "sim_weight"),
         (("loss", "smooth_weight"), "smooth_weight"),
         (("loss", "jacobian_weight"), "jacobian_weight"),
@@ -117,6 +117,8 @@ def parse_args():
     parser.add_argument("--save_interval", type=int, default=50)
     parser.add_argument("--early_stopping", type=int, default=50)
     parser.add_argument("--no_amp", action="store_true", default=False)
+    parser.add_argument("--use_amp", action="store_true", default=False,
+                        help="Enable AMP (default OFF; YAML use_amp: false maps here)")
     parser.add_argument("--num_gpus", type=int, default=2,
                         help="Number of GPUs for DataParallel (default 2; canonical setup is 2x RTX 3090)")
     # Apply YAML config defaults AFTER all add_argument calls
@@ -189,7 +191,7 @@ class DeformationTrainer:
         self.config = config
         self.scheduler = scheduler
 
-        self.use_amp = config.get("use_amp", True)
+        self.use_amp = config.get("use_amp", False)
         self.scaler = GradScaler() if self.use_amp else None
 
         self.sim_weight = config.get("sim_weight", 1.0)
@@ -243,7 +245,11 @@ class DeformationTrainer:
             x_dict = {"t1": t1}
             for mod in ["fmri", "asl", "qsm", "flair"]:
                 if mod in batch and batch[mod] is not None:
-                    x_dict[mod] = batch[mod].to(self.device)
+                    mod_tensor = batch[mod].to(self.device)
+                    if mod == "fmri":
+                        from utils.stage23_compat import normalize_fmri_batch
+                        mod_tensor = normalize_fmri_batch(mod_tensor)
+                    x_dict[mod] = mod_tensor
 
             labels = batch.get("label", torch.tensor([])).to(self.device)
             if labels.dim() > 1:
@@ -342,7 +348,11 @@ class DeformationTrainer:
             x_dict = {"t1": t1}
             for mod in ["fmri", "asl", "qsm", "flair"]:
                 if mod in batch and batch[mod] is not None:
-                    x_dict[mod] = batch[mod].to(self.device)
+                    mod_tensor = batch[mod].to(self.device)
+                    if mod == "fmri":
+                        from utils.stage23_compat import normalize_fmri_batch
+                        mod_tensor = normalize_fmri_batch(mod_tensor)
+                    x_dict[mod] = mod_tensor
 
             with autocast('cuda', enabled=self.use_amp):
                 z = self.encode(x_dict)
@@ -524,16 +534,8 @@ def main():
     ckpt = torch.load(args.encoder_checkpoint, map_location=device, weights_only=False)
     sd = ckpt["model_state_dict"]
 
-    encoder_sd = encoder.state_dict()
-    has_module_prefix = any(k.startswith("module.") for k in sd)
-    model_has_module = any(k.startswith("module.") for k in encoder_sd)
-
-    if has_module_prefix and not model_has_module:
-        sd = {k[7:]: v for k, v in sd.items()}
-    elif not has_module_prefix and model_has_module:
-        sd = {f"module.{k}": v for k, v in sd.items()}
-
-    encoder.load_state_dict(sd, strict=False)
+    from utils.stage23_compat import shape_filtered_load_state_dict
+    shape_filtered_load_state_dict(encoder, sd, strict=False, verbose=True)
     encoder = encoder.to(device)
 
     # Multi-GPU: wrap encoder with DataParallel
