@@ -27,6 +27,15 @@ from torch import Tensor
 # Cyclic-import safe: attention_3d.py only depends on torch.
 from models.attention_3d import MultiAxisAttention3D
 
+# Optional fMRI temporal encoder (4D BOLD -> 3D latent). When
+# use_fmri_temporal=True, the static ModalityEncoder3D for fMRI is
+# replaced by this lightweight 1D conv + transformer that preserves the
+# full BOLD time series instead of collapsing it to a static mean.
+try:
+    from models.fmri_temporal_encoder import fMRITemporalEncoder
+except ImportError:  # pragma: no cover
+    fMRITemporalEncoder = None  # type: ignore[assignment]
+
 
 class ResidualBlock3D(nn.Module):
     """
@@ -985,6 +994,12 @@ class MultiModalVAE3D(nn.Module):
         use_attention: bool = True,
         attention_levels: Tuple[int, ...] = (3,),
         attention_heads: int = 8,
+        use_fmri_temporal: bool = True,
+        fmri_in_channels: int = 34,
+        fmri_hidden_dim: int = 128,
+        fmri_num_pool: int = 3,
+        fmri_num_transformer_layers: int = 2,
+        fmri_num_heads: int = 4,
     ) -> None:
         """
         Initialize the Multi-Modal VAE.
@@ -1004,6 +1019,18 @@ class MultiModalVAE3D(nn.Module):
                               to each ModalityEncoder3D). Default: (3,) — the
                               deepest (bottleneck) stage only.
             attention_heads: Number of attention heads per axial block. Default 8.
+            use_fmri_temporal: If True and 'fmri' is in optional_modalities, use
+                               the lightweight 1D conv + Transformer fMRI encoder
+                               (fMRITemporalEncoder) instead of the static 3D CNN.
+                               This preserves the full BOLD time series.
+                               Default: True.
+            fmri_in_channels: Number of "spatial channel" slices for the fMRI
+                              temporal encoder (typically 34 = W axis of (D,H,W)
+                              fMRI after spatial avg pool). Default 34.
+            fmri_hidden_dim: Hidden dim of fMRI 1D conv stack. Default 128.
+            fmri_num_pool: Number of 1D conv blocks (each halves T). Default 3.
+            fmri_num_transformer_layers: TransformerEncoder depth. Default 2.
+            fmri_num_heads: Multi-head attention heads in the transformer. Default 4.
         """
         super().__init__()
 
@@ -1014,6 +1041,7 @@ class MultiModalVAE3D(nn.Module):
         self.num_classes = num_classes
         self.dropout_rate = dropout_rate
         self.decoder_depth = decoder_depth
+        self.use_fmri_temporal = use_fmri_temporal
 
         # Default optional modalities
         if optional_modalities is None:
@@ -1032,20 +1060,35 @@ class MultiModalVAE3D(nn.Module):
         )
 
         # Optional modality encoders
+        # 'fmri' can use either the static 3D encoder (legacy, time-averaged)
+        # or the new fMRITemporalEncoder (preserves BOLD time series).
         self.optional_encoders = nn.ModuleDict()
         self.optional_dropouts = nn.ModuleDict()
 
         for mod in optional_modalities:
-            # All modalities use 1 channel by default
-            self.optional_encoders[mod] = ModalityEncoder3D(
-                in_channels=1,
-                base_channels=base_channels,
-                num_downsamples=4,
-                latent_channels=latent_channels,
-                use_attention=use_attention,
-                attention_levels=attention_levels,
-                attention_heads=attention_heads,
-            )
+            if mod == "fmri" and use_fmri_temporal and fMRITemporalEncoder is not None:
+                # New: lightweight 1D temporal encoder (preserves BOLD time)
+                self.optional_encoders[mod] = fMRITemporalEncoder(
+                    in_channels=fmri_in_channels,
+                    hidden_dim=fmri_hidden_dim,
+                    embed_dim=latent_channels,  # match T1 latent_channels for fusion
+                    num_pool=fmri_num_pool,
+                    target_t=16,
+                    num_transformer_layers=fmri_num_transformer_layers,
+                    num_heads=fmri_num_heads,
+                    target_grid=(16, 16, 12),  # match T1 latent grid
+                )
+            else:
+                # Static 3D encoder (also used for ASL/QSM/FLAIR)
+                self.optional_encoders[mod] = ModalityEncoder3D(
+                    in_channels=1,
+                    base_channels=base_channels,
+                    num_downsamples=4,
+                    latent_channels=latent_channels,
+                    use_attention=use_attention,
+                    attention_levels=attention_levels,
+                    attention_heads=attention_heads,
+                )
             self.optional_dropouts[mod] = ModalityDropout(p=dropout_rate)
 
         # Number of modalities that contribute to fusion

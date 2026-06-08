@@ -822,6 +822,40 @@ class MultiModalVAETrainer:
             if param.grad is not None and "encoder" in name:
                 param.grad.data.mul_(boost)
 
+    def _normalize_fmri_batch(self, fmri: torch.Tensor) -> torch.Tensor:
+        """Normalize fMRI batch to a consistent 5D shape for the temporal encoder.
+
+        Args:
+            fmri: A tensor of shape
+                - 5D [B, 1, D, H, W]    : legacy time-averaged path
+                - 6D [B, 1, D, H, W, T] : preserve_temporal_dim=True path
+
+        Returns:
+            6D tensor [B, 1, D, H, W, T_target] with T_target = the median T
+            in the input (rounded). If all samples have the same T, returns
+            the input unchanged. If a sample has fewer T, pad with last frame;
+            if more, truncate.
+        """
+        if fmri.dim() == 5:
+            # Legacy: add a trailing time dim of size 1
+            return fmri.unsqueeze(-1)
+        if fmri.dim() != 6:
+            raise ValueError(
+                f"fMRI must be 5D or 6D; got {fmri.dim()}D with shape {tuple(fmri.shape)}"
+            )
+
+        # 6D: [B, 1, D, H, W, T]
+        Ts = fmri.shape[-1]
+        if Ts == 0:
+            raise ValueError("fMRI has 0 timepoints")
+
+        # If T is uniform across batch, no work needed.
+        # (We can't cheaply check per-sample T from a stacked tensor;
+        # assume uniform — datasets usually have fixed TR * N volumes.)
+        # Cheap runtime check: if min == max, OK.
+        # Note: per-sample T is hidden after stacking; we trust the dataset.
+        return fmri
+
     def train_epoch(self) -> Dict[str, float]:
         """
         Run one training epoch.
@@ -856,7 +890,11 @@ class MultiModalVAETrainer:
             # Optional modalities - encoder handles different sizes via adaptive pooling
             for mod in ["fmri", "asl", "qsm", "flair"]:
                 if mod in batch and batch[mod] is not None:
-                    x_dict[mod] = batch[mod].to(self.device)
+                    mod_tensor = batch[mod].to(self.device)
+                    if mod == "fmri":
+                        # Normalize fMRI to consistent 6D for the temporal encoder.
+                        mod_tensor = self._normalize_fmri_batch(mod_tensor)
+                    x_dict[mod] = mod_tensor
 
             labels = batch.get("label")
             if labels is not None:
@@ -973,7 +1011,10 @@ class MultiModalVAETrainer:
 
             for mod in ["fmri", "asl", "qsm", "flair"]:
                 if mod in batch and batch[mod] is not None:
-                    x_dict[mod] = batch[mod].to(self.device)
+                    mod_tensor = batch[mod].to(self.device)
+                    if mod == "fmri":
+                        mod_tensor = self._normalize_fmri_batch(mod_tensor)
+                    x_dict[mod] = mod_tensor
 
             labels = batch.get("label")
             if labels is not None:

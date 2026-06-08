@@ -55,6 +55,12 @@ def _load_yaml_defaults(config_path: str) -> dict:
         (("model", "dropout_rate"), "dropout_rate"),
         (("model", "use_attention"), "use_attention"),
         (("model", "attention_heads"), "attention_heads"),
+        (("model", "use_fmri_temporal"), "use_fmri_temporal"),
+        (("model", "fmri_in_channels"), "fmri_in_channels"),
+        (("model", "fmri_hidden_dim"), "fmri_hidden_dim"),
+        (("model", "fmri_num_pool"), "fmri_num_pool"),
+        (("model", "fmri_num_transformer_layers"), "fmri_num_transformer_layers"),
+        (("model", "fmri_num_heads"), "fmri_num_heads"),
         (("training", "batch_size"), "batch_size"),
         (("training", "learning_rate"), "learning_rate"),
         (("training", "weight_decay"), "weight_decay"),
@@ -118,6 +124,24 @@ def parse_args():
                         help="Comma-separated 0-indexed stage numbers for attention, e.g. '3' or '2,3'")
     parser.add_argument("--attention_heads", type=int, default=8,
                         help="Number of heads per axial attention block (auto-reduced if it doesn't divide channels)")
+
+    # fMRI temporal encoder (preserves BOLD time series instead of static mean).
+    # When enabled, dataset returns 5D fMRI [B, 1, D, H, W, T] and the model
+    # uses fMRITemporalEncoder (1D conv + Transformer) instead of the 3D CNN.
+    parser.add_argument("--use_fmri_temporal", action="store_true", default=True,
+                        help="Use fMRITemporalEncoder (preserves BOLD time series). Default ON.")
+    parser.add_argument("--no_fmri_temporal", action="store_true", default=False,
+                        help="Use static 3D CNN for fMRI (legacy time-averaged path).")
+    parser.add_argument("--fmri_in_channels", type=int, default=34,
+                        help="Spatial channels for fMRI temporal encoder (W axis of (D,H,W) fMRI).")
+    parser.add_argument("--fmri_hidden_dim", type=int, default=128,
+                        help="Hidden dim of fMRI 1D conv stack.")
+    parser.add_argument("--fmri_num_pool", type=int, default=3,
+                        help="Number of 1D conv blocks (each halves T).")
+    parser.add_argument("--fmri_num_transformer_layers", type=int, default=2,
+                        help="TransformerEncoder depth for fMRI temporal modeling.")
+    parser.add_argument("--fmri_num_heads", type=int, default=4,
+                        help="Multi-head attention heads in the fMRI transformer.")
 
     # Training
     parser.add_argument("--batch_size", type=int, default=2, help="Batch size")
@@ -303,6 +327,7 @@ def main():
     # Parse attention_levels: accept either CLI comma-separated string ("2,3")
     # or YAML list ([2, 3]) or single int / str.
     use_attention = args.use_attention and not args.no_attention
+    use_fmri_temporal = args.use_fmri_temporal and not args.no_fmri_temporal
     al_raw = args.attention_levels
     if isinstance(al_raw, (list, tuple)):
         attn_levels = tuple(int(x) for x in al_raw)
@@ -324,6 +349,12 @@ def main():
         use_attention=use_attention,
         attention_levels=attn_levels,
         attention_heads=args.attention_heads,
+        use_fmri_temporal=use_fmri_temporal,
+        fmri_in_channels=args.fmri_in_channels,
+        fmri_hidden_dim=args.fmri_hidden_dim,
+        fmri_num_pool=args.fmri_num_pool,
+        fmri_num_transformer_layers=args.fmri_num_transformer_layers,
+        fmri_num_heads=args.fmri_num_heads,
     )
 
     # Multi-GPU support via shared utils (replaces buggy local DataParallel)
@@ -357,6 +388,7 @@ def main():
         "ordinal_reg_weight": args.ordinal_reg_weight,
         "num_classes": args.num_classes,
         "use_amp": use_amp,
+        "use_fmri_temporal": use_fmri_temporal,
     }
 
     # Trainer

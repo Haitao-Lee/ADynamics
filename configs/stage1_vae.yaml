@@ -28,6 +28,19 @@ model:
   use_attention: true
   attention_levels: [3]
   attention_heads: 8
+  # fMRI temporal encoder (v8: replaces the static 3D CNN for fMRI).
+  # Preserves the full BOLD time series (220 timepoints) by:
+  #   1. Spatial average pool over (D, H) -> 1D time series per W slice
+  #   2. 1D conv stack (num_pool blocks, each halves T) -> 16 timepoints
+  #   3. Lightweight Transformer (num_transformer_layers, num_heads)
+  #   4. Reshape 16 tokens -> 3D grid (4,4,1) and trilinear interp to (16,16,12)
+  # Zero-init projection -> safe to add to existing pipeline.
+  use_fmri_temporal: true
+  fmri_in_channels: 34           # W axis of (D=64, H=64, W=34) fMRI -> 34 spatial channels
+  fmri_hidden_dim: 128
+  fmri_num_pool: 3               # 220 -> 110 -> 55 -> 28 -> adaptive pool to 16
+  fmri_num_transformer_layers: 2
+  fmri_num_heads: 4
 
 # Training hyperparameters
 training:

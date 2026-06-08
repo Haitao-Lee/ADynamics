@@ -454,6 +454,7 @@ class MultiModalDataset(Dataset):
         spatial_sizes: Optional[Dict[str, Tuple[int, int, int]]] = None,
         required_modality: str = "t1",
         optional_modalities: Optional[List[str]] = None,
+        preserve_temporal_dim: bool = True,
     ) -> None:
         """
         Initialize multi-modal dataset.
@@ -464,6 +465,13 @@ class MultiModalDataset(Dataset):
             spatial_sizes: Dict mapping modality -> (D, H, W). Required for ResizeWithPadOrCrop.
             required_modality: The required modality (default: "t1")
             optional_modalities: List of optional modality names (default: ["fmri", "asl", "qsm", "flair"])
+            preserve_temporal_dim: If True, 4D modalities (e.g. fMRI with time
+                                   axis) keep their time dimension and are
+                                   returned as 5D tensors [1, D, H, W, T] for
+                                   the fMRITemporalEncoder. If False, the
+                                   legacy path averages over time and returns
+                                   3D [1, D, H, W] for the static 3D encoder.
+                                   Default: True.
         """
         super().__init__(data=data_list, transform=transform)
         self.spatial_sizes = spatial_sizes or {}
@@ -471,6 +479,8 @@ class MultiModalDataset(Dataset):
         self.optional_modalities = optional_modalities or ["fmri", "asl", "qsm", "flair"]
         # Fixed target size for all modalities (to match T1 after preprocessing)
         self.target_size = (256, 256, 192)
+        # Keep time dim for 4D modalities (fMRI BOLD) by default.
+        self.preserve_temporal_dim = preserve_temporal_dim
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """
@@ -522,17 +532,47 @@ class MultiModalDataset(Dataset):
                         result[mod] = None
                         continue
                     # Handle 4D modalities (e.g. fMRI with 220 timepoints)
-                    # by averaging over the time dimension (last axis)
                     if data.ndim == 4:
-                        data = data.mean(axis=-1)  # [D, H, W] - average over time
-                    elif data.ndim != 3:
+                        if self.preserve_temporal_dim:
+                            # New path: keep the time axis so fMRITemporalEncoder
+                            # can use the full BOLD time series. Layout on disk
+                            # is typically (D, H, W, T) — keep that order.
+                            # Output: [1, D, H, W, T] (5D)
+                            tensor = torch.from_numpy(data).unsqueeze(0)  # [1, D, H, W, T]
+                            # Resize spatial dims (D, H, W) to target; leave T alone.
+                            # We do this by reshaping to (T, 1, D, H, W), interpolate,
+                            # then reshape back.
+                            T = tensor.shape[-1]
+                            spatial = tensor.squeeze(0).permute(3, 0, 1, 2)  # [T, D, H, W]
+                            spatial = spatial.unsqueeze(0)  # [1, T, D, H, W]
+                            # Interpolate only spatial dims
+                            spatial = F.interpolate(
+                                spatial,
+                                size=(T, *self.target_size),
+                                mode="trilinear",
+                                align_corners=False,
+                            )  # [1, T, D', H', W']
+                            spatial = spatial.squeeze(0)  # [T, D', H', W']
+                            # Back to [1, D', H', W', T]
+                            tensor = spatial.permute(1, 2, 3, 0).unsqueeze(0)
+                            result[mod] = tensor
+                        else:
+                            # Legacy path: average over time, return 3D [1, D, H, W].
+                            data = data.mean(axis=-1)
+                            tensor = torch.from_numpy(data).unsqueeze(0).unsqueeze(0)  # [1, 1, D, H, W]
+                            tensor = F.interpolate(tensor, size=self.target_size, mode="trilinear", align_corners=False)
+                            tensor = tensor.squeeze(0)  # [1, D, H, W]
+                            result[mod] = tensor
+                    elif data.ndim == 3:
+                        # 3D modality (ASL/QSM/FLAIR/T1-of-another-subject) — static path
+                        tensor = torch.from_numpy(data).unsqueeze(0).unsqueeze(0)  # [1, 1, D, H, W]
+                        tensor = F.interpolate(tensor, size=self.target_size, mode="trilinear", align_corners=False)
+                        tensor = tensor.squeeze(0)  # [1, D, H, W]
+                        result[mod] = tensor
+                    else:
+                        # Unsupported rank
                         result[mod] = None
                         continue
-                    tensor = torch.from_numpy(data).unsqueeze(0).unsqueeze(0)  # [1, 1, D, H, W]
-                    # Resize to fixed target size
-                    tensor = F.interpolate(tensor, size=self.target_size, mode="trilinear", align_corners=False)
-                    tensor = tensor.squeeze(0)  # [1, D, H, W]
-                    result[mod] = tensor
                     available_modalities.append(mod)
                 except Exception:
                     result[mod] = None
@@ -557,6 +597,11 @@ class MultiModalDataset(Dataset):
 def multimodal_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Simple collate function that stacks all tensors and handles missing modalities.
+
+    Handles the case where fMRI is 5D [B, 1, D, H, W, T] (preserve_temporal_dim=True)
+    vs 3D [B, 1, D, H, W] (legacy time-averaged). Within a single batch, all fMRI
+    samples must have the same rank — the dataset guarantees this via
+    preserve_temporal_dim. Missing-modality zero-fills use the reference shape.
     """
     result = {}
     keys = ["t1", "fmri", "asl", "qsm", "flair", "label", "patient_id", "available_modalities"]
@@ -579,6 +624,21 @@ def multimodal_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
                 for v in values:
                     if v is None or not isinstance(v, torch.Tensor):
                         tensors.append(torch.zeros(ref_shape, dtype=torch.float32))
+                    elif v.shape != ref_shape:
+                        # Shape mismatch (e.g. fMRI rank differs across samples).
+                        # Defensive: broadcast / reshape to ref_shape.
+                        # If v has fewer dims, unsqueeze on the right until they match.
+                        v_fixed = v
+                        while v_fixed.dim() < len(ref_shape):
+                            v_fixed = v_fixed.unsqueeze(-1)
+                        # If v has more dims, this is unrecoverable; raise clearly.
+                        if v_fixed.dim() != len(ref_shape):
+                            raise ValueError(
+                                f"Modality {key!r} has mismatched shape in batch: "
+                                f"ref={tuple(ref_shape)}, got={tuple(v.shape)}. "
+                                f"Check preserve_temporal_dim consistency in dataset."
+                            )
+                        tensors.append(v_fixed)
                     else:
                         tensors.append(v)
                 result[key] = torch.stack(tensors)
