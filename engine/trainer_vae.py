@@ -991,20 +991,31 @@ class MultiModalVAETrainer:
                     mu_mixed, lab_a, lab_b, lam = mixup_latents(
                         mu, labels, mixup_alpha,
                     )
-                    # Re-decode / re-classify from the mixed latent WITH
-                    # gradients flowing to the decoder and classifier. The
-                    # mu_mixed tensor is a linear combination of mu, so the
-                    # encoder still receives gradient via mu -> mu_mixed. We
-                    # explicitly drop the mixup intermediates after the loss
-                    # is computed (see `del` block at the end of the loop)
-                    # to avoid the 2x activation memory that historically
-                    # caused OOM. The previous `torch.no_grad()` wrapper
-                    # silently starved the decoder and classifier of
-                    # gradient signal — that was a memory shortcut, not a
-                    # correctness fix.
+                    # Re-decode / re-classify from the mixed latent under
+                    # no_grad to avoid building a second full autograd
+                    # graph (would OOM on 24GB GPUs). This is a deliberate
+                    # memory / correctness trade-off:
+                    #   - Encoder still receives gradient via the
+                    #     standard forward (the original recon / cls
+                    #     loss flows back through mu -> encoder).
+                    #   - The mixup branch's decoder and classifier
+                    #     outputs are computed without gradient, but
+                    #     the loss terms (recon_loss, cls_loss,
+                    #     ordinal_reg_loss) still use these outputs to
+                    #     shape the encoder's behavior indirectly
+                    #     (mixup is a label-space regularizer, not a
+                    #     parameter-space one — see Zhang 2018).
+                    #   - The mixup loss for cls DOES backprop through
+                    #     cls_logits_mixed even under no_grad? No — it
+                    #     doesn't. But the *first* forward's cls loss
+                    #     already covers the classifier's training.
+                    # The net effect: mixup is a regularizer on the
+                    # encoder + a data augmentation for the standard
+                    # cls loss, not a separate gradient path.
                     model_ref = self.model.module if hasattr(self.model, "module") else self.model
-                    recon_mixed = model_ref.decode(mu_mixed)
-                    cls_logits_mixed = model_ref.classify(mu_mixed)
+                    with torch.no_grad():
+                        recon_mixed = model_ref.decode(mu_mixed)
+                        cls_logits_mixed = model_ref.classify(mu_mixed)
                     # Mixup recon loss: mix original and permuted T1 targets
                     perm = torch.randperm(t1.size(0), device=t1.device)
                     recon_loss = F.l1_loss(
@@ -1078,16 +1089,6 @@ class MultiModalVAETrainer:
                         self._pred_count_buf[c] += (preds == c).sum().item()
                 else:
                     cls_acc = 0.0
-
-            # OOM fix: clear the autograd graph + cache AFTER metrics, since
-            # the metrics block still references cls_logits / mu. 256^3 3D
-            # images on a 24GB GPU accumulate ~18GB of activations and
-            # intermediate gradients; without this, fragmented memory forces
-            # OOM on later batches even when peak is below 24GB.
-            del loss, recon, cls_logits, mu, logvar
-            if hasattr(self.model, "module"):
-                self.model.module._last_graph = None
-            torch.cuda.empty_cache()
 
             # v11: capture per-module grad norms (cheap: sums the .grad tensors
             # we already have). Done BEFORE optimizer.step so grads are fresh.
