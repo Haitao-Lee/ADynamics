@@ -376,6 +376,11 @@ def main():
     )
 
     # Dataloaders
+    # num_workers=0 on Windows because PyTorch DataLoader + DataParallel
+    # + spawn-mode workers have a known compatibility issue (workers exit
+    # unexpectedly with no error message). On Linux this could be 2-4
+    # workers for ~30% speedup; on Windows the cost is a single-threaded
+    # loader and a small GPU-idle gap.
     from core_data.dataset import multimodal_collate_fn
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True,
