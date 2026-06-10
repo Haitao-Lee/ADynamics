@@ -141,3 +141,85 @@ def shape_filtered_load_state_dict(
             f"{n_missing} target keys left at default."
         )
     return n_loaded, n_skipped_shape, n_missing
+
+
+# ---------------------------------------------------------------------------
+# Modality-toggle helpers (used by Stage 1-5 scripts for consistency)
+# ---------------------------------------------------------------------------
+def resolve_optional_modalities(args) -> list:
+    """
+    Compute the final list of optional modalities from CLI / YAML flags.
+
+    This is the canonical implementation shared by Stage 1, 2, 3, 4, 5.
+    Rules (in priority order):
+      1. If --t1_only (CLI) or t1_only: true (YAML): return [] (T1-only).
+      2. Otherwise, return the subset of {fmri, asl, qsm, flair} whose
+         --use_X is True (and not --no_X).
+
+    Args:
+        args: parsed argparse namespace (with use_fmri / use_asl / use_qsm /
+              use_flair / t1_only / no_fmri / no_asl / no_qsm / no_flair attrs).
+
+    Returns:
+        list of optional modality names, in the canonical order.
+    """
+    t1_only = bool(getattr(args, "t1_only", False))
+    if t1_only:
+        return []
+
+    toggles = {
+        "fmri":  (bool(getattr(args, "use_fmri", True))
+                  and not bool(getattr(args, "no_fmri", False))),
+        "asl":   (bool(getattr(args, "use_asl", True))
+                  and not bool(getattr(args, "no_asl", False))),
+        "qsm":   (bool(getattr(args, "use_qsm", True))
+                  and not bool(getattr(args, "no_qsm", False))),
+        "flair": (bool(getattr(args, "use_flair", True))
+                  and not bool(getattr(args, "no_flair", False))),
+    }
+    return [m for m, on in toggles.items() if on]
+
+
+def resolve_use_demographic(args) -> bool:
+    """
+    Resolve use_demographic flag from CLI / YAML.
+
+    Returns True if demographic conditioning is on (default).
+    """
+    return bool(getattr(args, "use_demographic", True)) and not bool(
+        getattr(args, "no_demographic", False)
+    )
+
+
+# ---------------------------------------------------------------------------
+# CLI helper: add modality-toggle flags to any argparse parser
+# ---------------------------------------------------------------------------
+def add_modality_args(parser) -> None:
+    """
+    Add the 5 modality-toggle + demographic flags to an argparse parser.
+
+    Use this in every stage script (1-5) so the CLI is consistent and a
+    T1-only Stage 1 checkpoint loads cleanly into Stage 2/3/4/5.
+    """
+    parser.add_argument("--use_fmri", action="store_true", default=True,
+                        help="Use fMRI modality (default ON)")
+    parser.add_argument("--no_fmri", action="store_true", default=False,
+                        help="Disable fMRI modality")
+    parser.add_argument("--use_asl", action="store_true", default=True,
+                        help="Use ASL modality (default ON)")
+    parser.add_argument("--no_asl", action="store_true", default=False,
+                        help="Disable ASL modality")
+    parser.add_argument("--use_qsm", action="store_true", default=True,
+                        help="Use QSM modality (default ON)")
+    parser.add_argument("--no_qsm", action="store_true", default=False,
+                        help="Disable QSM modality")
+    parser.add_argument("--use_flair", action="store_true", default=True,
+                        help="Use FLAIR modality (default ON)")
+    parser.add_argument("--no_flair", action="store_true", default=False,
+                        help="Disable FLAIR modality")
+    parser.add_argument("--t1_only", action="store_true", default=False,
+                        help="T1-only mode: disable all 4 optional modalities")
+    parser.add_argument("--use_demographic", action="store_true", default=True,
+                        help="Add age + sex conditioning to latent (default ON)")
+    parser.add_argument("--no_demographic", action="store_true", default=False,
+                        help="Disable demographic conditioning")

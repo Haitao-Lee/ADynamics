@@ -1,10 +1,16 @@
 # Stage 1: Train Multi-Modal VAE from scratch.
-# All hyperparameters in configs/stage1_vae.yaml (4-class, kl=1.0, contrastive=0.3, dual-GPU).
-# CLI args override YAML. Output: ./checkpoints/stage1_multimodal/vae_best.pt
-# Estimated time: ~13h on 2x RTX 3090. Usage: .\run_01_train.ps1
+#
+# Default config: T1 + age/sex, cls_weight=4.0, cyclical KL, latent mixup,
+# attention at mid-level + bottleneck.
+#
+# Edit configs/stage1_vae.yaml to change any setting — there is no v-prefixed
+# variant. Output: ./checkpoints/stage1/vae_best.pt
+#
+# Estimated time: ~6-10h on 2x RTX 3090.
+# Usage: .\run_01_train.ps1
 
 python scripts/train_stage1_multimodal.py `
     --config ./configs/stage1_vae.yaml `
-    --output_dir ./checkpoints/stage1_multimodal `
+    --output_dir ./checkpoints/stage1 `
     --num_gpus 2 `
     --no_amp

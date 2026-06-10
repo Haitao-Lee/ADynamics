@@ -1,87 +1,104 @@
 # =============================================================================
 # ADynamics Stage 1: Multi-Modal VAE Training Configuration
 # =============================================================================
-# Trains the multi-modal encoder + lightweight decoder + classifier.
-# Loss = recon + cls_weight * ordinal_ce + kl_weight * KL (with free bits) + 0.1 * ordinal_reg
+# Default configuration. Trains the multi-modal encoder + lightweight decoder
+# + classifier.
+#
+# Loss = recon + cls_weight * ordinal_ce + kl_weight * KL (with free bits)
+#      + ordinal_reg_weight * ordinal_reg
+#
+# Modality note: T1 is always required. The 4 optional modalities (fMRI, ASL,
+# QSM, FLAIR) are toggled individually below. The current default is T1 + age/
+# sex only (t1_only=true) — the cleanest baseline for diagnosing encoder/
+# decoder behavior. To enable multi-modal, set t1_only: false.
+#
+# This file is the single source of truth: any change here is the new default.
+# Do not introduce v-prefixed variants.
 
 # Data
 data:
   json: "./core_data/dataset_manifest_merged_v2.json"
-  num_classes: 4               # 4 = NC / SCD / MCI / AD (v6: keep all 4 stages for richer CFM transitions)
-  optional_modalities: ["fmri", "asl", "qsm", "flair"]
+  num_classes: 4               # 4 = NC / SCD / MCI / AD
+  use_fmri: false
+  use_asl: false
+  use_qsm: false
+  use_flair: false
+  use_demographic: true        # add age + sex conditioning to latent (T1-only safe)
+  t1_only: true                # if true, forces all 4 above to false
 
 # Model architecture
 model:
   spatial_size: [256, 256, 192]  # [D, H, W]
   in_channels: 1
   latent_channels: 32
-  base_channels: 16             # must match stage1 checkpoint (--base_channels 16)
+  base_channels: 16
   decoder_depth: 4
   dropout_rate: 0.2
-  # Multi-axis 3D attention (NeuroQuant CVPR Findings 2026).
-  # use_attention: true  -> add MultiAxisAttention3D after the specified
-  #   encoder stages. The block is zero-initialized, so the first forward
-  #   pass is bitwise identical to no-attention. The encoder params grow
-  #   by ~4M (one block per modality encoder).
-  # attention_levels: 1-indexed-by-stage numbers (0..3 for 4 downsample stages).
-  #   (3) = bottleneck only. (2,3) = last two stages.
   use_attention: true
-  attention_levels: [3]
+  # Mid-level + bottleneck attention. Subtle NC/SCD/MCI differences (e.g.,
+  # hippocampal atrophy) live in mid-level features that get strided away
+  # before the bottleneck. Cost: ~10% slower/epoch. The block is
+  # zero-initialized, so the first forward pass is bitwise identical to
+  # no-attention.
+  attention_levels: [1, 2, 3]
   attention_heads: 8
-  # fMRI temporal encoder (v8: replaces the static 3D CNN for fMRI).
-  # Preserves the full BOLD time series (220 timepoints) by:
-  #   1. Spatial average pool over (D, H) -> 1D time series per W slice
-  #   2. 1D conv stack (num_pool blocks, each halves T) -> 16 timepoints
+  # fMRI temporal encoder (preserves full BOLD time series):
+  #   1. Spatial avg pool (D, H) -> 1D time series per W slice
+  #   2. 1D conv stack (num_pool blocks) -> 16 timepoints
   #   3. Lightweight Transformer (num_transformer_layers, num_heads)
   #   4. Reshape 16 tokens -> 3D grid (4,4,1) and trilinear interp to (16,16,12)
-  # Zero-init projection -> safe to add to existing pipeline.
+  # Zero-init projection — safe to add to existing pipeline.
   use_fmri_temporal: true
-  fmri_in_channels: 34           # W axis of (D=64, H=64, W=34) fMRI -> 34 spatial channels
+  fmri_in_channels: 34
   fmri_hidden_dim: 128
-  fmri_num_pool: 3               # 220 -> 110 -> 55 -> 28 -> adaptive pool to 16
+  fmri_num_pool: 3
   fmri_num_transformer_layers: 2
   fmri_num_heads: 4
 
 # Training hyperparameters
 training:
-  batch_size: 2                # TOTAL batch size (each GPU gets 1 via DataParallel scatter)
-  learning_rate: 0.00003        # reduced for stable retraining with stronger KL
+  batch_size: 4                # TOTAL batch size (each GPU gets 1 via DataParallel scatter)
+  learning_rate: 0.00003
   weight_decay: 0.00001
   epochs: 300
   early_stopping_patience: 50
   save_interval: 50
-  num_gpus: 2                   # dual-GPU training (2x RTX 3090)
-  use_amp: false               # v5: AMP caused NaN in VAE loss (KL+recon scale mismatch)
+  num_gpus: 2                   # 2x RTX 3090
+  use_amp: false               # AMP caused NaN in VAE loss (KL+recon scale mismatch)
 
 # Loss weights
 loss:
   recon_loss_type: "l1"
-  cls_weight: 1.0
-  kl_weight: 0.3               # v7: reduced from 1.0 — Phase 0 diagnostics showed
-                                # latent under-spread (std 0.02-0.08) because KL was
-                                # too strong, compressing all class info to N(0,1) center
-  kl_warmup_epochs: 30          # v5: longer warmup (was 20)
-  free_bits: 0.05               # v7: raised from 0.01 — stronger floor prevents
-                                # KL from collapsing any dimension below 0.05 nats
-  contrastive_weight: 0.0       # v7: set to 0 (dead code in MultiModalVAETrainer —
-                                # ordinal_contrastive_loss is not wired there).
-                                # Making config honest rather than misleading.
-  contrastive_temperature: 0.1 # NT-Xent temperature
-  gradient_weight: 0.0          # optional: gradient loss on reconstruction
-  ssim_weight: 0.0             # optional: SSIM loss
-  encoder_grad_boost: 1.0       # v7: scale encoder gradients. Phase 0 found starvation
-                                # (1/5x) but that was because fMRI was being discarded
-                                # (4D→3D bug in dataset.py). With fMRI properly loaded,
-                                # encoder grad is already 3.4x classifier grad. No boost needed.
-                                # by this factor before clip_grad_norm.
-                                # Phase 0 found encoder_t1 grad=0.87 vs classifier=4.4
-                                # (1/5x). Boosting encoder grads lets it learn
-                                # discriminative features instead of just matching prior.
-  ordinal_reg_weight: 0.1       # v7: make configurable (was hardcoded 0.1 in trainer)
+  # cls=4.0 balances the gradient ratio (recon 0.02 vs cls 2.4 was 100:1 with
+  # cls=1.0; classifier was starved). Tune via this YAML.
+  cls_weight: 4.0
+  # kl=0.3 prevents posterior collapse while still regularizing toward N(0,1).
+  # Higher values over-compressed latent (std 0.02-0.08).
+  kl_weight: 0.3
+  # Cyclical KL: 0 -> peak -> 0 every kl_cycle_len epochs. During the KL-off
+  # phase the encoder is free to use latent capacity for class info; during
+  # the KL-on phase the structure is "baked in" toward the prior. Reference:
+  # Fu et al. 2019, "Cyclical Annealing Schedule".
+  kl_strategy: "cyclical"
+  kl_warmup_epochs: 30          # only used when kl_strategy="linear"
+  kl_cycle_len: 15              # epochs per cycle when kl_strategy="cyclical"
+  kl_cycle_low_frac: 0.1        # floor fraction of kl_weight during off-phase
+  # Latent-space mixup (Zhang et al. 2018): mixes mu and labels with
+  # lambda ~ Beta(alpha, alpha), then re-decodes + re-classifies. Strong
+  # anti-overfit for small batch sizes. Set alpha=0.0 to disable.
+  mixup_alpha: 0.4
+  mixup_prob: 0.5               # per-batch probability of applying mixup
+  free_bits: 0.05               # floor on per-dim KL; prevents total collapse
+  contrastive_weight: 0.0       # disabled (contrastive loss not wired in trainer)
+  contrastive_temperature: 0.1
+  gradient_weight: 0.0
+  ssim_weight: 0.0
+  encoder_grad_boost: 1.0
+  ordinal_reg_weight: 0.1
 
 # Output
 output:
-  dir: "./checkpoints/stage1_multimodal"   # v6: 4-class + contrastive 0.3
+  dir: "./checkpoints/stage1"   # default checkpoint directory
 
 # Reproducibility
 seed: 42

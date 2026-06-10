@@ -133,6 +133,10 @@ def parse_args():
     parser.add_argument("--no_amp", action="store_true", default=False)
     parser.add_argument("--use_amp", action="store_true", default=False,
                         help="Enable AMP (default OFF; YAML use_amp: false maps here)")
+
+    # Modality toggles (must match Stage 1)
+    from utils.stage23_compat import add_modality_args
+    add_modality_args(parser)
     # Per-module learning rate multipliers (slower for pretrained modules)
     parser.add_argument("--encoder_lr_mult", type=float, default=0.1)
     parser.add_argument("--cfm_lr_mult", type=float, default=1.0)
@@ -160,25 +164,30 @@ def _load_data_list(json_path: str) -> list:
 def _build_dataloaders(args, train_tf, val_tf):
     """Build train/val DataLoaders using the shared MultiModalDataset."""
     from core_data.dataset import multimodal_collate_fn
+    from utils.stage23_compat import resolve_optional_modalities
+    optional_modalities = resolve_optional_modalities(args)
+    print(f"[Modality switches] optional={optional_modalities}")
     data_list = _load_data_list(args.json)
     train_size = int(0.8 * len(data_list))
     train_data = data_list[:train_size]
     val_data = data_list[train_size:]
     print(f"Total samples: {len(data_list)} (train={len(train_data)}, val={len(val_data)})")
 
+    # Note: fMRI needs preserve_temporal_dim=True only if 'fmri' is in optional.
+    preserve_t = "fmri" in optional_modalities
     train_ds = MultiModalDataset(
         data_list=train_data,
         transform=train_tf,
         spatial_sizes=MULTI_MODAL_SPATIAL_SIZES,
-        optional_modalities=["fmri", "asl", "qsm", "flair"],
-        preserve_temporal_dim=True,  # Plan C: keep fMRI time axis
+        optional_modalities=optional_modalities,
+        preserve_temporal_dim=preserve_t,
     )
     val_ds = MultiModalDataset(
         data_list=val_data,
         transform=val_tf,
         spatial_sizes=MULTI_MODAL_SPATIAL_SIZES,
-        optional_modalities=["fmri", "asl", "qsm", "flair"],
-        preserve_temporal_dim=True,
+        optional_modalities=optional_modalities,
+        preserve_temporal_dim=preserve_t,
     )
     train_loader = DataLoader(
         train_ds,
@@ -200,6 +209,9 @@ def _build_dataloaders(args, train_tf, val_tf):
 
 def _build_model(args, device):
     """Build the Multi-Modal VAE with fMRI temporal encoder (Plan C)."""
+    from utils.stage23_compat import resolve_optional_modalities, resolve_use_demographic
+    optional_modalities = resolve_optional_modalities(args)
+    use_demographic = resolve_use_demographic(args)
     model = MultiModalVAE3D(
         spatial_size=tuple(args.spatial_size),
         in_channels=args.in_channels,
@@ -208,8 +220,9 @@ def _build_model(args, device):
         num_classes=args.num_classes,
         dropout_rate=args.dropout_rate,
         decoder_depth=args.decoder_depth,
-        optional_modalities=["fmri", "asl", "qsm", "flair"],
-        use_fmri_temporal=True,  # Plan C
+        optional_modalities=optional_modalities,
+        use_fmri_temporal=("fmri" in optional_modalities),  # only relevant if fmri on
+        use_demographic_cond=use_demographic,
     ).to(device)
     return model
 

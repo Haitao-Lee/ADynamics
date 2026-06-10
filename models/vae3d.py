@@ -1000,6 +1000,9 @@ class MultiModalVAE3D(nn.Module):
         fmri_num_pool: int = 3,
         fmri_num_transformer_layers: int = 2,
         fmri_num_heads: int = 4,
+        use_demographic_cond: bool = False,
+        age_emb_dim: int = 16,
+        sex_emb_dim: int = 8,
     ) -> None:
         """
         Initialize the Multi-Modal VAE.
@@ -1031,6 +1034,11 @@ class MultiModalVAE3D(nn.Module):
             fmri_num_pool: Number of 1D conv blocks (each halves T). Default 3.
             fmri_num_transformer_layers: TransformerEncoder depth. Default 2.
             fmri_num_heads: Multi-head attention heads in the transformer. Default 4.
+            use_demographic_cond: If True, condition the latent on age and sex
+                embeddings (additive, opt-in). Works for any combination of
+                optional modalities (T1-only, T1+FLAIR, etc.). Default: False.
+            age_emb_dim: Embedding dim for age (float, normalized 0-1). Default 16.
+            sex_emb_dim: Embedding dim for sex (categorical: 0=unknown, 1=male, 2=female). Default 8.
         """
         super().__init__()
 
@@ -1042,11 +1050,27 @@ class MultiModalVAE3D(nn.Module):
         self.dropout_rate = dropout_rate
         self.decoder_depth = decoder_depth
         self.use_fmri_temporal = use_fmri_temporal
+        self.use_demographic_cond = use_demographic_cond
 
-        # Default optional modalities
+        # Default optional modalities (T1 is always required, never in this list)
         if optional_modalities is None:
             optional_modalities = ["fmri", "asl", "qsm", "flair"]
-        self.optional_modalities = optional_modalities
+        # Defensive dedup + filter to known modalities
+        known_optionals = {"fmri", "asl", "qsm", "flair"}
+        self.optional_modalities = [m for m in optional_modalities if m in known_optionals]
+
+        # Demographic conditioning modules (only built if use_demographic_cond=True)
+        if use_demographic_cond:
+            # age: scalar float per sample, mapped to age_emb_dim via small MLP
+            self.age_mlp = nn.Sequential(
+                nn.Linear(1, age_emb_dim),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.Linear(age_emb_dim, age_emb_dim),
+            )
+            # sex: int (0=unknown, 1=male, 2=female) — embed to sex_emb_dim
+            self.sex_emb = nn.Embedding(num_embeddings=4, embedding_dim=sex_emb_dim)
+            # Combine: project to a per-channel additive bias of size latent_channels
+            self.demo_proj = nn.Linear(age_emb_dim + sex_emb_dim, latent_channels)
 
         # T1 encoder (required, always present)
         self.encoder_t1 = ModalityEncoder3D(
@@ -1277,27 +1301,67 @@ class MultiModalVAE3D(nn.Module):
         self,
         x_dict: Dict[str, Tensor],
         return_components: bool = False,
+        age: Optional[Tensor] = None,
+        sex: Optional[Tensor] = None,
     ) -> Union[Tuple[Tensor, Tensor, Tensor], Tuple[Tensor, Tensor, Tensor, Tensor]]:
         """
         Full forward pass.
 
         Args:
             x_dict: Dictionary of modality tensors. T1 is required.
+                    Can optionally contain "age" (float [B]) and "sex" (long [B])
+                    keys for demographic conditioning — they will be popped out
+                    and applied additively to the latent.
             return_components: If True, return (recon, cls_logits, mu, logvar).
                               If False, return (recon, mu, logvar).
+            age: Optional age tensor [B] (float, in years). If provided AND
+                 x_dict also has "age", x_dict wins. Used only if
+                 use_demographic_cond=True was set at __init__.
+            sex: Optional sex tensor [B] (long, 0=unknown/1=male/2=female).
+                 If provided AND x_dict also has "sex", x_dict wins.
 
         Returns:
             When return_components=False:
                 Tuple of (reconstruction, mu, logvar)
             When return_components=True:
                 Tuple of (reconstruction, cls_logits, mu, logvar)
+
+        Note on DataParallel:
+            age/sex CAN be passed as kwargs OR as x_dict["age"]/x_dict["sex"].
+            Both are supported, but passing them as x_dict keys is the
+            PREFERRED path: MultiModalDataParallel.scatter will then
+            split age/sex to match each replica's batch slice. When passed
+            as kwargs, kwargs are NOT scattered, so each replica sees the
+            full batch — which can cause broadcast issues (mu[B=1] +
+            age[B=2] -> mu[B=2], doubling downstream batch size).
         """
+        # Demographic inputs can come from either kwargs or x_dict keys.
+        # x_dict keys win if both are present (and are popped out so they
+        # don't leak into encoders).
+        if "age" in x_dict:
+            age = x_dict.pop("age")
+        if "sex" in x_dict:
+            sex = x_dict.pop("sex")
+
         # Encode multi-modal inputs
         z_concat = self.encode(x_dict)
 
         # True VAE: learn both mu and logvar
         mu = self.fusion_proj(z_concat)
         logvar = self.logvar_proj(z_concat)
+
+        # Optional demographic conditioning: additive per-channel bias on mu/logvar
+        # before reparameterization. Adds age/sex info without disturbing the
+        # T1+optional-modality visual signal.
+        if self.use_demographic_cond and age is not None and sex is not None:
+            demo_bias = self._demographic_bias(age, sex, mu.shape[0])  # [B, C]
+            demo_bias = demo_bias.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)  # [B, C, 1, 1, 1]
+            mu = mu + demo_bias
+            # logvar shift is conservative (only the bias direction); keeping logvar
+            # un-shifted is also valid. We apply a soft 0.1x scale of the bias to
+            # logvar to keep gradient flow stable.
+            logvar = logvar + 0.1 * demo_bias
+
         z_sample = self.reparameterize(mu, logvar)
 
         # Decode to T1 reconstruction
@@ -1310,15 +1374,70 @@ class MultiModalVAE3D(nn.Module):
             return recon, cls_logits, mu, logvar
         return recon, mu, logvar
 
-    def get_latent(self, x_dict: Dict[str, Tensor]) -> Tensor:
+    def _demographic_bias(self, age: Tensor, sex: Tensor, batch_size: int) -> Tensor:
+        """
+        Compute per-channel demographic bias vector.
+
+        DataParallel note: under nn.DataParallel, x_dict (positional input) is
+        auto-scattered to each replica's device, but kwargs (age, sex) are
+        NOT auto-scattered. The recommended path is to pass them as
+        x_dict["age"] / x_dict["sex"] so scatter splits them per replica.
+        This method also defensively handles the kwargs path: it slices
+        age/sex down to the local replica's batch size to avoid broadcast
+        inflation of mu.
+
+        Args:
+            age: [B_full] or [B_local] float, in years
+            sex: [B_full] or [B_local] long (0=unknown, 1=male, 2=female)
+            batch_size: Local batch size of this replica (mu.shape[0]).
+
+        Returns:
+            bias: [B_local, latent_channels] on the same device as self.age_mlp
+        """
+        target_device = self.age_mlp[0].weight.device
+        age = age.to(device=target_device, dtype=torch.float32)
+        sex = sex.to(device=target_device, dtype=torch.long)
+
+        # Defensive: if age/sex have more samples than the local batch
+        # (e.g. kwargs path under DataParallel, full batch is broadcast to
+        # all replicas), take the FIRST batch_size samples as a best-effort
+        # match. The recommended fix is to pass age/sex via x_dict instead.
+        if age.shape[0] != batch_size:
+            age = age[:batch_size]
+            sex = sex[:batch_size]
+
+        # Normalize age to ~[0, 1] range (AD patients are typically 55-85, divide by 100)
+        age_norm = (age / 100.0).unsqueeze(-1)  # [B, 1]
+        age_feat = self.age_mlp(age_norm)  # [B, age_emb_dim]
+        sex_feat = self.sex_emb(sex)  # [B, sex_emb_dim]
+        demo = torch.cat([age_feat, sex_feat], dim=-1)  # [B, age+sex]
+        bias = self.demo_proj(demo)  # [B, latent_channels]
+        return bias
+
+    def get_latent(
+        self,
+        x_dict: Dict[str, Tensor],
+        age: Optional[Tensor] = None,
+        sex: Optional[Tensor] = None,
+    ) -> Tensor:
         """
         Encode and return latent without reparameterization.
 
+        Useful for extracting fixed latent features for downstream tasks
+        like disease classification. Returns mu (deterministic in eval).
+
         Args:
             x_dict: Dictionary of modality tensors
+            age: Optional age tensor [B]. Used only if use_demographic_cond=True.
+            sex: Optional sex tensor [B]. Used only if use_demographic_cond=True.
 
         Returns:
             Latent representation [B, latent_channels, 16, 16, 12]
         """
         z_concat = self.encode(x_dict)
-        return self.fusion_proj(z_concat)
+        mu = self.fusion_proj(z_concat)
+        if self.use_demographic_cond and age is not None and sex is not None:
+            demo_bias = self._demographic_bias(age, sex, mu.shape[0])
+            demo_bias = demo_bias.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+            mu = mu + demo_bias
+        return mu

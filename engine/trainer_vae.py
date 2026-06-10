@@ -5,6 +5,7 @@ Handles training loop, validation, checkpointing, and logging for the 3D VAE.
 Supports AMP (Automatic Mixed Precision) for memory-efficient HD training.
 """
 
+import math
 import os
 from typing import Any, Dict, Optional, Union
 
@@ -803,6 +804,14 @@ class MultiModalVAETrainer:
         self.current_epoch = 0
         self.best_val_loss = float("inf")
         self.best_cls_acc = 0.0
+        # Monitoring (v10): track extra per-epoch signals to diagnose latent
+        # quality without re-running a separate analysis pass.
+        self.kl_active_dims = 0.0  # how many latent dims have KL > free_bits
+        self.latent_std = 0.0     # mean per-dim std of mu (posterior spread)
+        self.train_val_gap = 0.0  # train_acc - val_acc (overfitting signal)
+        self.cls_loss_ema = 0.0   # exponential moving avg of train cls_loss
+        self.kl_strategy = config.get("kl_strategy", "linear")
+        self.current_kl_weight = 0.0  # set per-epoch in train()
 
     def _apply_encoder_grad_boost(self) -> None:
         """Scale up encoder gradients by encoder_grad_boost factor.
@@ -860,10 +869,21 @@ class MultiModalVAETrainer:
         """
         Run one training epoch.
 
-        Returns:
-            Dictionary containing average training metrics
+        v10 changes:
+            - Latent-space mixup (mixup_alpha from config) to fight overfit
+            - Per-class accuracy, KL active dims, posterior std metrics
+        v11 changes:
+            - Grad-norm per module (encoder/decoder/classifier/demo)
+            - Mixup application count
+            - Per-batch prediction distribution
         """
         self.model.train()
+
+        # v11: reset grad-norm buffer at start of epoch
+        self._grad_norm_buf = None
+        self._grad_norm_count = 0
+        # Reset prediction distribution buffer
+        self._pred_count_buf = torch.zeros(self.config.get("num_classes", 4))
 
         total_loss = 0.0
         total_recon_loss = 0.0
@@ -871,11 +891,27 @@ class MultiModalVAETrainer:
         total_kl_loss = 0.0
         total_cls_acc = 0.0
         num_batches = 0
+        # v10 monitoring: per-class accuracy and posterior stats
+        per_class_correct = torch.zeros(self.config.get("num_classes", 4))
+        per_class_total = torch.zeros(self.config.get("num_classes", 4))
+        # Collect mu, logvar across batches to compute aggregate stats at end
+        collected_mu_stds = []  # list of per-dim std tensors
 
         recon_loss_type = self.config.get("recon_loss_type", "l1")
         cls_weight = self.config.get("cls_weight", 1.0)
         kl_weight = getattr(self, 'current_kl_weight', self.config.get("kl_weight", 0.01))
         num_classes = self.config.get("num_classes", 3)
+        use_demographic = self.config.get("use_demographic_cond", False)
+        # v10: latent mixup config
+        mixup_alpha = self.config.get("mixup_alpha", 0.0)
+        mixup_prob = self.config.get("mixup_prob", 0.5)
+
+        # v11: track mixup application count
+        n_mixup_applied = 0
+
+        from utils.kl_schedules import (
+            should_apply_mixup, mixup_latents, mixup_classification_loss,
+        )
 
         from tqdm import tqdm
         pbar = tqdm(enumerate(self.train_loader), total=len(self.train_loader), desc="Train", leave=False)
@@ -884,15 +920,20 @@ class MultiModalVAETrainer:
             # Get T1 (already preprocessed to 256x256x192)
             t1 = batch["t1"].to(self.device)
 
-            # Build x_dict with T1 and optional modalities
+            # Build x_dict with T1 and optional modalities.
+            # IMPORTANT: only include modalities that the model actually has encoders for
+            # (driven by the trainer's config["optional_modalities"] list). Anything
+            # else in the batch is silently dropped here to avoid passing shapes the
+            # model can't handle.
+            active_optionals = self.config.get(
+                "optional_modalities", ["fmri", "asl", "qsm", "flair"]
+            )
             x_dict = {"t1": t1}
 
-            # Optional modalities - encoder handles different sizes via adaptive pooling
-            for mod in ["fmri", "asl", "qsm", "flair"]:
+            for mod in active_optionals:
                 if mod in batch and batch[mod] is not None:
                     mod_tensor = batch[mod].to(self.device)
                     if mod == "fmri":
-                        # Normalize fMRI to consistent 6D for the temporal encoder.
                         mod_tensor = self._normalize_fmri_batch(mod_tensor)
                     x_dict[mod] = mod_tensor
 
@@ -902,25 +943,59 @@ class MultiModalVAETrainer:
                 if labels.dim() > 1:
                     labels = labels.squeeze()
 
+            # Optional demographic conditioning.
+            # IMPORTANT: pass age/sex through x_dict (not as kwargs) so that
+            # MultiModalDataParallel.scatter splits them per replica. Passing
+            # as kwargs leaves them at full batch on every replica, which
+            # broadcast-inflates the latent and breaks L1(recon, t1) shape.
+            if use_demographic and "age" in batch and "sex" in batch:
+                x_dict["age"] = batch["age"].to(self.device)
+                x_dict["sex"] = batch["sex"].to(self.device)
+
             # Zero grad
             self.optimizer.zero_grad()
 
             # Forward pass
             with autocast('cuda', enabled=self.use_amp):
-                recon, cls_logits, mu, logvar = self.model(x_dict, return_components=True)
+                recon, cls_logits, mu, logvar = self.model(
+                    x_dict, return_components=True,
+                )
 
-                # Reconstruction loss (only T1)
-                recon_loss = F.l1_loss(recon, x_dict["t1"])
+                # v10: decide whether to apply latent mixup this batch
+                do_mixup = (mixup_alpha > 0) and (labels is not None) and should_apply_mixup(
+                    self.current_epoch, self.config,
+                )
 
-                # Classification loss with ordinal structure
-                if labels is not None:
-                    # Use ordinal CE: penalizes distant misclassification more
-                    cls_loss = ordinal_cross_entropy_loss(cls_logits, labels, num_classes=num_classes)
-                    # Add ordinal regression loss on latent mean
-                    ordinal_reg_loss = ordinal_regression_loss(mu, labels, num_classes=num_classes)
+                if do_mixup and mu.size(0) >= 2:
+                    # v11: count this batch as a mixup application
+                    n_mixup_applied += 1
+                    # Mix latents and labels (only meaningful when B>=2).
+                    mu_mixed, lab_a, lab_b, lam = mixup_latents(
+                        mu, labels, mixup_alpha,
+                    )
+                    # Re-decode and re-classify from mixed latent
+                    model_ref = self.model.module if hasattr(self.model, "module") else self.model
+                    recon_mixed = model_ref.decode(mu_mixed)
+                    cls_logits_mixed = model_ref.classify(mu_mixed)
+                    # Mixup recon loss: mix original and permuted T1 targets
+                    perm = torch.randperm(t1.size(0), device=t1.device)
+                    recon_loss = F.l1_loss(
+                        recon_mixed, lam * t1 + (1.0 - lam) * t1[perm],
+                    )
+                    # Mixup classification loss
+                    cls_loss = mixup_classification_loss(cls_logits_mixed, lab_a, lab_b, lam)
+                    # Ordinal regression on mixed mu (still useful)
+                    ordinal_reg_loss = ordinal_regression_loss(mu_mixed, lab_a, num_classes=num_classes)
                 else:
-                    cls_loss = torch.tensor(0.0, device=self.device)
-                    ordinal_reg_loss = torch.tensor(0.0, device=self.device)
+                    # Standard path
+                    recon_loss = F.l1_loss(recon, x_dict["t1"])
+                    if labels is not None:
+                        cls_loss = ordinal_cross_entropy_loss(cls_logits, labels, num_classes=num_classes)
+                        ordinal_reg_loss = ordinal_regression_loss(mu, labels, num_classes=num_classes)
+                    else:
+                        cls_loss = torch.tensor(0.0, device=self.device)
+                        ordinal_reg_loss = torch.tensor(0.0, device=self.device)
+                    lam = 1.0
 
                 # KL loss with Free Bits
                 free_bits = self.config.get("free_bits", 0.0)
@@ -949,11 +1024,44 @@ class MultiModalVAETrainer:
 
             # Metrics
             with torch.no_grad():
+                # v10: per-class accuracy
                 if labels is not None:
                     preds = cls_logits.argmax(dim=1)
                     cls_acc = (preds == labels).float().mean().item()
+                    for c in range(num_classes):
+                        mask = labels == c
+                        if mask.any():
+                            per_class_total[c] += mask.sum().item()
+                            per_class_correct[c] += (preds[mask] == c).sum().item()
+                    # v10: per-dim std of mu (posterior spread)
+                    # mu is [B, C, D, H, W]; pool spatial -> [B, C]; std over batch
+                    mu_pooled = mu.mean(dim=(-3, -2, -1))  # [B, C]
+                    collected_mu_stds.append(mu_pooled.std(dim=0).cpu())
+                    # v11: prediction distribution (per-batch). We aggregate
+                    # the full per-batch prediction count in a tensor.
+                    if not hasattr(self, "_pred_count_buf"):
+                        self._pred_count_buf = torch.zeros(num_classes)
+                    for c in range(num_classes):
+                        self._pred_count_buf[c] += (preds == c).sum().item()
                 else:
                     cls_acc = 0.0
+
+            # v11: capture per-module grad norms (cheap: sums the .grad tensors
+            # we already have). Done BEFORE optimizer.step so grads are fresh.
+            # Aggregate as running mean; final mean reported per epoch.
+            from utils.diagnostics import grad_norm_by_module
+            gn = grad_norm_by_module(
+                self.model.module if hasattr(self.model, "module") else self.model,
+            )
+            if self._grad_norm_count == 0:
+                # First batch: just store the values (they're not yet a "mean").
+                self._grad_norm_buf = dict(gn)
+            else:
+                for k, v in gn.items():
+                    self._grad_norm_buf[k] = (
+                        self._grad_norm_buf[k] * self._grad_norm_count + v
+                    ) / (self._grad_norm_count + 1)
+            self._grad_norm_count += 1
 
             total_loss += loss.item()
             total_recon_loss += recon_loss.item()
@@ -969,12 +1077,28 @@ class MultiModalVAETrainer:
                 "kl": f"{kl_loss.item():.4f}",
             })
 
+        # v10: aggregate monitoring metrics
+        per_class_acc = (per_class_correct / per_class_total.clamp(min=1)).tolist()
+        if collected_mu_stds:
+            all_stds = torch.stack(collected_mu_stds, dim=0).mean(dim=0)
+            self.latent_std = all_stds.mean().item()
+            free_bits = self.config.get("free_bits", 0.0)
+            self.kl_active_dims = (all_stds > math.sqrt(2 * free_bits + 1e-6)).float().mean().item() * all_stds.numel()
+        # v10: EMA of cls_loss for trend tracking
+        ema = self.cls_loss_ema
+        ema = 0.9 * ema + 0.1 * (total_cls_loss / max(1, num_batches))
+        self.cls_loss_ema = ema
+
         return {
             "loss": total_loss / num_batches,
             "recon_loss": total_recon_loss / num_batches,
             "cls_loss": total_cls_loss / num_batches,
             "kl_loss": total_kl_loss / num_batches,
             "cls_acc": total_cls_acc / num_batches,
+            "per_class_acc": per_class_acc,
+            "mixup_count": float(n_mixup_applied),
+            "mixup_frac": n_mixup_applied / max(1, num_batches),
+            "grad_norms": dict(self._grad_norm_buf) if hasattr(self, "_grad_norm_buf") else {},
         }
 
     @torch.no_grad()
@@ -982,8 +1106,11 @@ class MultiModalVAETrainer:
         """
         Run one validation epoch.
 
-        Returns:
-            Dictionary containing average validation metrics
+        v10: also returns per_class_acc, latent_std (val), and KL active dims
+             so we can spot posterior collapse / overfit from the log alone.
+        v11: also returns val_silhouette, per-class centroid distances,
+             per-class prediction frequency, and recon intensity stats
+             (deep diagnostics for the "is the data the problem?" question).
         """
         self.model.eval()
 
@@ -992,11 +1119,23 @@ class MultiModalVAETrainer:
         total_cls_loss = 0.0
         total_cls_acc = 0.0
         num_batches = 0
+        num_classes = self.config.get("num_classes", 4)
+        per_class_correct = torch.zeros(num_classes)
+        per_class_total = torch.zeros(num_classes)
+        collected_mu_stds = []
+        # v11: collect full val mu + labels + preds for end-of-epoch diagnostics
+        all_mu_pooled = []   # list of [B, C]
+        all_labels = []      # list of [B]
+        all_preds = []       # list of [B]
+        all_input_intensity = []  # list of mean per sample
+        all_recon_intensity = []
+        # prediction distribution accumulator (across all val samples)
+        pred_dist = torch.zeros(num_classes)
 
         recon_loss_type = self.config.get("recon_loss_type", "l1")
         cls_weight = self.config.get("cls_weight", 1.0)
         kl_weight = getattr(self, 'current_kl_weight', self.config.get("kl_weight", 0.01))
-        num_classes = self.config.get("num_classes", 3)
+        use_demographic = self.config.get("use_demographic_cond", False)
 
         from tqdm import tqdm
         pbar = tqdm(enumerate(self.val_loader), total=len(self.val_loader), desc="Val", leave=False)
@@ -1006,10 +1145,14 @@ class MultiModalVAETrainer:
             # Get T1 (already preprocessed)
             t1 = batch["t1"].to(self.device)
 
-            # Build x_dict with T1 and optional modalities
+            # Build x_dict with T1 and optional modalities (only those the
+            # model actually has encoders for, driven by config).
+            active_optionals = self.config.get(
+                "optional_modalities", ["fmri", "asl", "qsm", "flair"]
+            )
             x_dict = {"t1": t1}
 
-            for mod in ["fmri", "asl", "qsm", "flair"]:
+            for mod in active_optionals:
                 if mod in batch and batch[mod] is not None:
                     mod_tensor = batch[mod].to(self.device)
                     if mod == "fmri":
@@ -1022,8 +1165,17 @@ class MultiModalVAETrainer:
                 if labels.dim() > 1:
                     labels = labels.squeeze()
 
+            # Optional demographic conditioning.
+            # IMPORTANT: pass age/sex through x_dict (not as kwargs) so that
+            # MultiModalDataParallel.scatter splits them per replica.
+            if use_demographic and "age" in batch and "sex" in batch:
+                x_dict["age"] = batch["age"].to(self.device)
+                x_dict["sex"] = batch["sex"].to(self.device)
+
             with autocast('cuda', enabled=self.use_amp):
-                recon, cls_logits, mu, logvar = self.model(x_dict, return_components=True)
+                recon, cls_logits, mu, logvar = self.model(
+                    x_dict, return_components=True,
+                )
 
                 recon_loss = F.l1_loss(recon, x_dict["t1"])
 
@@ -1032,6 +1184,24 @@ class MultiModalVAETrainer:
                     ordinal_reg_loss = ordinal_regression_loss(mu, labels, num_classes=num_classes)
                     preds = cls_logits.argmax(dim=1)
                     cls_acc = (preds == labels).float().mean().item()
+                    # v10: per-class accuracy + posterior spread
+                    for c in range(num_classes):
+                        mask = labels == c
+                        if mask.any():
+                            per_class_total[c] += mask.sum().item()
+                            per_class_correct[c] += (preds[mask] == c).sum().item()
+                    mu_pooled = mu.mean(dim=(-3, -2, -1))
+                    collected_mu_stds.append(mu_pooled.std(dim=0).cpu())
+                    # v11: collect for end-of-epoch silhouette + centroid dists
+                    all_mu_pooled.append(mu_pooled.cpu())
+                    all_labels.append(labels.cpu())
+                    all_preds.append(preds.cpu())
+                    # v11: input/recon intensity stats (data sanity)
+                    all_input_intensity.append(t1.mean(dim=(-3, -2, -1)).cpu())
+                    all_recon_intensity.append(recon.mean(dim=(-3, -2, -1)).cpu())
+                    # v11: prediction distribution accumulator
+                    for c in range(num_classes):
+                        pred_dist[c] += (preds == c).sum().item()
                 else:
                     cls_loss = torch.tensor(0.0, device=self.device)
                     ordinal_reg_loss = torch.tensor(0.0, device=self.device)
@@ -1053,12 +1223,64 @@ class MultiModalVAETrainer:
 
             pbar.set_postfix({"loss": f"{loss.item():.4f}", "acc": f"{cls_acc:.4f}"})
 
+        # v10: aggregate monitoring metrics (same way as train)
+        per_class_acc = (per_class_correct / per_class_total.clamp(min=1)).tolist()
+        if collected_mu_stds:
+            all_stds = torch.stack(collected_mu_stds, dim=0).mean(dim=0)
+            free_bits = self.config.get("free_bits", 0.0)
+            n_active = (all_stds > math.sqrt(2 * free_bits + 1e-6)).float().sum().item()
+        else:
+            n_active = 0.0
+            all_stds = torch.zeros(1)
+
+        # v11: deep diagnostics (only when we have val samples)
+        from utils.diagnostics import (
+            silhouette_score, per_class_centroid_distance,
+            per_dim_latent_stats, recon_intensity_stats,
+        )
+        if all_mu_pooled:
+            mu_all = torch.cat(all_mu_pooled, dim=0)        # [N, C]
+            lab_all = torch.cat(all_labels, dim=0)          # [N]
+            pred_all = torch.cat(all_preds, dim=0)          # [N]
+            sil = silhouette_score(mu_all, lab_all)
+            centroid_dists = per_class_centroid_distance(
+                mu_all, lab_all, num_classes=num_classes,
+            )
+            dim_stats = per_dim_latent_stats(
+                mu_all, free_bits=self.config.get("free_bits", 0.0),
+            )
+            pred_freq = (pred_dist / max(1.0, pred_dist.sum().item())).tolist()
+        else:
+            sil = 0.0
+            centroid_dists = {}
+            dim_stats = {}
+            pred_freq = [0.0] * num_classes
+
+        # v11: input/recon intensity sanity check
+        if all_input_intensity:
+            in_mean = torch.cat(all_input_intensity).mean().item()
+            re_mean = torch.cat(all_recon_intensity).mean().item()
+            intensity_gap = abs(in_mean - re_mean)
+        else:
+            in_mean = re_mean = intensity_gap = 0.0
+
         return {
             "loss": total_loss / num_batches,
             "recon_loss": total_recon_loss / num_batches,
             "cls_loss": total_cls_loss / num_batches,
             "kl_loss": total_kl_loss / num_batches,
             "cls_acc": total_cls_acc / num_batches,
+            "per_class_acc": per_class_acc,
+            "val_latent_std": all_stds.mean().item() if collected_mu_stds else 0.0,
+            "val_kl_active_dims": float(n_active),
+            # v11 deep diagnostics
+            "val_silhouette": sil,
+            "val_centroid_dists": centroid_dists,
+            "val_dim_stats": dim_stats,
+            "val_pred_freq": pred_freq,
+            "val_input_intensity": in_mean,
+            "val_recon_intensity": re_mean,
+            "val_intensity_gap": intensity_gap,
         }
 
     def save_checkpoint(self, filepath: str, include_optimizer: bool = True) -> None:
@@ -1140,6 +1362,19 @@ class MultiModalVAETrainer:
         os.makedirs(os.path.dirname(log_file) if os.path.dirname(log_file) else ".", exist_ok=True)
 
         log_exists = os.path.exists(log_file)
+        # v10: if existing CSV is from an older run (missing v10 columns),
+        # archive it and start fresh. Otherwise, append.
+        if log_exists:
+            try:
+                with open(log_file, "r") as f:
+                    first_line = f.readline()
+                if "val_kl_active_dims" not in first_line:
+                    backup = log_file + ".old"
+                    os.rename(log_file, backup)
+                    print(f"[v10] Old-format log archived to {backup}")
+                    log_exists = False
+            except Exception:
+                pass
         write_header = not log_exists
 
         history = {
@@ -1153,24 +1388,27 @@ class MultiModalVAETrainer:
             "val_cls_loss": [],
             "val_kl_loss": [],
             "val_cls_acc": [],
+            "kl_weight": [],
+            "kl_active_dims": [],
+            "latent_std": [],
+            "per_class_acc_train": [],
+            "per_class_acc_val": [],
         }
 
         epochs_without_improvement = 0
         early_stopped = False
 
-        # KL annealing: warmup from 0 to target over kl_warmup_epochs
-        target_kl_weight = self.config.get("kl_weight", 0.01)
-        kl_warmup_epochs = self.config.get("kl_warmup_epochs", 20)
+        # v10: KL schedule dispatcher (linear or cyclical).
+        # We store the strategy on self for downstream introspection.
+        from utils.kl_schedules import get_kl_weight
+        self.kl_strategy = self.config.get("kl_strategy", "linear")
 
         for epoch in range(num_epochs):
             self.current_epoch = epoch
             epoch_start_time = time.time()
 
-            # Compute current kl_weight with annealing
-            if epoch < kl_warmup_epochs:
-                self.current_kl_weight = target_kl_weight * (epoch + 1) / kl_warmup_epochs
-            else:
-                self.current_kl_weight = target_kl_weight
+            # v10: dispatch to selected KL strategy
+            self.current_kl_weight, _ = get_kl_weight(epoch, self.config)
 
             train_metrics = self.train_epoch()
             val_metrics = self.validate_epoch()
@@ -1190,14 +1428,77 @@ class MultiModalVAETrainer:
             else:
                 epochs_without_improvement += 1
 
+            # v10: train/val accuracy gap (overfit signal)
+            self.train_val_gap = train_metrics["cls_acc"] - val_metrics["cls_acc"]
+
+            # Per-class accuracy strings (NC / SCD / MCI / AD)
+            class_names = self.config.get("class_names", ["NC", "SCD", "MCI", "AD"])
+            pca_tr = train_metrics.get("per_class_acc", [0.0] * 4)
+            pca_va = val_metrics.get("per_class_acc", [0.0] * 4)
+            train_pca_str = "/".join(
+                f"{class_names[i]}={pca_tr[i]:.2f}" for i in range(len(pca_tr))
+            )
+            val_pca_str = "/".join(
+                f"{class_names[i]}={pca_va[i]:.2f}" for i in range(len(pca_va))
+            )
+
+            # v10: condensed log line with all the new signals
             print(
                 f"Epoch [{epoch+1}/{num_epochs}] "
                 f"LR: {current_lr:.6f} | "
-                f"Train: {train_metrics['loss']:.4f} (recon: {train_metrics['recon_loss']:.4f}, cls: {train_metrics['cls_loss']:.4f}, kl: {train_metrics['kl_loss']:.4f}, acc: {train_metrics['cls_acc']:.4f}) | "
-                f"Val: {val_metrics['loss']:.4f} (recon: {val_metrics['recon_loss']:.4f}, cls: {val_metrics['cls_loss']:.4f}, kl: {val_metrics['kl_loss']:.4f}, acc: {val_metrics['cls_acc']:.4f}) | "
+                f"Train: {train_metrics['loss']:.4f} "
+                f"(recon: {train_metrics['recon_loss']:.4f}, cls: {train_metrics['cls_loss']:.4f}, "
+                f"kl: {train_metrics['kl_loss']:.4f}, acc: {train_metrics['cls_acc']:.4f}) | "
+                f"Val: {val_metrics['loss']:.4f} "
+                f"(recon: {val_metrics['recon_loss']:.4f}, cls: {val_metrics['cls_loss']:.4f}, "
+                f"kl: {val_metrics['kl_loss']:.4f}, acc: {val_metrics['cls_acc']:.4f}) | "
+                f"KL_w={self.current_kl_weight:.3f} | "
+                f"gap={self.train_val_gap:+.3f} | "
+                f"actD={val_metrics.get('val_kl_active_dims', 0):.0f}/32 | "
+                f"std={val_metrics.get('val_latent_std', 0):.3f} | "
                 f"Time: {epoch_time:.1f}s | "
                 f"Patience: {epochs_without_improvement}/{early_stopping_patience}"
             )
+            # Per-class accuracy on its own line so it doesn't make the main
+            # line unreadable. Only print every 5 epochs to keep logs terse.
+            if (epoch + 1) % 5 == 0 or epoch == 0 or is_best:
+                print(
+                    f"           per-class acc | train: {train_pca_str} | "
+                    f"val: {val_pca_str}"
+                )
+
+            # v11: deep diagnostics on a separate line (every 5 epochs + best).
+            # These are the "is the data the problem?" signals.
+            if (epoch + 1) % 5 == 0 or epoch == 0 or is_best:
+                sil = val_metrics.get("val_silhouette", 0.0)
+                cd = val_metrics.get("val_centroid_dists", {})
+                pf = val_metrics.get("val_pred_freq", [0.0] * len(class_names))
+                ds = val_metrics.get("val_dim_stats", {})
+                in_int = val_metrics.get("val_input_intensity", 0.0)
+                re_int = val_metrics.get("val_recon_intensity", 0.0)
+                in_re_gap = val_metrics.get("val_intensity_gap", 0.0)
+                pf_str = "/".join(f"{pf[i]:.2f}" for i in range(min(4, len(pf))))
+                cd_str = " ".join(
+                    f"{k}={v:.2f}" for k, v in sorted(cd.items())
+                )
+                # Gradient norm summary (top-3 modules)
+                grad_norms = train_metrics.get("grad_norms", {})
+                top_grads = sorted(grad_norms.items(), key=lambda kv: -kv[1])[:3]
+                grad_str = " ".join(f"{k}={v:.2f}" for k, v in top_grads) if top_grads else "n/a"
+                print(
+                    f"           [DIAG] silhouette={sil:+.3f} | "
+                    f"centroid_dists: {cd_str if cd_str else 'n/a'} | "
+                    f"pred_dist[NC/SCD/MCI/AD]={pf_str} | "
+                    f"latent_dim: mean={ds.get('latent_std_mean', 0):.3f} "
+                    f"min={ds.get('latent_std_min', 0):.3f} "
+                    f"max={ds.get('latent_std_max', 0):.3f} "
+                    f"active={ds.get('n_active_dims', 0)}/{ds.get('n_active_dims', 0) + ds.get('n_collapsed_dims', 0)}"
+                )
+                print(
+                    f"           [DIAG] input_mean={in_int:.3f} recon_mean={re_int:.3f} "
+                    f"intensity_gap={in_re_gap:.3f} | top_grads: {grad_str} | "
+                    f"mixup_frac={train_metrics.get('mixup_frac', 0):.2f}"
+                )
 
             # Record history
             history["train_loss"].append(train_metrics["loss"])
@@ -1210,17 +1511,47 @@ class MultiModalVAETrainer:
             history["val_cls_loss"].append(val_metrics["cls_loss"])
             history["val_kl_loss"].append(val_metrics["kl_loss"])
             history["val_cls_acc"].append(val_metrics["cls_acc"])
+            # v10: extended history (KL weight, monitoring metrics)
+            history["kl_weight"].append(self.current_kl_weight)
+            history["kl_active_dims"].append(val_metrics.get("val_kl_active_dims", 0))
+            history["latent_std"].append(val_metrics.get("val_latent_std", 0))
+            history["per_class_acc_train"].append(pca_tr)
+            history["per_class_acc_val"].append(pca_va)
 
-            # Write to CSV
+            # Write to CSV (v10: more columns for offline analysis)
             with open(log_file, "a", newline="") as f:
                 writer = csv.writer(f)
                 if write_header:
                     writer.writerow([
-                        "epoch", "train_loss", "train_recon_loss", "train_cls_loss", "train_kl_loss", "train_cls_acc",
+                        "epoch",
+                        "train_loss", "train_recon_loss", "train_cls_loss", "train_kl_loss", "train_cls_acc",
                         "val_loss", "val_recon_loss", "val_cls_loss", "val_kl_loss", "val_cls_acc",
-                        "lr", "epoch_time", "is_best"
+                        "lr", "epoch_time", "is_best",
+                        # v10 monitoring
+                        "kl_weight", "val_kl_active_dims", "val_latent_std", "train_val_gap",
+                        "pca_train_NC", "pca_train_SCD", "pca_train_MCI", "pca_train_AD",
+                        "pca_val_NC", "pca_val_SCD", "pca_val_MCI", "pca_val_AD",
+                        # v11 deep diagnostics
+                        "val_silhouette",
+                        "cent_dist_NC_SCD", "cent_dist_NC_MCI", "cent_dist_NC_AD",
+                        "cent_dist_SCD_MCI", "cent_dist_SCD_AD", "cent_dist_MCI_AD",
+                        "pred_freq_NC", "pred_freq_SCD", "pred_freq_MCI", "pred_freq_AD",
+                        "latent_std_min", "latent_std_max",
+                        "input_intensity", "recon_intensity", "intensity_gap",
+                        "grad_encoder_t1", "grad_decoder", "grad_classifier", "grad_demo",
+                        "mixup_frac",
                     ])
                     write_header = False
+                # Pad per-class acc to 4 entries in case num_classes differs
+                pca_tr_pad = (pca_tr + [0.0] * 4)[:4]
+                pca_va_pad = (pca_va + [0.0] * 4)[:4]
+                pred_freq = val_metrics.get("val_pred_freq", [0.0] * 4)
+                pf_pad = (pred_freq + [0.0] * 4)[:4]
+                cd = val_metrics.get("val_centroid_dists", {})
+                ds = val_metrics.get("val_dim_stats", {})
+                gn = train_metrics.get("grad_norms", {})
+                def _gn(key):
+                    return gn.get(f"{key}_grad", 0.0)
                 writer.writerow([
                     epoch + 1,
                     f"{train_metrics['loss']:.6f}",
@@ -1235,7 +1566,40 @@ class MultiModalVAETrainer:
                     f"{val_metrics['cls_acc']:.6f}",
                     f"{current_lr:.8f}",
                     f"{epoch_time:.2f}",
-                    "1" if is_best else "0"
+                    "1" if is_best else "0",
+                    f"{self.current_kl_weight:.6f}",
+                    f"{val_metrics.get('val_kl_active_dims', 0):.0f}",
+                    f"{val_metrics.get('val_latent_std', 0):.6f}",
+                    f"{self.train_val_gap:+.6f}",
+                    f"{pca_tr_pad[0]:.4f}",
+                    f"{pca_tr_pad[1]:.4f}",
+                    f"{pca_tr_pad[2]:.4f}",
+                    f"{pca_tr_pad[3]:.4f}",
+                    f"{pca_va_pad[0]:.4f}",
+                    f"{pca_va_pad[1]:.4f}",
+                    f"{pca_va_pad[2]:.4f}",
+                    f"{pca_va_pad[3]:.4f}",
+                    f"{val_metrics.get('val_silhouette', 0):+.6f}",
+                    f"{cd.get('c01_dist', 0):.4f}",
+                    f"{cd.get('c02_dist', 0):.4f}",
+                    f"{cd.get('c03_dist', 0):.4f}",
+                    f"{cd.get('c12_dist', 0):.4f}",
+                    f"{cd.get('c13_dist', 0):.4f}",
+                    f"{cd.get('c23_dist', 0):.4f}",
+                    f"{pf_pad[0]:.4f}",
+                    f"{pf_pad[1]:.4f}",
+                    f"{pf_pad[2]:.4f}",
+                    f"{pf_pad[3]:.4f}",
+                    f"{ds.get('latent_std_min', 0):.6f}",
+                    f"{ds.get('latent_std_max', 0):.6f}",
+                    f"{val_metrics.get('val_input_intensity', 0):.6f}",
+                    f"{val_metrics.get('val_recon_intensity', 0):.6f}",
+                    f"{val_metrics.get('val_intensity_gap', 0):.6f}",
+                    f"{_gn('encoder_t1'):.4f}",
+                    f"{_gn('decoder'):.4f}",
+                    f"{_gn('classifier'):.4f}",
+                    f"{_gn('demo'):.4f}",
+                    f"{train_metrics.get('mixup_frac', 0):.4f}",
                 ])
 
             # Save checkpoint

@@ -591,6 +591,28 @@ class MultiModalDataset(Dataset):
         result["patient_id"] = data_item.get("patient_id", f"unknown_{idx}")
         result["available_modalities"] = available_modalities
 
+        # Demographics: always include keys (with safe defaults) so collate is
+        # uniform regardless of whether use_demographic_cond is on or off.
+        # Missing values become safe defaults (age=0, sex=0[unknown]).
+        raw_age = data_item.get("age", None)
+        raw_sex = data_item.get("sex", None)
+        if raw_age is None or raw_age == "":
+            age_val = 0.0
+        else:
+            try:
+                age_val = float(raw_age)
+            except (TypeError, ValueError):
+                age_val = 0.0
+        if raw_sex is None or raw_sex == "":
+            sex_val = 0  # 0=unknown
+        else:
+            try:
+                sex_val = int(raw_sex)
+            except (TypeError, ValueError):
+                sex_val = 0
+        result["age"] = torch.tensor(age_val, dtype=torch.float32)
+        result["sex"] = torch.tensor(sex_val, dtype=torch.long)
+
         return result
 
 
@@ -604,13 +626,41 @@ def multimodal_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     preserve_temporal_dim. Missing-modality zero-fills use the reference shape.
     """
     result = {}
-    keys = ["t1", "fmri", "asl", "qsm", "flair", "label", "patient_id", "available_modalities"]
+    keys = ["t1", "fmri", "asl", "qsm", "flair", "label", "patient_id", "available_modalities", "age", "sex"]
 
     for key in keys:
         values = [item.get(key) for item in batch]
 
         if key == "label":
             result[key] = torch.tensor(values, dtype=torch.long)
+        elif key == "age":
+            # Stack as float [B]; missing values default to 0.0
+            arr = []
+            for v in values:
+                if v is None:
+                    arr.append(0.0)
+                elif isinstance(v, torch.Tensor):
+                    arr.append(float(v.item()))
+                else:
+                    try:
+                        arr.append(float(v))
+                    except (TypeError, ValueError):
+                        arr.append(0.0)
+            result[key] = torch.tensor(arr, dtype=torch.float32)
+        elif key == "sex":
+            # Stack as long [B]; missing values default to 0 (unknown)
+            arr = []
+            for v in values:
+                if v is None:
+                    arr.append(0)
+                elif isinstance(v, torch.Tensor):
+                    arr.append(int(v.item()))
+                else:
+                    try:
+                        arr.append(int(v))
+                    except (TypeError, ValueError):
+                        arr.append(0)
+            result[key] = torch.tensor(arr, dtype=torch.long)
         elif key == "patient_id":
             result[key] = values
         elif key == "available_modalities":

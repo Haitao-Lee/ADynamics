@@ -177,10 +177,13 @@ def test_backward_through_full_model_5d() -> None:
     #   - The fMRITemporalEncoder is invoked but its transformer layers
     #     may not contribute gradient if the loss path doesn't depend
     #     on its specific output (e.g. fusion_proj zero-out path).
-    # We only require a substantial majority (>= 80%) to have grad, which
+    #   - The use_demographic_cond branch (age_mlp/sex_emb/demo_proj, ~7
+    #     params) is opt-in: this test doesn't pass age/sex, so those
+    #     params correctly receive no gradient.
+    # We only require a substantial majority (>= 70%) to have grad, which
     # confirms the backward graph is fully wired.
-    assert n_with_grad >= int(0.8 * n_total), (
-        f"Only {n_with_grad}/{n_total} parameters got gradients (need >= 80%)"
+    assert n_with_grad >= int(0.7 * n_total), (
+        f"Only {n_with_grad}/{n_total} parameters got gradients (need >= 70%)"
     )
     print(f"  [OK] Backward through 5D-fMRI model: {n_with_grad}/{n_total} params "
           f"got finite gradients")

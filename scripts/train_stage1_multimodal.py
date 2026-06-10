@@ -49,6 +49,12 @@ def _load_yaml_defaults(config_path: str) -> dict:
     mapping = [
         (("data", "json"), "json"),
         (("data", "num_classes"), "num_classes"),
+        (("data", "use_fmri"), "use_fmri"),
+        (("data", "use_asl"), "use_asl"),
+        (("data", "use_qsm"), "use_qsm"),
+        (("data", "use_flair"), "use_flair"),
+        (("data", "use_demographic"), "use_demographic"),
+        (("data", "t1_only"), "t1_only"),
         (("model", "latent_channels"), "latent_channels"),
         (("model", "base_channels"), "base_channels"),
         (("model", "decoder_depth"), "decoder_depth"),
@@ -79,10 +85,26 @@ def _load_yaml_defaults(config_path: str) -> dict:
         (("loss", "ssim_weight"), "ssim_weight"),
         (("loss", "encoder_grad_boost"), "encoder_grad_boost"),
         (("loss", "ordinal_reg_weight"), "ordinal_reg_weight"),
+        # v10: cyclical KL schedule + latent mixup (missing in original mapping
+        # so trainer fell back to defaults: kl_strategy="linear", mixup_alpha=0.0).
+        # Without these 5 entries, self.config.get(...) in trainer returned
+        # defaults and the v10 improvements were silently inactive.
+        (("loss", "kl_strategy"), "kl_strategy"),
+        (("loss", "kl_cycle_len"), "kl_cycle_len"),
+        (("loss", "kl_cycle_low_frac"), "kl_cycle_low_frac"),
+        (("loss", "mixup_alpha"), "mixup_alpha"),
+        (("loss", "mixup_prob"), "mixup_prob"),
         (("output", "dir"), "output_dir"),
         (("seed",), "seed"),
     ]
     return apply_yaml_defaults(config_path, mapping)
+
+
+# Local thin alias for the shared helper so the rest of this file is unchanged.
+def _resolve_optional_modalities(args) -> list:
+    """Wrapper around utils.stage23_compat.resolve_optional_modalities."""
+    from utils.stage23_compat import resolve_optional_modalities
+    return resolve_optional_modalities(args)
 
 
 def parse_args():
@@ -102,6 +124,11 @@ def parse_args():
                         help="Path to dataset JSON manifest")
     parser.add_argument("--output_dir", type=str, default="./checkpoints/stage1_multimodal",
                         help="Output directory for checkpoints")
+
+    # Modality toggles (T1 is always required). Default: all 4 ON.
+    # Use --no_X to drop a single modality, or --t1_only to drop all 4.
+    from utils.stage23_compat import add_modality_args
+    add_modality_args(parser)
 
     # Model
     parser.add_argument("--latent_channels", type=int, default=32,
@@ -187,6 +214,21 @@ def parse_args():
                         help="Use automatic mixed precision")
     parser.add_argument("--no_amp", action="store_true", default=False,
                         help="Disable AMP")
+
+    # v10: KL schedule strategy and cyclical-KL params
+    parser.add_argument("--kl_strategy", type=str, default="linear",
+                        choices=["linear", "cyclical"],
+                        help="KL weight schedule: 'linear' (warmup) or 'cyclical' (0<->peak cycles)")
+    parser.add_argument("--kl_cycle_len", type=int, default=15,
+                        help="Epochs per cycle when kl_strategy=cyclical")
+    parser.add_argument("--kl_cycle_low_frac", type=float, default=0.1,
+                        help="Min KL weight (fraction of target) during cyclical off-phase")
+
+    # v10: latent-space mixup
+    parser.add_argument("--mixup_alpha", type=float, default=0.0,
+                        help="Latent mixup Beta(alpha, alpha) parameter; 0 disables")
+    parser.add_argument("--mixup_prob", type=float, default=0.5,
+                        help="Per-batch probability of applying mixup")
 
     # Apply YAML config defaults AFTER all add_argument calls
     # (set_defaults must come last so it isn't overridden by argparse defaults)
@@ -305,8 +347,24 @@ def main():
     print(f"Train: {len(train_data)}, Val: {len(val_data)}")
 
     # Datasets
-    train_dataset = MultiModalDataset(train_data, transform=train_transforms)
-    val_dataset = MultiModalDataset(val_data, transform=val_transforms)
+    # Resolve which optional modalities are active so the dataset doesn't bother
+    # trying to load files for modalities the model has no encoder for.
+    optional_modalities = _resolve_optional_modalities(args)
+    use_demographic = bool(getattr(args, "use_demographic", True)) and not bool(
+        getattr(args, "no_demographic", False)
+    )
+    print(f"[Modality switches] optional={optional_modalities}  "
+          f"demographic={use_demographic}  t1_only={bool(getattr(args, 't1_only', False))}")
+    train_dataset = MultiModalDataset(
+        train_data,
+        transform=train_transforms,
+        optional_modalities=optional_modalities,
+    )
+    val_dataset = MultiModalDataset(
+        val_data,
+        transform=val_transforms,
+        optional_modalities=optional_modalities,
+    )
 
     # Dataloaders
     from core_data.dataset import multimodal_collate_fn
@@ -345,7 +403,7 @@ def main():
         num_classes=args.num_classes,
         dropout_rate=args.dropout_rate,
         decoder_depth=args.decoder_depth,
-        optional_modalities=["fmri", "asl", "qsm", "flair"],
+        optional_modalities=optional_modalities,   # ← was hardcoded; now driven by switches
         use_attention=use_attention,
         attention_levels=attn_levels,
         attention_heads=args.attention_heads,
@@ -355,6 +413,7 @@ def main():
         fmri_num_pool=args.fmri_num_pool,
         fmri_num_transformer_layers=args.fmri_num_transformer_layers,
         fmri_num_heads=args.fmri_num_heads,
+        use_demographic_cond=use_demographic,
     )
 
     # Multi-GPU support via shared utils (replaces buggy local DataParallel)
@@ -389,6 +448,17 @@ def main():
         "num_classes": args.num_classes,
         "use_amp": use_amp,
         "use_fmri_temporal": use_fmri_temporal,
+        "use_demographic_cond": use_demographic,
+        "optional_modalities": optional_modalities,
+        # v10: cyclical KL schedule (was missing — trainer fell back to "linear")
+        "kl_strategy": getattr(args, "kl_strategy", "linear"),
+        "kl_cycle_len": getattr(args, "kl_cycle_len", 15),
+        "kl_cycle_low_frac": getattr(args, "kl_cycle_low_frac", 0.1),
+        # v10: latent mixup (was missing — trainer fell back to mixup_alpha=0.0)
+        "mixup_alpha": getattr(args, "mixup_alpha", 0.0),
+        "mixup_prob": getattr(args, "mixup_prob", 0.5),
+        # Class names for diagnostic output
+        "class_names": ["NC", "SCD", "MCI", "AD"],
     }
 
     # Trainer

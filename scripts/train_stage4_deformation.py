@@ -119,6 +119,10 @@ def parse_args():
     parser.add_argument("--no_amp", action="store_true", default=False)
     parser.add_argument("--use_amp", action="store_true", default=False,
                         help="Enable AMP (default OFF; YAML use_amp: false maps here)")
+
+    # Modality toggles (must match Stage 1)
+    from utils.stage23_compat import add_modality_args
+    add_modality_args(parser)
     parser.add_argument("--num_gpus", type=int, default=2,
                         help="Number of GPUs for DataParallel (default 2; canonical setup is 2x RTX 3090)")
     # Apply YAML config defaults AFTER all add_argument calls
@@ -519,6 +523,9 @@ def main():
     )
 
     # Load encoder from Stage 1
+    from utils.stage23_compat import resolve_optional_modalities, resolve_use_demographic
+    optional_modalities = resolve_optional_modalities(args)
+    print(f"[Modality switches] optional={optional_modalities}")
     encoder = MultiModalVAE3D(
         spatial_size=MULTI_MODAL_SPATIAL_SIZES["t1"],
         in_channels=1,
@@ -527,7 +534,8 @@ def main():
         num_classes=args.num_classes,
         dropout_rate=args.dropout_rate,
         decoder_depth=args.decoder_depth,
-        optional_modalities=["fmri", "asl", "qsm", "flair"],
+        optional_modalities=optional_modalities,
+        use_demographic_cond=resolve_use_demographic(args),
     )
 
     print(f"Loading encoder from {args.encoder_checkpoint}")
