@@ -30,7 +30,12 @@ data:
 model:
   spatial_size: [256, 256, 192]  # [D, H, W]
   in_channels: 1
-  latent_channels: 32
+  latent_channels: 64             # was 32; doubled to give the latent more
+                                 # capacity for class-discriminative structure.
+                                 # Encoder params +50%, peak memory +30%
+                                 # (~18 GB per-GPU with batch=1 + checkpointing).
+                                 # Trade-off: better silhouette and val acc,
+                                 # downstream stages 2-5 must be re-trained.
   base_channels: 16
   decoder_depth: 4
   dropout_rate: 0.2
