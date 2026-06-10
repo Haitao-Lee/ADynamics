@@ -921,6 +921,19 @@ class MultiModalVAETrainer:
         mixup_alpha = self.config.get("mixup_alpha", 0.0)
         mixup_prob = self.config.get("mixup_prob", 0.5)
 
+        # Per-class weights for class imbalance (loaded ONCE per epoch —
+        # tensor is loop-invariant). config["class_weights"] = [w_NC, w_SCD,
+        # w_MCI, w_AD]. When set, minority classes (SCD 13%, MCI 26%) get
+        # higher loss contribution than majority (NC 34%, AD 27%), forcing
+        # the classifier to learn rare-class signal instead of collapsing
+        # to NC/AD. Default: None (equal weights). Loaded here so it's in
+        # scope for both train_epoch and validate_epoch.
+        class_weights = self.config.get("class_weights", None)
+        if class_weights is not None:
+            class_weights = torch.tensor(
+                class_weights, dtype=torch.float32, device=self.device,
+            )
+
         # v11: track mixup application count
         n_mixup_applied = 0
 
@@ -935,18 +948,10 @@ class MultiModalVAETrainer:
             # Get T1 (already preprocessed to 256x256x192)
             t1 = batch["t1"].to(self.device)
 
-            # Per-class weights for class imbalance (loaded once per
-            # epoch; same tensor shared across all batches). Read from
-            # config["class_weights"] = [w_NC, w_SCD, w_MCI, w_AD]. When
-            # set, minority classes (SCD 13%, MCI 26%) get higher loss
-            # contribution than majority (NC 34%, AD 27%), forcing the
-            # classifier to learn rare-class signal instead of collapsing
-            # to NC/AD. Default: None (equal weights).
-            class_weights = self.config.get("class_weights", None)
-            if class_weights is not None:
-                class_weights = torch.tensor(
-                    class_weights, dtype=torch.float32, device=self.device,
-                )
+            # class_weights is loaded once at the top of train_epoch (above
+            # the batch loop) and reused for every batch — tensor is
+            # loop-invariant. Re-loading per batch would just create a fresh
+            # torch.tensor every step with no functional benefit.
 
             # Build x_dict with T1 and optional modalities.
             # IMPORTANT: only include modalities that the model actually has encoders for
@@ -1208,6 +1213,16 @@ class MultiModalVAETrainer:
         cls_weight = self.config.get("cls_weight", 1.0)
         kl_weight = getattr(self, 'current_kl_weight', self.config.get("kl_weight", 0.01))
         use_demographic = self.config.get("use_demographic_cond", False)
+
+        # Load per-class weights from config (inverse-frequency for class balance).
+        # MUST be done in validate_epoch too — it's a different method, has its
+        # own local scope; without this, ordinal_cross_entropy_loss raises
+        # NameError on the first val batch. (Bug from commit ce0b7eb.)
+        class_weights = self.config.get("class_weights", None)
+        if class_weights is not None:
+            class_weights = torch.tensor(
+                class_weights, dtype=torch.float32, device=self.device,
+            )
 
         from tqdm import tqdm
         pbar = tqdm(enumerate(self.val_loader), total=len(self.val_loader), desc="Val", leave=False)
