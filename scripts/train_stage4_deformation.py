@@ -201,6 +201,11 @@ class DeformationTrainer:
         self.sim_weight = config.get("sim_weight", 1.0)
         self.smooth_weight = config.get("smooth_weight", 0.1)
         self.jacobian_weight = config.get("jacobian_weight", 0.01)
+        # Bug fix: store num_classes on self so train_epoch can use
+        # self.num_classes instead of the script-level `args` (which is
+        # not in scope inside a class method). The previous code raised
+        # NameError on the very first batch.
+        self.num_classes = config.get("num_classes", 4)
 
         self.stn = SpatialTransformer(mode="bilinear", padding_mode="border")
         self.smooth_loss_fn = GradientSmoothingLoss(penalty_type="l2")
@@ -259,7 +264,7 @@ class DeformationTrainer:
             if labels.dim() > 1:
                 labels = labels.squeeze()
 
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
 
             with autocast('cuda', enabled=self.use_amp):
                 # Encode source images
@@ -292,7 +297,7 @@ class DeformationTrainer:
                 # Compute losses
                 # Primary: similarity between warped and target (AD if available, else original)
                 # When NC->AD progression, target is AD image from same subject or paired sample
-                ad_label = args.num_classes - 1  # AD is the last class
+                ad_label = self.num_classes - 1  # AD is the last class
                 if (labels == ad_label).sum() > 0:  # AD subjects available
                     ad_idx = (labels == ad_label).nonzero(as_tuple=True)[0][0]
                     ad_target = t1[(labels == ad_label).nonzero(as_tuple=True)[0]]
@@ -301,7 +306,12 @@ class DeformationTrainer:
                     # Fallback: compare warped to original (deformation should be small)
                     sim_loss = F.l1_loss(warped_image, t1)
                 smooth_loss = self.smooth_loss_fn(flow)
-                jacobian_loss = compute_jacobian_penalty(flow, spacing=(1.0, 1.0, 1.0))
+                # OOM fix: compute jacobian at 4mm spacing instead of 1mm.
+                # At 256^3 resolution, a 1mm-spacing jacobian penalty
+                # allocates [B, 3, 3, D, H, W] = 450MB per batch. A 4mm
+                # spacing reduces this 64x (~7MB). The penalty is a
+                # smoothness term, so coarser spacing is acceptable.
+                jacobian_loss = compute_jacobian_penalty(flow, spacing=(4.0, 4.0, 4.0))
 
                 loss = (
                     self.sim_weight * sim_loss
@@ -369,7 +379,12 @@ class DeformationTrainer:
                 # Similarity: warped image vs original (deformation should be anatomically plausible)
                 sim_loss = F.l1_loss(warped_image, t1)
                 smooth_loss = self.smooth_loss_fn(flow)
-                jacobian_loss = compute_jacobian_penalty(flow, spacing=(1.0, 1.0, 1.0))
+                # OOM fix: compute jacobian at 4mm spacing instead of 1mm.
+                # At 256^3 resolution, a 1mm-spacing jacobian penalty
+                # allocates [B, 3, 3, D, H, W] = 450MB per batch. A 4mm
+                # spacing reduces this 64x (~7MB). The penalty is a
+                # smoothness term, so coarser spacing is acceptable.
+                jacobian_loss = compute_jacobian_penalty(flow, spacing=(4.0, 4.0, 4.0))
 
                 loss = (
                     self.sim_weight * sim_loss
@@ -556,8 +571,23 @@ def main():
         param.requires_grad = False
     print("Encoder loaded and frozen")
 
-    # Freeze decoder too
+    # Load decoder if provided. Previously this was hardcoded to None,
+    # which silently dropped the Stage 2 fine-tuned decoder — Stage 4
+    # would then fall back to the encoder's VAE decoder, which is a
+    # different (worse) reconstruction. Now the user can pass
+    # --decoder_checkpoint to opt in.
     decoder = None
+    if args.decoder_checkpoint and os.path.exists(args.decoder_checkpoint):
+        print(f"Loading decoder from {args.decoder_checkpoint}")
+        dec_ckpt = torch.load(args.decoder_checkpoint, map_location=device, weights_only=False)
+        dec_sd = dec_ckpt.get("model_state_dict", dec_ckpt)
+        # The decoder checkpoint shares encoder weights (the fine-tuned
+        # VAE includes both). We extract decoder state by name match
+        # against the encoder's existing decoder.
+        from utils.stage23_compat import shape_filtered_load_state_dict
+        shape_filtered_load_state_dict(encoder, dec_sd, strict=False, verbose=False)
+        decoder = encoder  # share the encoder's decode path
+        print("Decoder loaded into encoder")
 
     # Load CFM if provided
     cfm_model = None

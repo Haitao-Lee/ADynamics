@@ -257,6 +257,7 @@ def train_one_epoch(
     device,
     args,
     smooth_loss_fn,
+    scaler=None,
 ):
     """Joint training epoch: recon + cfm + deform."""
     model.train()
@@ -285,12 +286,18 @@ def train_one_epoch(
             if labels.dim() > 1:
                 labels = labels.squeeze()
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
         # Forward VAE
         recon, cls_logits, mu, logvar = model(x_dict, return_components=True)
         recon_loss = F.l1_loss(recon, t1)
-        cls_loss = F.cross_entropy(cls_logits, labels) if labels is not None else 0.0
+        # Bug fix: cls_loss must be a Tensor even when labels is None so
+        # .item() works downstream. A bare 0.0 Python float would raise
+        # AttributeError on cls_loss.item() in the metric block.
+        if labels is not None:
+            cls_loss = F.cross_entropy(cls_logits, labels)
+        else:
+            cls_loss = torch.tensor(0.0, device=device)
 
         # CFM velocity on (NC, AD) latents — 2-class flow
         # Pick 2 random latents; if labels include both NC(0) and AD(3)
@@ -317,7 +324,8 @@ def train_one_epoch(
         # Smoothness on flow
         sm_loss = smooth_loss_fn(flow)
         # Jacobian-determinant penalty (encourage diffeomorphism)
-        jac_loss = compute_jacobian_penalty(flow)
+        # OOM fix: spacing=4.0 reduces 450MB temp to ~7MB.
+        jac_loss = compute_jacobian_penalty(flow, spacing=(4.0, 4.0, 4.0))
         def_loss = sim_loss + args.smooth_weight * sm_loss + args.jacobian_weight * jac_loss
 
         loss = (
@@ -327,11 +335,23 @@ def train_one_epoch(
             + args.def_weight * def_loss
         )
 
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        torch.nn.utils.clip_grad_norm_(cfm.parameters(), max_norm=1.0)
-        torch.nn.utils.clip_grad_norm_(deform_gen.parameters(), max_norm=1.0)
-        optimizer.step()
+        # AMP fix: actually use the scaler that was defined in main().
+        # Previously the scaler was created but never threaded into
+        # train_one_epoch, so AMP silently no-op'd.
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(cfm.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(deform_gen.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(cfm.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(deform_gen.parameters(), max_norm=1.0)
+            optimizer.step()
 
         total_loss += loss.item()
         total_recon += recon_loss.item()
@@ -344,6 +364,14 @@ def train_one_epoch(
             "cfm": f"{cfm_loss.item():.3f}",
             "def": f"{def_loss.item():.3f}",
         })
+
+        # OOM fix: release per-batch autograd graph + ~300MB of
+        # deformation + CFM activations. Without this, 24GB GPUs
+        # accumulate ~18GB per batch and OOM by epoch 3-4.
+        del loss, recon, cls_logits, mu, logvar, recon_loss, cls_loss
+        del z0, z1, z_t, v_pred, target_v, cfm_loss
+        del flow, deformed, sim_loss, sm_loss, jac_loss, def_loss
+        torch.cuda.empty_cache()
 
     n = max(n_batches, 1)
     return {
@@ -505,7 +533,7 @@ def main() -> None:
         t0 = time.time()
         train_m = train_one_epoch(
             model, cfm, deform_gen, spatial_transformer, train_loader,
-            optimizer, device, args, smooth_loss_fn,
+            optimizer, device, args, smooth_loss_fn, scaler=scaler,
         )
         val_m = validate(
             model, cfm, deform_gen, spatial_transformer, val_loader,

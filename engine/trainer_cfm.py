@@ -322,7 +322,7 @@ class CFMTrainer:
         for _ in range(num_batches_total):
             z0, z1, c0, c1, age0, sex0 = self.sample_latent_pairs(batch_size)
 
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
 
             with autocast('cuda', enabled=self.use_amp):
                 losses = self.train_step(z0, z1, c0, c1, age0, sex0)

@@ -216,7 +216,7 @@ def build_latent_pools(encoder, dataloader, device, num_classes=4):
             _, _, mu, _ = encoder(x_dict, return_components=True)
 
             for i, label in enumerate(labels):
-                lbl = label.item() if label.numel() == 1 else label
+                lbl = int(label.item())
                 pools[lbl].append(mu[i].cpu())
 
     for c in range(num_classes):
@@ -504,7 +504,7 @@ def main():
 
         for _ in range(n_batches):
             z0, z1, *_ = trainer.sample_latent_pairs(args.batch_size)
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
             batch_size_actual = z0.shape[0]
             t = torch.rand(batch_size_actual, device=device)

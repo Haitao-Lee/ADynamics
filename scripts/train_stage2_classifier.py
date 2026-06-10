@@ -222,18 +222,26 @@ class ClassifierTrainer:
                 if labels.dim() > 1:
                     labels = labels.squeeze()
 
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
 
             with autocast('cuda', enabled=self.use_amp):
                 # Forward pass - get only classification logits
                 _, cls_logits, mu, logvar = self.model(x_dict, return_components=True)
 
-                # Classification loss only
-                cls_loss = F.cross_entropy(cls_logits, labels)
+                # Classification loss only. Guard against None labels —
+                # some collate paths may yield unlabeled samples.
+                if labels is not None:
+                    cls_loss = F.cross_entropy(cls_logits, labels)
+                else:
+                    cls_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
 
-                # Per-class accuracy
-                preds = cls_logits.argmax(dim=1)
-                acc = (preds == labels).float().mean()
+                # Per-class accuracy (only meaningful when labels present)
+                if labels is not None:
+                    preds = cls_logits.argmax(dim=1)
+                    acc = (preds == labels).float().mean()
+                else:
+                    preds = cls_logits.argmax(dim=1)
+                    acc = torch.tensor(0.0, device=self.device)
 
                 loss = cls_loss
 
@@ -249,9 +257,14 @@ class ClassifierTrainer:
                 self.optimizer.step()
 
             total_loss += loss.item()
-            total_acc += acc.item()
+            total_acc += acc.item() if isinstance(acc, torch.Tensor) else acc
             num_batches += 1
-            pbar.set_postfix({"loss": f"{loss.item():.4f}", "acc": f"{acc.item():.4f}"})
+            pbar.set_postfix({"loss": f"{loss.item():.4f}", "acc": f"{acc.item() if isinstance(acc, torch.Tensor) else acc:.4f}"})
+
+            # OOM fix: release the per-batch autograd graph + activations.
+            # recon (50MB) and mu/logvar graphs linger otherwise.
+            del loss, cls_logits, mu, logvar
+            torch.cuda.empty_cache()
 
         return {
             "loss": total_loss / num_batches,

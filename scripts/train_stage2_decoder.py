@@ -35,6 +35,12 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.amp import GradScaler, autocast
 
+from utils.stage23_compat import (
+    normalize_fmri_batch,
+    resolve_optional_modalities,
+    shape_filtered_load_state_dict,
+)
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 warnings.filterwarnings("ignore")
 
@@ -233,7 +239,6 @@ class DecoderTrainer:
                 if mod in batch and batch[mod] is not None:
                     mod_tensor = batch[mod].to(self.device)
                     if mod == "fmri":
-                        from utils.stage23_compat import normalize_fmri_batch
                         mod_tensor = normalize_fmri_batch(mod_tensor)
                     x_dict[mod] = mod_tensor
 
@@ -243,7 +248,7 @@ class DecoderTrainer:
                 if labels.dim() > 1:
                     labels = labels.squeeze()
 
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
 
             with autocast('cuda', enabled=self.use_amp):
                 recon, cls_logits, mu, logvar = self.model(x_dict, return_components=True)
@@ -270,6 +275,11 @@ class DecoderTrainer:
             num_batches += 1
             pbar.set_postfix({"recon": f"{recon_loss.item():.4f}"})
 
+            # OOM fix: release the per-batch autograd graph + activations.
+            # recon (50MB at 256^3) and mu/logvar graphs linger otherwise.
+            del loss, recon, cls_logits, mu, logvar, recon_loss, kl_loss
+            torch.cuda.empty_cache()
+
         return {
             "loss": total_loss / num_batches,
             "recon_loss": total_recon / num_batches,
@@ -295,7 +305,6 @@ class DecoderTrainer:
                 if mod in batch and batch[mod] is not None:
                     mod_tensor = batch[mod].to(self.device)
                     if mod == "fmri":
-                        from utils.stage23_compat import normalize_fmri_batch
                         mod_tensor = normalize_fmri_batch(mod_tensor)
                     x_dict[mod] = mod_tensor
 
@@ -445,14 +454,16 @@ def main():
         num_classes=args.num_classes,
         dropout_rate=args.dropout_rate,
         decoder_depth=args.decoder_depth,
-        optional_modalities=["fmri", "asl", "qsm", "flair"],
+        # Match Stage 1 modality toggles so the encoder architecture aligns
+        # with the loaded checkpoint. Mismatches cause
+        # shape_filtered_load to silently drop most keys.
+        optional_modalities=resolve_optional_modalities(args),
     )
 
     print(f"Loading model from {args.checkpoint}")
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     sd = checkpoint["model_state_dict"]
 
-    from utils.stage23_compat import shape_filtered_load_state_dict
     shape_filtered_load_state_dict(model, sd, strict=False, verbose=True)
     model = model.to(device)
     print("Model loaded successfully")
