@@ -86,6 +86,7 @@ def _load_yaml_defaults(config_path: str) -> dict:
         (("loss", "ssim_weight"), "ssim_weight"),
         (("loss", "encoder_grad_boost"), "encoder_grad_boost"),
         (("loss", "ordinal_reg_weight"), "ordinal_reg_weight"),
+        (("loss", "class_weights"), "class_weights"),
         # v10: cyclical KL schedule + latent mixup (missing in original mapping
         # so trainer fell back to defaults: kl_strategy="linear", mixup_alpha=0.0).
         # Without these 5 entries, self.config.get(...) in trainer returned

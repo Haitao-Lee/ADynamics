@@ -935,6 +935,19 @@ class MultiModalVAETrainer:
             # Get T1 (already preprocessed to 256x256x192)
             t1 = batch["t1"].to(self.device)
 
+            # Per-class weights for class imbalance (loaded once per
+            # epoch; same tensor shared across all batches). Read from
+            # config["class_weights"] = [w_NC, w_SCD, w_MCI, w_AD]. When
+            # set, minority classes (SCD 13%, MCI 26%) get higher loss
+            # contribution than majority (NC 34%, AD 27%), forcing the
+            # classifier to learn rare-class signal instead of collapsing
+            # to NC/AD. Default: None (equal weights).
+            class_weights = self.config.get("class_weights", None)
+            if class_weights is not None:
+                class_weights = torch.tensor(
+                    class_weights, dtype=torch.float32, device=self.device,
+                )
+
             # Build x_dict with T1 and optional modalities.
             # IMPORTANT: only include modalities that the model actually has encoders for
             # (driven by the trainer's config["optional_modalities"] list). Anything
@@ -1034,7 +1047,10 @@ class MultiModalVAETrainer:
                     # Standard path
                     recon_loss = F.l1_loss(recon, x_dict["t1"])
                     if labels is not None:
-                        cls_loss = ordinal_cross_entropy_loss(cls_logits, labels, num_classes=num_classes)
+                        cls_loss = ordinal_cross_entropy_loss(
+                        cls_logits, labels, num_classes=num_classes,
+                        class_weights=class_weights,
+                    )
                         ordinal_reg_loss = ordinal_regression_loss(mu, labels, num_classes=num_classes)
                     else:
                         cls_loss = torch.tensor(0.0, device=self.device)
@@ -1236,7 +1252,10 @@ class MultiModalVAETrainer:
                 recon_loss = F.l1_loss(recon, x_dict["t1"])
 
                 if labels is not None:
-                    cls_loss = ordinal_cross_entropy_loss(cls_logits, labels, num_classes=num_classes)
+                    cls_loss = ordinal_cross_entropy_loss(
+                        cls_logits, labels, num_classes=num_classes,
+                        class_weights=class_weights,
+                    )
                     ordinal_reg_loss = ordinal_regression_loss(mu, labels, num_classes=num_classes)
                     preds = cls_logits.argmax(dim=1)
                     cls_acc = (preds == labels).float().mean().item()

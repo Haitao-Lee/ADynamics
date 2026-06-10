@@ -142,6 +142,7 @@ def ordinal_cross_entropy_loss(
     logits: Tensor,
     labels: Tensor,
     num_classes: int = 4,
+    class_weights: Optional[Tensor] = None,
 ) -> Tensor:
     """
     Ordinal Cross Entropy Loss for disease progression classification.
@@ -156,12 +157,15 @@ def ordinal_cross_entropy_loss(
         logits: Classification logits [B, num_classes]
         labels: Ground truth labels [B] - 0=NC, 1=SCD, 2=MCI, 3=AD
         num_classes: Number of classes
+        class_weights: Optional per-class weight tensor [num_classes] for
+            F.cross_entropy. Used to counter class imbalance (e.g. SCD has
+            only 13% of samples). If None, all classes weighted equally.
 
     Returns:
         Scalar loss
     """
-    # Standard cross entropy
-    ce_loss = F.cross_entropy(logits, labels, reduction='none')
+    # Standard cross entropy (with optional per-class weighting)
+    ce_loss = F.cross_entropy(logits, labels, weight=class_weights, reduction='none')
 
     # Ordinal penalty: distance from correct class
     preds = logits.argmax(dim=1)
