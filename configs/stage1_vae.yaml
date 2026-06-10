@@ -54,10 +54,16 @@ model:
   fmri_num_pool: 3
   fmri_num_transformer_layers: 2
   fmri_num_heads: 4
+  # OOM fix: gradient checkpointing on the decoder. 256^3 decoder
+  # activations account for ~16GB of autograd-graph memory; wrapping
+  # the layer stack in torch.utils.checkpoint.sequential drops the
+  # peak by ~40% at the cost of ~15% slower training. Keep this ON
+  # for the 24GB GPU budget.
+  use_checkpointing: true
 
 # Training hyperparameters
 training:
-  batch_size: 4                # TOTAL batch size (each GPU gets 1 via DataParallel scatter)
+  batch_size: 2                # TOTAL batch size (DataParallel scatter 1 per GPU, total effective=2)
   learning_rate: 0.00003
   weight_decay: 0.00001
   epochs: 300

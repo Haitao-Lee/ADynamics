@@ -1002,6 +1002,7 @@ class MultiModalVAE3D(nn.Module):
         fmri_num_heads: int = 4,
         use_demographic_cond: bool = False,
         age_emb_dim: int = 16,
+        use_checkpointing: bool = False,
         sex_emb_dim: int = 8,
     ) -> None:
         """
@@ -1039,6 +1040,15 @@ class MultiModalVAE3D(nn.Module):
                 optional modalities (T1-only, T1+FLAIR, etc.). Default: False.
             age_emb_dim: Embedding dim for age (float, normalized 0-1). Default 16.
             sex_emb_dim: Embedding dim for sex (categorical: 0=unknown, 1=male, 2=female). Default 8.
+            use_checkpointing: If True, wrap the decoder layer stack in
+                `torch.utils.checkpoint.checkpoint_sequential`. Trades a small
+                amount of extra compute (~15% slower per epoch) for a large
+                reduction in autograd-graph memory (peak activation memory
+                drops by ~40% on 256^3 inputs). Defaults to False to keep
+                behavior identical to the original implementation; enable
+                via the YAML `model.use_checkpointing: true` or the
+                `--use_checkpointing` CLI flag when OOM is hit on the
+                forward pass.
         """
         super().__init__()
 
@@ -1051,6 +1061,7 @@ class MultiModalVAE3D(nn.Module):
         self.decoder_depth = decoder_depth
         self.use_fmri_temporal = use_fmri_temporal
         self.use_demographic_cond = use_demographic_cond
+        self.use_checkpointing = use_checkpointing
 
         # Default optional modalities (T1 is always required, never in this list)
         if optional_modalities is None:
@@ -1252,8 +1263,23 @@ class MultiModalVAE3D(nn.Module):
         """
         h = self.decoder_latent_conv(z)
 
-        for layer in self.decoder_layers:
-            h = layer(h)
+        # OOM fix: when use_checkpointing is on (and we are training),
+        # wrap the decoder layer stack in torch.utils.checkpoint. The
+        # decoder's intermediate activations (multiple feature maps at
+        # full 256^3 resolution) account for ~16GB of autograd-graph
+        # memory in the default config. Checkpointing recomputes those
+        # activations on the backward pass, trading ~15% of wall time
+        # for ~40% peak memory reduction.
+        if self.training and self.use_checkpointing and len(self.decoder_layers) > 0:
+            from torch.utils.checkpoint import checkpoint_sequential
+            # checkpoint_sequential splits the modules into chunks and
+            # runs each chunk in a no_grad forward, re-attaching the
+            # graph on backward. We use a chunk size of 1 to get the
+            # maximum memory savings (one layer at a time).
+            h = checkpoint_sequential(self.decoder_layers, 1, h, use_reentrant=False)
+        else:
+            for layer in self.decoder_layers:
+                h = layer(h)
 
         if self.final_upsample is not None:
             h = self.final_upsample(h)

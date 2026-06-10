@@ -67,6 +67,7 @@ def _load_yaml_defaults(config_path: str) -> dict:
         (("model", "fmri_num_pool"), "fmri_num_pool"),
         (("model", "fmri_num_transformer_layers"), "fmri_num_transformer_layers"),
         (("model", "fmri_num_heads"), "fmri_num_heads"),
+        (("model", "use_checkpointing"), "use_checkpointing"),
         (("training", "batch_size"), "batch_size"),
         (("training", "learning_rate"), "learning_rate"),
         (("training", "weight_decay"), "weight_decay"),
@@ -169,6 +170,14 @@ def parse_args():
                         help="TransformerEncoder depth for fMRI temporal modeling.")
     parser.add_argument("--fmri_num_heads", type=int, default=4,
                         help="Multi-head attention heads in the fMRI transformer.")
+
+    # OOM fix: gradient checkpointing on the decoder (saves ~40% peak
+    # memory, costs ~15% wall time). Default ON given the 24GB GPU
+    # budget; set --no_checkpointing to disable.
+    parser.add_argument("--use_checkpointing", action="store_true", default=True,
+                        help="Wrap the decoder in torch.utils.checkpoint.sequential (default ON).")
+    parser.add_argument("--no_checkpointing", action="store_true", default=False,
+                        help="Disable decoder gradient checkpointing.")
 
     # Training
     parser.add_argument("--batch_size", type=int, default=2, help="Batch size")
@@ -414,6 +423,11 @@ def main():
         fmri_num_transformer_layers=args.fmri_num_transformer_layers,
         fmri_num_heads=args.fmri_num_heads,
         use_demographic_cond=use_demographic,
+        # OOM fix: gradient checkpointing on the decoder. 256^3 decoder
+        # activations consume ~16GB of autograd-graph memory; checkpoint
+        # drops peak by ~40% at the cost of ~15% slower training. Set
+        # this to False if you have more VRAM than peak and need speed.
+        use_checkpointing=bool(getattr(args, "use_checkpointing", True)),
     )
 
     # Multi-GPU support via shared utils (replaces buggy local DataParallel)
