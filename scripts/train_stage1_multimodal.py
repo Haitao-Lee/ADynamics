@@ -67,6 +67,7 @@ def _load_yaml_defaults(config_path: str) -> dict:
         (("model", "fmri_num_pool"), "fmri_num_pool"),
         (("model", "fmri_num_transformer_layers"), "fmri_num_transformer_layers"),
         (("model", "fmri_num_heads"), "fmri_num_heads"),
+        (("model", "fmri_t_target"), "fmri_t_target"),
         (("model", "use_checkpointing"), "use_checkpointing"),
         (("training", "batch_size"), "batch_size"),
         (("training", "learning_rate"), "learning_rate"),
@@ -171,6 +172,10 @@ def parse_args():
                         help="TransformerEncoder depth for fMRI temporal modeling.")
     parser.add_argument("--fmri_num_heads", type=int, default=4,
                         help="Multi-head attention heads in the fMRI transformer.")
+    parser.add_argument("--fmri_t_target", type=int, default=200,
+                        help="Number of BOLD timepoints to normalize fMRI to. "
+                             "T>target → middle segment (training: random); "
+                             "T<target → zero-pad at end.")
 
     # OOM fix: gradient checkpointing on the decoder (saves ~40% peak
     # memory, costs ~15% wall time). Default ON given the 24GB GPU
@@ -365,15 +370,27 @@ def main():
     )
     print(f"[Modality switches] optional={optional_modalities}  "
           f"demographic={use_demographic}  t1_only={bool(getattr(args, 't1_only', False))}")
+    # Per-modality target sizes from MULTI_MODAL_SPATIAL_SIZES (one entry
+    # per modality; the dataset enforces these in _resize_spatial_3d for
+    # 3D modalities and _normalize_fmri_t for 4D fMRI). fMRI's T=200
+    # is read from args.fmri_t_target with a 200 default.
+    spatial_sizes = dict(MULTI_MODAL_SPATIAL_SIZES)
+    print(f"[Per-modality target sizes] {spatial_sizes}")
+    fmri_t_target = int(getattr(args, "fmri_t_target", 200))
+    print(f"[fMRI T target] {fmri_t_target}")
     train_dataset = MultiModalDataset(
         train_data,
         transform=train_transforms,
         optional_modalities=optional_modalities,
+        spatial_sizes=spatial_sizes,
+        fmri_t_target=fmri_t_target,
     )
     val_dataset = MultiModalDataset(
         val_data,
         transform=val_transforms,
         optional_modalities=optional_modalities,
+        spatial_sizes=spatial_sizes,
+        fmri_t_target=fmri_t_target,
     )
 
     # Dataloaders

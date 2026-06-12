@@ -447,11 +447,36 @@ class MultiModalDataset(Dataset):
         >>> print(sample.keys())  # ['t1', 'fmri', 'asl', 'qsm', 'flair', 'label', 'patient_id', 'available']
     """
 
+    # Default per-modality spatial target sizes, derived from real data survey:
+    #   T1    actual (197, 233, 189) → target (256, 256, 192) — must match
+    #         the decoder output (the VAE's internal latent grid is hard-
+    #         coded to (16,16,12) and decoder_depth=4 → 16x upsample to
+    #         (256,256,192)). T1 is padded/cropped to that size so the
+    #         reconstruction loss has matching shapes.
+    #   fMRI  actual (64, 64, 34, T)  → target (64, 64, 34, 200) — keeps
+    #         native spatial (BOLD is 3.5mm), trims/pads T to 200.
+    #   ASL   actual (128, 128, 32)   → target (64, 64, 32)   — perfusion
+    #         spatial is coarse, halve for memory.
+    #   QSM   actual (256, 256, 124)  → target (128, 128, 96) — venous
+    #         detail worth keeping, halve D/H to free memory.
+    #   FLAIR actual (256, 256, 22)   → target (128, 128, 32) — only 22
+    #         slices, upsample W to 32 and halve D/H.
+    DEFAULT_SPATIAL_SIZES: Dict[str, Tuple[int, int, int]] = {
+        "t1":   (256, 256, 192),
+        "fmri": (64, 64, 34),       # 3D part of 4D fMRI
+        "asl":  (64, 64, 32),
+        "qsm":  (128, 128, 96),
+        "flair": (128, 128, 32),
+    }
+    # fMRI-specific temporal target (number of BOLD volumes to keep)
+    DEFAULT_FMRI_T_TARGET: int = 200
+
     def __init__(
         self,
         data_list: List[Dict[str, Any]],
         transform: Optional[Any] = None,
         spatial_sizes: Optional[Dict[str, Tuple[int, int, int]]] = None,
+        fmri_t_target: Optional[int] = None,
         required_modality: str = "t1",
         optional_modalities: Optional[List[str]] = None,
         preserve_temporal_dim: bool = True,
@@ -462,34 +487,114 @@ class MultiModalDataset(Dataset):
         Args:
             data_list: List of data dictionaries with modality paths and labels
             transform: MONAI transform to apply
-            spatial_sizes: Dict mapping modality -> (D, H, W). Required for ResizeWithPadOrCrop.
+            spatial_sizes: Dict mapping modality -> (D, H, W) target size.
+                If None, uses DEFAULT_SPATIAL_SIZES (per-modality, NOT all
+                forced to T1's size). This was changed from the original
+                "all modalities → (256,256,192)" because each modality's
+                physical spatial resolution is different:
+                  T1=1mm, fMRI=3.5mm, ASL≈4mm, QSM≈1mm, FLAIR≈5mm.
+                Forcing fMRI (3.5mm) to 256×256×192 wastes 10x memory on
+                artificial super-resolution.
+            fmri_t_target: Number of BOLD timepoints to normalize to. If a
+                sample has more, take the middle segment; if fewer, zero-pad
+                at the end. Default 200 (covers ~95% of files in survey).
             required_modality: The required modality (default: "t1")
-            optional_modalities: List of optional modality names (default: ["fmri", "asl", "qsm", "flair"])
-            preserve_temporal_dim: If True, 4D modalities (e.g. fMRI with time
-                                   axis) keep their time dimension and are
-                                   returned as 5D tensors [1, D, H, W, T] for
-                                   the fMRITemporalEncoder. If False, the
-                                   legacy path averages over time and returns
-                                   3D [1, D, H, W] for the static 3D encoder.
-                                   Default: True.
+            optional_modalities: List of optional modality names (default:
+                ["fmri", "asl", "qsm", "flair"])
+            preserve_temporal_dim: If True (default), 4D fMRI keeps its time
+                dimension and is returned as 5D tensor [1, D, H, W, T] for
+                the fMRITemporalEncoder. If False, time is averaged (legacy).
         """
         super().__init__(data=data_list, transform=transform)
-        self.spatial_sizes = spatial_sizes or {}
+        # Per-modality spatial targets. Each modality uses its own — see
+        # DEFAULT_SPATIAL_SIZES docstring for the survey justification.
+        self.spatial_sizes = dict(self.DEFAULT_SPATIAL_SIZES)
+        if spatial_sizes:
+            self.spatial_sizes.update(spatial_sizes)
+        self.fmri_t_target = fmri_t_target if fmri_t_target is not None else self.DEFAULT_FMRI_T_TARGET
         self.required_modality = required_modality
         self.optional_modalities = optional_modalities or ["fmri", "asl", "qsm", "flair"]
-        # Fixed target size for all modalities (to match T1 after preprocessing)
-        self.target_size = (256, 256, 192)
-        # Keep time dim for 4D modalities (fMRI BOLD) by default.
+        # Legacy attribute: target_size is T1's target (kept for any caller
+        # that still reads it). New code should use spatial_sizes["t1"].
+        self.target_size = self.spatial_sizes.get("t1", (192, 192, 160))
         self.preserve_temporal_dim = preserve_temporal_dim
+
+    def _resize_spatial_3d(self, data: np.ndarray, target_dhw: Tuple[int, int, int]) -> np.ndarray:
+        """Resize a 3D numpy array (D, H, W) to (target_D, target_H, target_W)
+        using trilinear interpolation. If shapes already match, returns as-is.
+        """
+        if data.shape == target_dhw:
+            return data
+        t = torch.from_numpy(data).unsqueeze(0).unsqueeze(0).float()  # [1, 1, D, H, W]
+        t = F.interpolate(t, size=target_dhw, mode="trilinear", align_corners=False)
+        return t.squeeze(0).squeeze(0).numpy()
+
+    def _normalize_fmri_t(self, data: np.ndarray, training: bool = True) -> np.ndarray:
+        """Normalize a 4D fMRI (D, H, W, T) tensor:
+
+        1. Resize spatial (D, H, W) to self.spatial_sizes['fmri'] (default 64,64,34).
+        2. Resample T to self.fmri_t_target (default 200):
+           - T > target: take the middle segment (deterministic, keeps
+             steady-state BOLD; drops calibration frames at start/end).
+           - T < target: zero-pad at the end.
+           - T == target: as-is.
+           - 4D: random segment during training (augmentation); middle
+             segment during eval/test (deterministic). Caller passes
+             `training` accordingly.
+        3. Per-volume (per-timepoint) z-score: for each t, subtract
+           mean over (D,H,W) and divide by std over (D,H,W). This kills
+           global BOLD drift and makes BOLD units comparable across
+           subjects / scanners.
+
+        Returns: np.ndarray of shape (D', H', W', T_target).
+        """
+        target_dhw = tuple(self.spatial_sizes["fmri"])
+        T_target = self.fmri_t_target
+
+        # Step 1: spatial resize via per-volume loop (F.interpolate doesn't
+        # accept 5D input with a different mode per dim).
+        if data.shape[:3] != target_dhw:
+            # data is (D, H, W, T). Loop over T slices.
+            T_src = data.shape[3]
+            resized = np.empty((*target_dhw, T_src), dtype=np.float32)
+            for t in range(T_src):
+                resized[..., t] = self._resize_spatial_3d(data[..., t], target_dhw)
+            data = resized
+
+        # Step 2: temporal trim or pad to T_target
+        T_src = data.shape[3]
+        if T_src > T_target:
+            if training:
+                # random crop in training for augmentation
+                max_start = T_src - T_target
+                start = int(np.random.randint(0, max_start + 1))
+            else:
+                # deterministic middle segment at eval/test
+                start = (T_src - T_target) // 2
+            data = data[..., start:start + T_target]
+        elif T_src < T_target:
+            pad = T_target - T_src
+            data = np.pad(data, ((0, 0), (0, 0), (0, 0), (0, pad)), mode="constant", constant_values=0.0)
+
+        # Step 3: per-volume z-score
+        # mean / std over (D, H, W) per timepoint, keepdims.
+        mean = data.mean(axis=(0, 1, 2), keepdims=True)  # (1, 1, 1, T)
+        std = data.std(axis=(0, 1, 2), keepdims=True) + 1e-8
+        data = (data - mean) / std
+        return data.astype(np.float32)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """
         Get a multi-modal sample.
 
+        Each modality is resized to its own target size (not forced to T1's).
+        fMRI is additionally normalized in time (trim/pad to T=200) and
+        per-volume z-scored to kill BOLD drift.
+
         Returns:
             Dictionary containing:
-                - t1: preprocessed T1 tensor
-                - other modalities as resized tensors (all to same size)
+                - t1: preprocessed T1 tensor (resize to spatial_sizes['t1'])
+                - other modalities: per-modality-sized tensors
                 - label: disease stage
                 - patient_id
                 - available_modalities: list of available modality names
@@ -516,70 +621,56 @@ class MultiModalDataset(Dataset):
                 raise
             raise FileNotFoundError(f"Cannot load T1 file: {t1_path}") from e
 
-        # Build dict for MONAI transforms
+        # Build dict for MONAI transforms (T1 only — we don't run transforms
+        # on optional modalities; their per-modality resize happens here)
         data_dict = {"t1": str(t1_path)}
 
-        # Optional modalities - load and resize to fixed size
+        # Optional modalities - per-modality resize + (fMRI) time normalization
         for mod in self.optional_modalities:
             path = data_item.get(mod)
-            if path and os.path.exists(path):
-                try:
-                    import nibabel as nib
-                    img = nib.load(str(path))
-                    data = img.get_fdata().astype(np.float32)
-                    # Skip corrupted files with zero dimensions
-                    if any(s == 0 for s in data.shape):
-                        result[mod] = None
-                        continue
-                    # Handle 4D modalities (e.g. fMRI with 220 timepoints)
-                    if data.ndim == 4:
-                        if self.preserve_temporal_dim:
-                            # New path: keep the time axis so fMRITemporalEncoder
-                            # can use the full BOLD time series. Layout on disk
-                            # is typically (D, H, W, T) — keep that order.
-                            # Output: [1, D, H, W, T] (5D)
-                            tensor = torch.from_numpy(data).unsqueeze(0)  # [1, D, H, W, T]
-                            # Resize spatial dims (D, H, W) to target; leave T alone.
-                            # We do this by reshaping to (T, 1, D, H, W), interpolate,
-                            # then reshape back.
-                            T = tensor.shape[-1]
-                            spatial = tensor.squeeze(0).permute(3, 0, 1, 2)  # [T, D, H, W]
-                            spatial = spatial.unsqueeze(0)  # [1, T, D, H, W]
-                            # Interpolate only spatial dims
-                            spatial = F.interpolate(
-                                spatial,
-                                size=(T, *self.target_size),
-                                mode="trilinear",
-                                align_corners=False,
-                            )  # [1, T, D', H', W']
-                            spatial = spatial.squeeze(0)  # [T, D', H', W']
-                            # Back to [1, D', H', W', T]
-                            tensor = spatial.permute(1, 2, 3, 0).unsqueeze(0)
-                            result[mod] = tensor
-                        else:
-                            # Legacy path: average over time, return 3D [1, D, H, W].
-                            data = data.mean(axis=-1)
-                            tensor = torch.from_numpy(data).unsqueeze(0).unsqueeze(0)  # [1, 1, D, H, W]
-                            tensor = F.interpolate(tensor, size=self.target_size, mode="trilinear", align_corners=False)
-                            tensor = tensor.squeeze(0)  # [1, D, H, W]
-                            result[mod] = tensor
-                    elif data.ndim == 3:
-                        # 3D modality (ASL/QSM/FLAIR/T1-of-another-subject) — static path
-                        tensor = torch.from_numpy(data).unsqueeze(0).unsqueeze(0)  # [1, 1, D, H, W]
-                        tensor = F.interpolate(tensor, size=self.target_size, mode="trilinear", align_corners=False)
-                        tensor = tensor.squeeze(0)  # [1, D, H, W]
-                        result[mod] = tensor
-                    else:
-                        # Unsupported rank
-                        result[mod] = None
-                        continue
-                    available_modalities.append(mod)
-                except Exception:
+            if not path or not os.path.exists(path):
+                result[mod] = None
+                continue
+            try:
+                import nibabel as nib
+                img = nib.load(str(path))
+                # Read as float32 to avoid 2x memory for float64 → cast.
+                data = np.asarray(img.dataobj, dtype=np.float32)
+                # Skip corrupted files with zero dimensions
+                if any(s == 0 for s in data.shape):
+                    print(f"[WARN] {mod} {path} has zero dim: {data.shape}")
                     result[mod] = None
-            else:
+                    continue
+
+                target_dhw = self.spatial_sizes.get(mod, self.target_size)
+
+                if mod == "fmri" and data.ndim == 4 and self.preserve_temporal_dim:
+                    # 4D fMRI: spatial resize + temporal normalize to T_target
+                    # + per-volume z-score. Returns [1, D', H', W', T_target].
+                    normalized = self._normalize_fmri_t(data, training=self.transform is not None)
+                    result[mod] = torch.from_numpy(normalized).unsqueeze(0)
+                    available_modalities.append(mod)
+                elif mod == "fmri" and data.ndim == 4 and not self.preserve_temporal_dim:
+                    # Legacy: average over time, resize spatial, return [1, D, H, W].
+                    data = data.mean(axis=-1)
+                    data = self._resize_spatial_3d(data, target_dhw)
+                    result[mod] = torch.from_numpy(data).unsqueeze(0).unsqueeze(0).squeeze(0)
+                    available_modalities.append(mod)
+                elif data.ndim == 3:
+                    # 3D modality (ASL/QSM/FLAIR or fallback for fMRI)
+                    data = self._resize_spatial_3d(data, target_dhw)
+                    result[mod] = torch.from_numpy(data).unsqueeze(0)
+                    available_modalities.append(mod)
+                else:
+                    # Unsupported rank
+                    print(f"[WARN] {mod} {path} unsupported rank {data.ndim}D shape={data.shape}")
+                    result[mod] = None
+                    continue
+            except Exception as e:
+                print(f"[WARN] failed to load {mod} {path}: {e}")
                 result[mod] = None
 
-        # Apply transforms to T1
+        # Apply MONAI transforms to T1 (resize, intensity norm, etc.)
         if self.transform is not None:
             data_dict = self.transform(data_dict)
             result["t1"] = data_dict["t1"]
@@ -693,7 +784,25 @@ def multimodal_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
                         tensors.append(v)
                 result[key] = torch.stack(tensors)
             else:
-                result[key] = None
+                # Defensive: when ALL samples in the batch lack this modality
+                # (rare; only happens with extreme class imbalance + modality
+                # dropout), fall back to a known-good shape. We default to a
+                # batch-size-1 zero tensor using the per-modality default size
+                # (T1D/T1H/T1W for 3D modalities; +T for fMRI). The trainer
+                # expects a non-None tensor so it can route through
+                # `_normalize_fmri_batch` and the model forward.
+                # We rebuild a default from the dataset class if we can find it.
+                default_shape = {
+                    "t1": (1, 192, 192, 160),
+                    "fmri": (1, 64, 64, 34, 200),
+                    "asl": (1, 64, 64, 32),
+                    "qsm": (1, 128, 128, 96),
+                    "flair": (1, 128, 128, 32),
+                }.get(key)
+                if default_shape is None:
+                    result[key] = None
+                else:
+                    result[key] = torch.zeros((len(values),) + default_shape, dtype=torch.float32)
         else:
             result[key] = values
 

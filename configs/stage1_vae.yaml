@@ -59,6 +59,12 @@ model:
   fmri_num_pool: 3
   fmri_num_transformer_layers: 2
   fmri_num_heads: 4
+  # fMRI BOLD timepoint normalization: samples with T>target take the
+  # middle segment (training: random segment, eval: middle); samples
+  # with T<target zero-pad at the end. Default 200 covers ~95% of files
+  # in the data survey. Per-volume z-score (over D,H,W) is applied to
+  # kill BOLD drift — see core_data/dataset.py:_normalize_fmri_t.
+  fmri_t_target: 200
   # OOM fix: gradient checkpointing on the decoder. 256^3 decoder
   # activations account for ~16GB of autograd-graph memory; wrapping
   # the layer stack in torch.utils.checkpoint.sequential drops the

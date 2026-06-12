@@ -158,13 +158,25 @@ def get_val_transforms(
     return val_transforms
 
 
-# Multi-modal transform sizes
+# Multi-modal transform sizes.
+# Sizes were derived from the actual data shape survey (June 2026):
+#   T1    actual (197, 233, 189) → (256, 256, 192) — MUST match decoder
+#         output (the VAE's internal latent grid is (16,16,12) and
+#         decoder_depth=4 → 16x upsample to (256,256,192)). Resize/crop
+#         the real T1 to that size so the recon loss has matching shapes.
+#   fMRI  actual (64, 64, 34, T)  → (64, 64, 34)    — 3D part; T=200 separately
+#   ASL   actual (128, 128, 32)   → (64, 64, 32)    — perfusion, half-res
+#   QSM   actual (256, 256, 124)  → (128, 128, 96)  — venous detail, half D/H
+#   FLAIR actual (256, 256, 22)   → (128, 128, 32)  — slice-thin, upsample W
+# Per-modality resize happens in MultiModalDataset._resize_spatial_3d;
+# this dict drives the MONAI transform for T1 only (which is the only
+# modality that needs intensity normalization + crop).
 MULTI_MODAL_SPATIAL_SIZES = {
-    "t1": (256, 256, 192),
-    "fmri": (34, 64, 64),
-    "asl": (128, 128, 36),
-    "qsm": (192, 192, 128),
-    "flair": (256, 256, 192),
+    "t1":   (256, 256, 192),
+    "fmri": (64, 64, 34),
+    "asl":  (64, 64, 32),
+    "qsm":  (128, 128, 96),
+    "flair": (128, 128, 32),
 }
 
 
