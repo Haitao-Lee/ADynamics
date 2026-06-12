@@ -78,6 +78,9 @@ def parse_args():
     parser.add_argument("--num_classes", type=int, default=4,
                         help="Number of disease classes (3: NC/SCD+MCI/AD, 4: NC/SCD/MCI/AD)")
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--t1_only", action="store_true",
+                        help="If set, build model with no optional modality encoders "
+                             "(matches checkpoints trained with t1_only=true)")
     # Apply YAML config defaults AFTER all add_argument calls
     # (set_defaults must come last so it isn't overridden by argparse defaults)
     parser.set_defaults(**config_defaults)
@@ -116,6 +119,10 @@ def load_data(json_path):
 
 
 def load_model(checkpoint_path, device, args):
+    # Optional-modality list is determined by training config. Default to
+    # the full multi-modal set (T1+fMRI+ASL+QSM+FLAIR); if --t1_only is
+    # passed, build with no optional encoders so checkpoint shapes match.
+    optional_modalities = [] if getattr(args, "t1_only", False) else ["fmri", "asl", "qsm", "flair"]
     model = MultiModalVAE3D(
         spatial_size=MULTI_MODAL_SPATIAL_SIZES["t1"],
         in_channels=1,
@@ -123,7 +130,7 @@ def load_model(checkpoint_path, device, args):
         base_channels=args.base_channels,
         num_classes=args.num_classes,
         decoder_depth=args.decoder_depth,
-        optional_modalities=["fmri", "asl", "qsm", "flair"],
+        optional_modalities=optional_modalities,
     )
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     sd = ckpt["model_state_dict"]

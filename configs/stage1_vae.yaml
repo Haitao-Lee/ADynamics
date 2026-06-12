@@ -19,12 +19,12 @@
 data:
   json: "./core_data/dataset_manifest_merged_v2.json"
   num_classes: 4               # 4 = NC / SCD / MCI / AD
-  use_fmri: false
-  use_asl: false
-  use_qsm: false
-  use_flair: false
+  use_fmri: true
+  use_asl: true
+  use_qsm: true
+  use_flair: true
   use_demographic: true        # add age + sex conditioning to latent (T1-only safe)
-  t1_only: true                # if true, forces all 4 above to false
+  t1_only: false               # use T1 + all 4 optional modalities
 
 # Model architecture
 model:
@@ -118,7 +118,7 @@ loss:
 
 # Output
 output:
-  dir: "./checkpoints/stage1"   # default checkpoint directory
+  dir: "./checkpoints/stage1_multimodal"   # multi-modal run (T1 + fMRI + ASL + QSM + FLAIR)
 
 # Reproducibility
 seed: 42
