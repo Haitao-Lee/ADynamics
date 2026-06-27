@@ -1009,12 +1009,6 @@ class MultiModalVAETrainer:
                 x_dict["age"] = batch["age"].to(self.device)
                 x_dict["sex"] = batch["sex"].to(self.device)
 
-            # Zero grad (set_to_none=True releases grad memory rather than
-            # zeroing the buffer, which PyTorch recommends for memory-bound
-            # workloads like 3D medical imaging at full 256^3 resolution.
-            # Saves ~30-50% of the per-parameter gradient memory.)
-            self.optimizer.zero_grad(set_to_none=True)
-
             # Forward pass
             with autocast('cuda', enabled=self.use_amp):
                 try:
@@ -1192,22 +1186,23 @@ class MultiModalVAETrainer:
                 else:
                     cls_acc = 0.0
 
-            # v11: capture per-module grad norms (cheap: sums the .grad tensors
-            # we already have). Done BEFORE optimizer.step so grads are fresh.
-            # Aggregate as running mean; final mean reported per epoch.
-            from utils.diagnostics import grad_norm_by_module
-            gn = grad_norm_by_module(
-                self.model.module if hasattr(self.model, "module") else self.model,
-            )
-            if self._grad_norm_count == 0:
-                # First batch: just store the values (they're not yet a "mean").
-                self._grad_norm_buf = dict(gn)
-            else:
-                for k, v in gn.items():
-                    self._grad_norm_buf[k] = (
-                        self._grad_norm_buf[k] * self._grad_norm_count + v
-                    ) / (self._grad_norm_count + 1)
-            self._grad_norm_count += 1
+            # v11: capture per-module grad norms (done every 5 batches to
+            # avoid overhead — iterating all parameters is ~1-2% wall time).
+            # Done BEFORE optimizer.step so grads are fresh.
+            if batch_idx % 5 == 0:
+                from utils.diagnostics import grad_norm_by_module
+                gn = grad_norm_by_module(
+                    self.model.module if hasattr(self.model, "module") else self.model,
+                )
+                if self._grad_norm_count == 0:
+                    # First batch: just store the values (they're not yet a "mean").
+                    self._grad_norm_buf = dict(gn)
+                else:
+                    for k, v in gn.items():
+                        self._grad_norm_buf[k] = (
+                            self._grad_norm_buf[k] * self._grad_norm_count + v
+                        ) / (self._grad_norm_count + 1)
+                self._grad_norm_count += 1
 
             total_loss += loss.item() * accumulation_steps  # unscale for logging
             total_recon_loss += recon_loss.item()
@@ -1234,7 +1229,11 @@ class MultiModalVAETrainer:
             del loss, recon, cls_logits, mu, logvar
             if hasattr(self.model, "module"):
                 self.model.module._last_graph = None
-            torch.cuda.empty_cache()
+            # empty_cache forces CUDA sync across all GPUs — very expensive
+            # on DataParallel. Only do it every 10 batches to prevent
+            # fragmentation without tanking throughput.
+            if batch_idx % 10 == 0:
+                torch.cuda.empty_cache()
 
         # v10: aggregate monitoring metrics
         per_class_acc = (per_class_correct / per_class_total.clamp(min=1)).tolist()
