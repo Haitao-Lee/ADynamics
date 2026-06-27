@@ -459,7 +459,11 @@ def main():
     print(f"Train: {len(train_data)}, Val: {len(val_data)}")
 
     # Precomputed cache (chunked)
-    _npy_cache = "C:/ADynamics_npy_cache" if os.path.isdir("C:/ADynamics_npy_cache") else None
+    _npy_cache = None
+    for _cache_candidate in ["./npy_cache", "C:/ADynamics_npy_cache"]:
+        if os.path.isdir(_cache_candidate):
+            _npy_cache = _cache_candidate
+            break
     _precomputed_path = None
     if _npy_cache:
         _chunked = os.path.join(_npy_cache, "precomputed")

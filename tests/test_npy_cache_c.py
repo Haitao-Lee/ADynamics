@@ -1,4 +1,4 @@
-"""Quick test: trainer finds the .npy on C: via sha1(path), not
+"""Quick test: trainer finds the .npy via sha1(path), not
 alongside the .nii.gz. Verifies data identity vs nibabel.
 """
 import os, sys, time, json, hashlib
@@ -6,7 +6,7 @@ sys.path.insert(0, r'E:\LHT_workspace\AD\ADynamics')
 os.chdir(r'E:\LHT_workspace\AD\ADynamics')
 
 # Make sure the .npy is NOT alongside the .nii.gz (we just moved them
-# all to C:). The test should still find them via the new npy_cache_dir.
+# all to the cache dir). The test should still find them via the new npy_cache_dir.
 import glob
 siblings = [f for f in glob.glob(r'E:\LHT_workspace\AD\processed_data\**\*.npy', recursive=True) if '.tmp' not in f]
 print(f'sibling .npy on E: {len(siblings)}  (should be 0 after the move)')
@@ -34,13 +34,22 @@ for item in items[:200]:
         sample = {'t1': t1, 'fmri': fmri, 'asl': asl}
         break
 t1, fmri, asl = sample['t1'], sample['fmri'], sample['asl']
-print(f't1   hash = {h(t1)}  expected at C:/ADynamics_npy_cache/{h(t1)}.npy')
-print(f'fmri hash = {h(fmri)}  expected at C:/ADynamics_npy_cache/{h(fmri)}.npy')
-print(f'asl  hash = {h(asl)}  expected at C:/ADynamics_npy_cache/{h(asl)}.npy')
 
-# Verify each cache file exists on C:
+# Detect cache directory (same logic as training scripts)
+_npy_cache = None
+for _cache_candidate in ["./npy_cache", "C:/ADynamics_npy_cache"]:
+    if os.path.isdir(_cache_candidate):
+        _npy_cache = _cache_candidate
+        break
+assert _npy_cache is not None, "No npy_cache found in ./npy_cache or C:/ADynamics_npy_cache"
+print(f'Using cache dir: {_npy_cache}')
+print(f't1   hash = {h(t1)}  expected at {_npy_cache}/{h(t1)}.npy')
+print(f'fmri hash = {h(fmri)}  expected at {_npy_cache}/{h(fmri)}.npy')
+print(f'asl  hash = {h(asl)}  expected at {_npy_cache}/{h(asl)}.npy')
+
+# Verify each cache file exists:
 for name, p in [('t1', t1), ('fmri', fmri), ('asl', asl)]:
-    cp = f'C:/ADynamics_npy_cache/{h(p)}.npy'
+    cp = f'{_npy_cache}/{h(p)}.npy'
     exists = os.path.exists(cp)
     sz = os.path.getsize(cp) if exists else 0
     print(f'  {name}: {cp}  exists={exists}  size={sz/1024**2:.1f} MB')
@@ -52,7 +61,7 @@ ds = MultiModalDataset(
     data_list=[{'t1': t1, 'fmri': fmri, 'asl': asl, 'label': 0, 'patient_id': 'test'}],
     transform=None,
     use_npy_cache=True,
-    npy_cache_dir='C:/ADynamics_npy_cache',
+    npy_cache_dir=_npy_cache,
 )
 print('\n--- Verifying T1 via npy_cache_dir ---')
 arr = ds._load_npy_cached(t1)
