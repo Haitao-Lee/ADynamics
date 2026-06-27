@@ -1,0 +1,64 @@
+{
+  "chunks": [
+    "./npy_cache\\precomputed\\chunk_00000.pt",
+    "./npy_cache\\precomputed\\chunk_00050.pt",
+    "./npy_cache\\precomputed\\chunk_00100.pt",
+    "./npy_cache\\precomputed\\chunk_00150.pt",
+    "./npy_cache\\precomputed\\chunk_00200.pt",
+    "./npy_cache\\precomputed\\chunk_00250.pt",
+    "./npy_cache\\precomputed\\chunk_00300.pt",
+    "./npy_cache\\precomputed\\chunk_00350.pt",
+    "./npy_cache\\precomputed\\chunk_00400.pt",
+    "./npy_cache\\precomputed\\chunk_00450.pt",
+    "./npy_cache\\precomputed\\chunk_00500.pt",
+    "./npy_cache\\precomputed\\chunk_00550.pt",
+    "./npy_cache\\precomputed\\chunk_00600.pt",
+    "./npy_cache\\precomputed\\chunk_00650.pt",
+    "./npy_cache\\precomputed\\chunk_00700.pt",
+    "./npy_cache\\precomputed\\chunk_00750.pt",
+    "./npy_cache\\precomputed\\chunk_00800.pt",
+    "./npy_cache\\precomputed\\chunk_00850.pt",
+    "./npy_cache\\precomputed\\chunk_00900.pt",
+    "./npy_cache\\precomputed\\chunk_00950.pt",
+    "./npy_cache\\precomputed\\chunk_01000.pt",
+    "./npy_cache\\precomputed\\chunk_01050.pt",
+    "./npy_cache\\precomputed\\chunk_01100.pt",
+    "./npy_cache\\precomputed\\chunk_01150.pt",
+    "./npy_cache\\precomputed\\chunk_01200.pt",
+    "./npy_cache\\precomputed\\chunk_01250.pt",
+    "./npy_cache\\precomputed\\chunk_01300.pt",
+    "./npy_cache\\precomputed\\chunk_01350.pt",
+    "./npy_cache\\precomputed\\chunk_01400.pt",
+    "./npy_cache\\precomputed\\chunk_01450.pt"
+  ],
+  "total": 1496,
+  "ok": 1472,
+  "errors": 24,
+  "spatial_sizes": {
+    "t1": [
+      128,
+      128,
+      128
+    ],
+    "fmri": [
+      64,
+      64,
+      34
+    ],
+    "asl": [
+      128,
+      128,
+      128
+    ],
+    "qsm": [
+      128,
+      128,
+      128
+    ],
+    "flair": [
+      128,
+      128,
+      128
+    ]
+  }
+}

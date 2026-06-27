@@ -85,7 +85,7 @@ def parse_args():
     parser.add_argument("--dropout_rate", type=float, default=0.2)
     parser.add_argument("--fmri_t_target", type=int, default=100,
                         help="fMRI temporal target (must match Stage 1)")
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--learning_rate", type=float, default=0.0001)
     parser.add_argument("--weight_decay", type=float, default=1e-5)
@@ -221,18 +221,50 @@ class ClassifierTrainer:
 
             self.optimizer.zero_grad(set_to_none=True)
 
-            with autocast('cuda', enabled=self.use_amp):
-                # Forward pass - get only classification logits
-                _, cls_logits, mu, logvar = self.model(x_dict, return_components=True)
+            # Unwrap DataParallel to get the base model
+            m = self.model.module if hasattr(self.model, 'module') else self.model
 
-                # Classification loss only. Guard against None labels —
-                # some collate paths may yield unlabeled samples.
+            with autocast('cuda', enabled=self.use_amp):
+                # Encoder is frozen — run under no_grad to avoid building
+                # the full autograd graph (saves ~60% peak memory).
+                # Only encoder + fusion is computed; decoder is skipped entirely.
+                with torch.no_grad():
+                    z_t1, z_aux_dict = m.encode(x_dict)
+
+                    # Demographic bias
+                    demo_bias = None
+                    if m.use_demographic_cond:
+                        age = x_dict.get("age")
+                        sex = x_dict.get("sex")
+                        if age is not None and sex is not None:
+                            demo_bias = m._demographic_bias(age, sex, z_t1.shape[0])
+                            demo_bias = demo_bias.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+
+                    # Fusion (T1-centric or legacy)
+                    if m.use_t1_centric_fusion:
+                        mu = m.t1_centric_fusion(z_t1, z_aux_dict, demo_bias=demo_bias)
+                    else:
+                        latent_list = [z_t1]
+                        for mod_name in m.optional_modalities:
+                            if mod_name in z_aux_dict and z_aux_dict[mod_name] is not None:
+                                latent_list.append(z_aux_dict[mod_name])
+                            else:
+                                latent_list.append(torch.zeros_like(z_t1))
+                        z_concat = torch.cat(latent_list, dim=1)
+                        mu = m.fusion_proj(z_concat)
+
+                # Classifier head — trainable, needs gradients
+                # mu is detached from no_grad, but classifier weights have
+                # requires_grad=True, so backward computes classifier gradients.
+                cls_logits = m.classify_latent(mu)
+
+                # Classification loss only. Guard against None labels.
                 if labels is not None:
                     cls_loss = F.cross_entropy(cls_logits, labels)
                 else:
                     cls_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
 
-                # Per-class accuracy (only meaningful when labels present)
+                # Per-class accuracy
                 if labels is not None:
                     preds = cls_logits.argmax(dim=1)
                     acc = (preds == labels).float().mean()
@@ -259,8 +291,7 @@ class ClassifierTrainer:
             pbar.set_postfix({"loss": f"{loss.item():.4f}", "acc": f"{acc.item() if isinstance(acc, torch.Tensor) else acc:.4f}"})
 
             # OOM fix: release the per-batch autograd graph + activations.
-            # recon (50MB) and mu/logvar graphs linger otherwise.
-            del loss, cls_logits, mu, logvar
+            del loss, cls_logits, mu
             torch.cuda.empty_cache()
 
         return {
