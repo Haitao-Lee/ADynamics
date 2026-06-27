@@ -106,7 +106,7 @@ model:
   # with T<target zero-pad at the end. Default 200 covers ~95% of files
   # in the data survey. Per-volume z-score (over D,H,W) is applied to
   # kill BOLD drift — see core_data/dataset.py:_normalize_fmri_t.
-  fmri_t_target: 100
+  fmri_t_target: 60
   # OOM fix: gradient checkpointing on the decoder. 256^3 decoder
   # activations account for ~16GB of autograd-graph memory; wrapping
   # the layer stack in torch.utils.checkpoint.sequential drops the
@@ -116,7 +116,7 @@ model:
 
 # Training hyperparameters
 training:
-  batch_size: 2                # TOTAL batch size (DataParallel scatter 2 per GPU)
+  batch_size: 4                # TOTAL batch size (DataParallel scatter 2 per GPU)
   learning_rate: 0.00003
   weight_decay: 0.00001
   epochs: 300
