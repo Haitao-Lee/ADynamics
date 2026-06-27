@@ -1,0 +1,131 @@
+{
+  "source_manifest": "core_data/dataset_manifest_merged_v2.json",
+  "backup_manifest": "core_data/dataset_manifest_merged_v2.json.bak_20260612_152134",
+  "new_manifest": "core_data/dataset_manifest_merged_v2_fmri_origin.json",
+  "origin_dir": "E:\\LHT_workspace\\AD\\processed_data\\fMRI\\origin",
+  "stats": {
+    "total_records": 1496,
+    "fmri_swapped": 328,
+    "skipped_ambiguous": 7,
+    "skipped_no_match": 0,
+    "skipped_empty_pid_or_fmri": 1161
+  },
+  "ambiguous_pids": [
+    {
+      "patient_id": "0_2_1",
+      "candidate_count": 11,
+      "candidates": [
+        "0_2_10_zhou_yu_zhong_0002275496_35807_dup1_010_fmri_8ch_mp_rest_dup1.nii.gz",
+        "0_2_11_cui_jin_rong_ad2015112811_36028_dup1_011_fmri_8ch_mp_rest_dup1.nii.gz",
+        "0_2_12_zhao_mei_ling_ad2015112912_36048_dup1_009_fmri_8ch_mp_rest_dup1.nii.gz"
+      ]
+    },
+    {
+      "patient_id": "0_2_2",
+      "candidate_count": 11,
+      "candidates": [
+        "0_2_20_su_ying_lin_0002473990_36792_dup1_013_fmri_8ch_mp_rest_dup1.nii.gz",
+        "0_2_21_wang_dao_fan_0002643418_37047_dup1_009_fmri_8ch_mp_rest_dup1.nii.gz",
+        "0_2_22_zhao_li_0000345487_37476_dup1_009_fmri_8ch_mp_rest_dup1.nii.gz"
+      ]
+    },
+    {
+      "patient_id": "0_2_3",
+      "candidate_count": 11,
+      "candidates": [
+        "0_2_30_wang_xiao_zhong_0001997331_38174_dup1_006_fmri_8ch_mp_rest_dup1.nii.gz",
+        "0_2_31_wang_xin_fu_0002257604_38175_dup1_007_fmri_8ch_mp_rest_dup1.nii.gz",
+        "0_2_32_ye_zhi_ming_0000185312_38185_dup1_009_fmri_8ch_mp_rest_dup1.nii.gz"
+      ]
+    },
+    {
+      "patient_id": "0_2_4",
+      "candidate_count": 10,
+      "candidates": [
+        "0_2_40_shao_bu_lan_0001213608_38813_dup1_012_fmri_8ch_mp_rest_dup1.nii.gz",
+        "0_2_41_tang_shu_zhuang_0001199368_38814_dup1_006_fmri_8ch_mp_rest_dup1.nii.gz",
+        "0_2_43_dong_shu_hua_0000505863_39087_dup1_010_fmri_8ch_mp_rest_dup1.nii.gz"
+      ]
+    },
+    {
+      "patient_id": "0_2_5",
+      "candidate_count": 11,
+      "candidates": [
+        "0_2_50_li_cui_e_0002825905_41385_dup1_006_fmri_8ch_mp_rest_dup1.nii.gz",
+        "0_2_51_chen_ming_xin_0002821271_41560_dup1_009_fmri_8ch_mp_rest_dup1.nii.gz",
+        "0_2_52_weng_tong_0000637213_41561_dup1_006_fmri_8ch_mp_rest_dup1.nii.gz"
+      ]
+    },
+    {
+      "patient_id": "0_2_6",
+      "candidate_count": 11,
+      "candidates": [
+        "0_2_60_han_qi_hua_0002157134_46124_dup1_007_fmri_8ch_mp_rest_dup1.nii.gz",
+        "0_2_61_zhao_mei_ling_0001657793_46125_dup1_007_fmri_8ch_mp_rest_dup1.nii.gz",
+        "0_2_62_zhang_shu_dong_0003004657_46449_dup1_007_fmri_8ch_mp_rest_dup1.nii.gz"
+      ]
+    },
+    {
+      "patient_id": "0_2_7",
+      "candidate_count": 6,
+      "candidates": [
+        "0_2_70_ye_you_hua_2017040405_2885_012_fmri_8ch_mp_rest_dup1.nii.gz",
+        "0_2_71_xu_chang_yu_vip201705071_4357_dup1_013_fmri_8ch_mp_rest_dup1.nii.gz",
+        "0_2_72_han_rui_yun_ad2017060101_5643_dup1_013_fmri_8ch_mp_rest_dup1.nii.gz"
+      ]
+    }
+  ],
+  "unmatched_pids": [],
+  "first_10_swaps": [
+    {
+      "patient_id": "0_0_sub001",
+      "old_fmri": "E:\\LHT_workspace\\AD\\processed_data\\fMRI\\Motion_correction\\0_0_sub001.nii.gz",
+      "new_fmri": "E:\\LHT_workspace\\AD\\processed_data\\fMRI\\origin\\0_0_sub001_009_fmri_8ch_mp_rest.nii.gz"
+    },
+    {
+      "patient_id": "0_0_sub002",
+      "old_fmri": "E:\\LHT_workspace\\AD\\processed_data\\fMRI\\Motion_correction\\0_0_sub002.nii.gz",
+      "new_fmri": "E:\\LHT_workspace\\AD\\processed_data\\fMRI\\origin\\0_0_sub002_010_fmri_8ch_mp_rest.nii.gz"
+    },
+    {
+      "patient_id": "0_0_sub003",
+      "old_fmri": "E:\\LHT_workspace\\AD\\processed_data\\fMRI\\Motion_correction\\0_0_sub003.nii.gz",
+      "new_fmri": "E:\\LHT_workspace\\AD\\processed_data\\fMRI\\origin\\0_0_sub003_009_fmri_8ch_mp_rest.nii.gz"
+    },
+    {
+      "patient_id": "0_0_sub004",
+      "old_fmri": "E:\\LHT_workspace\\AD\\processed_data\\fMRI\\Motion_correction\\0_0_sub004.nii.gz",
+      "new_fmri": "E:\\LHT_workspace\\AD\\processed_data\\fMRI\\origin\\0_0_sub004_010_fmri_8ch_mp_rest.nii.gz"
+    },
+    {
+      "patient_id": "0_0_sub005",
+      "old_fmri": "E:\\LHT_workspace\\AD\\processed_data\\fMRI\\Motion_correction\\0_0_sub005.nii.gz",
+      "new_fmri": "E:\\LHT_workspace\\AD\\processed_data\\fMRI\\origin\\0_0_sub005_009_fmri_8ch_mp_rest.nii.gz"
+    },
+    {
+      "patient_id": "0_0_sub006",
+      "old_fmri": "E:\\LHT_workspace\\AD\\processed_data\\fMRI\\Motion_correction\\0_0_sub006.nii.gz",
+      "new_fmri": "E:\\LHT_workspace\\AD\\processed_data\\fMRI\\origin\\0_0_sub006_009_fMRI_8CH_MP_rest.nii.gz"
+    },
+    {
+      "patient_id": "0_0_sub007",
+      "old_fmri": "E:\\LHT_workspace\\AD\\processed_data\\fMRI\\Motion_correction\\0_0_sub007.nii.gz",
+      "new_fmri": "E:\\LHT_workspace\\AD\\processed_data\\fMRI\\origin\\0_0_sub007_009_fmri_8ch_mp_rest_dup1_dup1.nii.gz"
+    },
+    {
+      "patient_id": "0_0_sub008",
+      "old_fmri": "E:\\LHT_workspace\\AD\\processed_data\\fMRI\\Motion_correction\\0_0_sub008.nii.gz",
+      "new_fmri": "E:\\LHT_workspace\\AD\\processed_data\\fMRI\\origin\\0_0_sub008_009_fmri_8ch_mp_rest_dup1.nii.gz"
+    },
+    {
+      "patient_id": "0_0_sub010",
+      "old_fmri": "E:\\LHT_workspace\\AD\\processed_data\\fMRI\\Motion_correction\\0_0_sub010.nii.gz",
+      "new_fmri": "E:\\LHT_workspace\\AD\\processed_data\\fMRI\\origin\\0_0_sub010_009_fmri_8ch_mp_rest_dup1.nii.gz"
+    },
+    {
+      "patient_id": "0_0_sub011",
+      "old_fmri": "E:\\LHT_workspace\\AD\\processed_data\\fMRI\\Motion_correction\\0_0_sub011.nii.gz",
+      "new_fmri": "E:\\LHT_workspace\\AD\\processed_data\\fMRI\\origin\\0_0_sub011_009_fmri_8ch_mp_rest_dup1.nii.gz"
+    }
+  ]
+}

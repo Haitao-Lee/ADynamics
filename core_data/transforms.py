@@ -172,7 +172,7 @@ def get_val_transforms(
 # this dict drives the MONAI transform for T1 only (which is the only
 # modality that needs intensity normalization + crop).
 MULTI_MODAL_SPATIAL_SIZES = {
-    "t1":   (256, 256, 192),
+    "t1":   (128, 128, 128),
     "fmri": (64, 64, 34),
     "asl":  (64, 64, 32),
     "qsm":  (128, 128, 96),
@@ -200,13 +200,46 @@ def get_multimodal_train_transforms(
         spatial_sizes = MULTI_MODAL_SPATIAL_SIZES
 
     # T1 transforms (full pipeline)
-    t1_size = spatial_sizes.get("t1", (256, 256, 192))
+    t1_size = spatial_sizes.get("t1", (128, 128, 128))
     t1_transforms = Compose([
         LoadImaged(keys=["t1"], reader="NibabelReader"),
         EnsureChannelFirstd(keys=["t1"]),
         Orientationd(keys=["t1"], axcodes="RAS"),
         CropForegroundd(keys=["t1"], source_key="t1", margin_cut=0),
         Spacingd(keys=["t1"], pixdim=(1.0, 1.0, 1.0), mode="bilinear", align_corners=False),
+        ScaleIntensityRangePercentilesd(keys=["t1"], lower=0.5, upper=99.5, b_min=0.0, b_max=1.0, relative=False),
+        ResizeWithPadOrCropd(keys=["t1"], spatial_size=t1_size, mode="constant"),
+    ])
+
+    return t1_transforms
+
+
+def get_multimodal_train_transforms_safe(
+    spatial_sizes: Optional[Dict[str, Sequence[int]]] = None,
+) -> Compose:
+    """
+    A more robust version of get_multimodal_train_transforms that skips
+    Spacingd and CropForegroundd (which fail on some samples where the
+    brain mask collapses to 0×0×0). The trade-off: no resampling to
+    1mm isotropic, no foreground cropping. Use this when the multi-modality
+    data is already preprocessed (manifest paths point to preprocessed NIfTI).
+
+    Only does:
+      - LoadImaged
+      - EnsureChannelFirstd
+      - Orientationd (RAS)
+      - ScaleIntensityRangePercentilesd
+      - ResizeWithPadOrCropd
+    """
+    if spatial_sizes is None:
+        from core_data.transforms import MULTI_MODAL_SPATIAL_SIZES as _sizes
+        spatial_sizes = _sizes
+
+    t1_size = spatial_sizes.get("t1", (128, 128, 128))
+    t1_transforms = Compose([
+        LoadImaged(keys=["t1"], reader="NibabelReader"),
+        EnsureChannelFirstd(keys=["t1"]),
+        Orientationd(keys=["t1"], axcodes="RAS"),
         ScaleIntensityRangePercentilesd(keys=["t1"], lower=0.5, upper=99.5, b_min=0.0, b_max=1.0, relative=False),
         ResizeWithPadOrCropd(keys=["t1"], spatial_size=t1_size, mode="constant"),
     ])

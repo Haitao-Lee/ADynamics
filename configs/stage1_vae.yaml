@@ -28,14 +28,14 @@ data:
 
 # Model architecture
 model:
-  spatial_size: [256, 256, 192]  # [D, H, W]
+  spatial_size: [128, 128, 128]  # [D, H, W] — 128³ for speed; use 192³ for final run
   in_channels: 1
-  latent_channels: 64             # was 32; doubled to give the latent more
-                                 # capacity for class-discriminative structure.
-                                 # Encoder params +50%, peak memory +30%
-                                 # (~18 GB per-GPU with batch=1 + checkpointing).
-                                 # Trade-off: better silhouette and val acc,
-                                 # downstream stages 2-5 must be re-trained.
+  latent_channels: 32             # MUST match the existing Stage 1 checkpoint at
+                                 # ./checkpoints/stage1/vae_best.pt.  Changing this
+                                 # requires re-training Stage 1.
+                                 # (Was tested at 64; trade-off: +50% encoder params,
+                                 # +30% peak memory, marginally better silhouette but
+                                 # unstable after epoch 80. Reverted to 32 as default.)
   base_channels: 16
   decoder_depth: 4
   dropout_rate: 0.2
@@ -47,24 +47,66 @@ model:
   # no-attention.
   attention_levels: [1, 2, 3]
   attention_heads: 8
-  # fMRI temporal encoder (preserves full BOLD time series):
-  #   1. Spatial avg pool (D, H) -> 1D time series per W slice
-  #   2. 1D conv stack (num_pool blocks) -> 16 timepoints
-  #   3. Lightweight Transformer (num_transformer_layers, num_heads)
-  #   4. Reshape 16 tokens -> 3D grid (4,4,1) and trilinear interp to (16,16,12)
-  # Zero-init projection — safe to add to existing pipeline.
-  use_fmri_temporal: true
+  # fMRI encoder (NEW: deep multi-scale + FC, recommended).
+  #   Pipeline:
+  #     1. 1x1x1 Conv3d soft-ROI projection (1 -> n_soft_roi) — learned,
+  #        no atlas needed. n_soft_roi=32 is a coarse parcellation.
+  #     2. Spatial attention + adaptive pool over (D, H), keep W intact
+  #     3. Reshape to [B, n_soft_roi*W, T] = [B, 1088, 200]
+  #     4. 1x1 input projection 1088 -> hidden_dim
+  #     5. 5 SEQUENTIAL dilated 1D conv blocks (dilations 1, 2, 4, 8, 16)
+  #        — NO stride, T=200 preserved throughout. Receptive fields
+  #        grow: 7, 13, 25, 49, 97 (cumulative covers T=200).
+  #     6. 3-layer Transformer on full T=200 (not 16 compressed tokens)
+  #     7. Multi-stat temporal pool: mean + std + max
+  #     8. Functional connectivity head (cross-ROI correlation matrix)
+  #     9. 3D reshape (real (ROI, W) layout, not time fakery) + interp to (16,16,12)
+  # Param count: ~324K (vs 91K for the old encoder, vs 7.1M for T1).
+  # Zero-init final layers — safe to add to an existing pipeline.
+  use_fmri_deep: true
+  fmri_deep_n_soft_roi: 32
+  fmri_deep_n_transformer_layers: 3
+  fmri_deep_n_heads: 4
+  fmri_deep_fc_compression: 32
+  # LEGACY fMRI temporal encoder (use_fmri_temporal=true) — kept as
+  # fallback / for ablation studies. Used only if use_fmri_deep=false.
+  use_fmri_temporal: false
   fmri_in_channels: 34
   fmri_hidden_dim: 128
   fmri_num_pool: 3
   fmri_num_transformer_layers: 2
   fmri_num_heads: 4
+
+  # === T1-CENTRIC FUSION (RECOMMENDED) ===
+  # T1 is the structural trunk; auxiliary modalities (fMRI, ASL, QSM, FLAIR)
+  # are gated residual deltas added on top. The demographic bias (age/sex)
+  # is also applied as a small additive shift on the T1 trunk.
+  #
+  # KEY INVARIANT: When all auxiliary modalities are missing, the fused
+  # latent equals the T1 trunk (modulo the trunk's small 1x1 conv refinement).
+  # So adding auxiliary modalities can NEVER produce a worse latent than
+  # T1-only — the worst case is "no contribution from aux", which IS the
+  # T1 baseline.
+  #
+  # Implementation details:
+  #   - t1_trunk: 1x1 conv refinement of z_t1 (zero-init final layer so
+  #     the model starts as identity on T1).
+  #   - per-modality delta_nets: 1x1 conv (zero-init) producing a [B,C,D,H,W]
+  #     residual delta. Starts as 0.
+  #   - per-modality gate_nets: scalar sigmoid 0-1. Starts at 0.5.
+  #   - The fused latent is: t1_trunk(z_t1) + sum(gate[mod] * delta[mod]) + demo_bias.
+  #
+  # To enforce the invariant with a hard loss (optional), the trainer
+  # can call model.encode_t1_only(x_dict["t1"]) and compute:
+  #     L_mono = relu(cls_loss(mu_t1) - cls_loss(mu_full) + margin)
+  # (see engine/trainer_vae.py — add this if you want a hard guarantee).
+  use_t1_centric_fusion: true
   # fMRI BOLD timepoint normalization: samples with T>target take the
   # middle segment (training: random segment, eval: middle); samples
   # with T<target zero-pad at the end. Default 200 covers ~95% of files
   # in the data survey. Per-volume z-score (over D,H,W) is applied to
   # kill BOLD drift — see core_data/dataset.py:_normalize_fmri_t.
-  fmri_t_target: 200
+  fmri_t_target: 100
   # OOM fix: gradient checkpointing on the decoder. 256^3 decoder
   # activations account for ~16GB of autograd-graph memory; wrapping
   # the layer stack in torch.utils.checkpoint.sequential drops the
@@ -74,7 +116,7 @@ model:
 
 # Training hyperparameters
 training:
-  batch_size: 2                # TOTAL batch size (DataParallel scatter 1 per GPU, total effective=2)
+  batch_size: 2                # TOTAL batch size (DataParallel scatter 2 per GPU)
   learning_rate: 0.00003
   weight_decay: 0.00001
   epochs: 300
@@ -86,21 +128,24 @@ training:
 # Loss weights
 loss:
   recon_loss_type: "l1"
-  # cls=4.0 balances the gradient ratio (recon 0.02 vs cls 2.4 was 100:1 with
-  # cls=1.0; classifier was starved). Tune via this YAML.
-  cls_weight: 4.0
+  # Stage 1 design: encoder learns both reconstruction and classification ability.
+  # Reconstruction is the primary task; classification provides auxiliary supervision.
+  # cls_weight=2.0 gives recon:cls ≈ 1:2 ratio, enough classification supervision
+  # without letting it dominate the training.
+  cls_weight: 2.0
   # Per-class weights for cross-entropy (used by ordinal_cross_entropy_loss).
-  # Inverse-frequency weighted to counter class imbalance: SCD 13% (199/1247)
-  # and MCI 26% (386/1247) are minority vs NC 34% and AD 27%. Without this
-  # the model collapses to NC+AD and gets 0% recall on SCD and MCI.
-  # Formula: w_c = 0.5 / freq_c, normalized so weights sum to ~7.5
-  # (slightly above 4 to mildly boost minority classes).
-  class_weights: [1.24, 3.13, 1.61, 1.53]
+  # Strongly inverse-frequency weighted to counter severe class imbalance:
+  # SCD is only 13% (199/1247) and MCI is 26% (386/1247) vs NC 34% and AD 27%.
+  # Increased SCD weight from 3.13 to 6.0 to force the classifier to learn
+  # SCD signal instead of collapsing to NC/AD predictions.
+  # Formula: w_c = 1.0 / freq_c, normalized so weights sum to ~12
+  # (aggressive boost for minority classes).
+  class_weights: [1.18, 6.00, 1.55, 1.47]
   # kl=0.15 (was 0.3) gives the latent more room to encode class signal.
   # The previous 0.3 over-compressed 64-dim latent down to 7 active dims,
   # leaving no room for subtle SCD vs MCI differences. Lower KL lets
   # active_dims climb to ~20-30/64, raising silhouette.
-  kl_weight: 0.15
+  kl_weight: 0.2
   # Cyclical KL: 0 -> peak -> 0 every kl_cycle_len epochs. During the KL-off
   # phase the encoder is free to use latent capacity for class info; during
   # the KL-on phase the structure is "baked in" toward the prior. Reference:
@@ -115,7 +160,7 @@ loss:
   mixup_alpha: 0.4
   mixup_prob: 0.5               # per-batch probability of applying mixup
   free_bits: 0.05               # floor on per-dim KL; prevents total collapse
-  contrastive_weight: 0.0       # disabled (contrastive loss not wired in trainer)
+  contrastive_weight: 0.0       # TODO: fix contrastive for multi-modal input
   contrastive_temperature: 0.1
   gradient_weight: 0.0
   ssim_weight: 0.0

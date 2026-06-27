@@ -932,7 +932,7 @@
     "flair": "E:\\LHT_workspace\\AD\\processed_data\\T2Flair\\origin\\0_2_17_han_rui_yun_0000162252_36563_dup1_004_axt2flair_dup1.nii.gz",
     "age": 72.0,
     "sex": 2,
-    "fmri": null
+    "fmri": "E:\\LHT_workspace\\AD\\processed_data\\fMRI\\origin\\0_2_17_han_rui_yun_0000162252_36563_dup1_012_fmri_8ch_mp_rest_dup1.nii.gz"
   },
   {
     "patient_id": "0_2_18",
@@ -1116,7 +1116,7 @@
     "flair": "E:\\LHT_workspace\\AD\\processed_data\\T2Flair\\origin\\0_2_32_ye_zhi_ming_0000185312_38185_dup1_004_axt2flair_dup1.nii.gz",
     "age": 78.0,
     "sex": 2,
-    "fmri": null
+    "fmri": "E:\\LHT_workspace\\AD\\processed_data\\fMRI\\origin\\0_2_32_ye_zhi_ming_0000185312_38185_dup1_009_fmri_8ch_mp_rest_dup1.nii.gz"
   },
   {
     "patient_id": "0_2_33",

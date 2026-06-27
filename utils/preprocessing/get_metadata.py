@@ -4,24 +4,26 @@ import pandas as pd
 
 def get_metadata(input: str, suffix: str = ".nii.gz"):
     """
-    获取NIfTI文件的元数据信息，如果输入路径是文件夹，筛选所有符合后缀的文件，并将信息保存为xlsx文件。
+    Extract metadata from NIfTI files. If input path is a directory, filters all
+    files with the given suffix and saves metadata to an xlsx file.
 
-    参数:
-    input (str): 输入文件或文件夹路径
-    suffix (str): 要筛选的文件后缀，默认为 ".nii.gz"
-    
-    返回:
-    None
+    Args:
+        input (str): Input file or directory path
+        suffix (str): File suffix to filter, default ".nii.gz"
+
+    Returns:
+        None (saves to xlsx for directory input)
+        dict (metadata for single file input)
     """
-    # 判断输入是文件夹还是文件
+    # Check if input is directory or file
     if os.path.isdir(input):
-        # 如果是文件夹，遍历文件夹中所有符合后缀的文件
+        # If directory, iterate all files with the given suffix
         file_list = [f for f in os.listdir(input) if f.endswith(suffix)]
         if not file_list:
             print(f"No files with suffix '{suffix}' found in directory {input}")
             return
-        
-        # 收集所有文件的元数据
+
+        # Collect metadata for all files
         metadata = []
         for file in file_list:
             file_path = os.path.join(input, file)
@@ -37,14 +39,14 @@ def get_metadata(input: str, suffix: str = ".nii.gz"):
             except Exception as e:
                 print(f"Error reading {file_path}: {e}")
 
-        # 将元数据存储到xlsx文件
+        # Save metadata to xlsx file
         metadata_df = pd.DataFrame(metadata)
         output_file = os.path.join(input, "metadata.xlsx")
         metadata_df.to_excel(output_file, index=False)
         print(f"Metadata saved to {output_file}")
-    
+
     elif os.path.isfile(input):
-        # 如果是文件，直接返回文件的元数据信息
+        # If single file, return metadata directly
         try:
             img = sitk.ReadImage(input)
             metadata = {

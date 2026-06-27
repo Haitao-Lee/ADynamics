@@ -65,6 +65,7 @@ def parse_args():
         (("training", "early_stopping_patience"), "early_stopping"),
         (("training", "num_gpus"), "num_gpus"),
         (("training", "use_amp"), "use_amp"),
+        (("model", "fmri_t_target"), "fmri_t_target"),
         (("output", "dir"), "output_dir"),
         (("seed",), "seed"),
     ]
@@ -74,7 +75,7 @@ def parse_args():
     parser.add_argument("--json", type=str, default="./core_data/dataset_manifest_merged_v2.json")
     parser.add_argument("--output_dir", type=str, default="./checkpoints/stage2_classifier")
     parser.add_argument("--checkpoint", type=str,
-                        default="./checkpoints/stage1_multimodal/vae_best.pt",
+                        default="./checkpoints/stage1/vae_best.pt",
                         help="Path to Stage 1 checkpoint (encoder weights)")
     parser.add_argument("--latent_channels", type=int, default=32)
     parser.add_argument("--base_channels", type=int, default=16)
@@ -82,6 +83,8 @@ def parse_args():
     parser.add_argument("--num_classes", type=int, default=4,
                         help="Number of disease classes (3: NC/SCD+MCI/AD, 4: NC/SCD/MCI/AD)")
     parser.add_argument("--dropout_rate", type=float, default=0.2)
+    parser.add_argument("--fmri_t_target", type=int, default=100,
+                        help="fMRI temporal target (must match Stage 1)")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--learning_rate", type=float, default=0.0001)
@@ -169,9 +172,7 @@ class ClassifierTrainer:
         self.output_dir = output_dir
         self.scaler = GradScaler() if use_amp else None
 
-        # Freeze entire encoder (all encoder + fusion + logvar layers)
-        self._freeze_encoder()
-        # Verify classifier is trainable
+        # Freeze logic is in main() before optimizer creation
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         total = sum(p.numel() for p in model.parameters())
         print(f"Trainable params: {trainable:,} / {total:,} ({trainable/total*100:.1f}%)")
@@ -180,17 +181,6 @@ class ClassifierTrainer:
         self.current_epoch = 0
         self._best_epoch = 0  # Initialize for early stopping tracking
         self.class_total = {c: 0 for c in range(num_classes)}  # For per-class accuracy reporting
-
-    def _freeze_encoder(self) -> None:
-        """Freeze all encoder parameters."""
-        frozen = 0
-        for name, param in self.model.named_parameters():
-            if "classifier" not in name:
-                param.requires_grad = False
-                frozen += param.numel()
-            else:
-                print(f"  Trainable: {name}")
-        print(f"Frozen {frozen:,} encoder parameters")
 
     def train_epoch(self) -> dict:
         self.model.train()
@@ -205,13 +195,20 @@ class ClassifierTrainer:
         for batch_idx, batch in pbar:
             t1 = batch["t1"].to(self.device)
             x_dict = {"t1": t1}
+
+            # Use available_modalities to skip zero-filled missing modalities
+            batch_avail = batch.get("available_modalities", None)
+            if batch_avail and isinstance(batch_avail[0], (list, tuple)):
+                avail_set = set(batch_avail[0])
+                for av in batch_avail[1:]:
+                    avail_set &= set(av)
+            else:
+                avail_set = {"fmri", "asl", "qsm", "flair"}
+
             for mod in ["fmri", "asl", "qsm", "flair"]:
-                if mod in batch and batch[mod] is not None:
+                if mod in avail_set and mod in batch and batch[mod] is not None:
                     mod_tensor = batch[mod].to(self.device)
                     if mod == "fmri":
-                        # Plan C: dataset may return 5D fMRI (preserve_temporal_dim=True).
-                        # Normalize to 6D so the model's fMRITemporalEncoder gets a
-                        # consistent shape regardless of preserve_temporal_dim.
                         from utils.stage23_compat import normalize_fmri_batch
                         mod_tensor = normalize_fmri_batch(mod_tensor)
                     x_dict[mod] = mod_tensor
@@ -289,13 +286,20 @@ class ClassifierTrainer:
         for batch_idx, batch in pbar:
             t1 = batch["t1"].to(self.device)
             x_dict = {"t1": t1}
+
+            # Use available_modalities to skip zero-filled missing modalities
+            batch_avail = batch.get("available_modalities", None)
+            if batch_avail and isinstance(batch_avail[0], (list, tuple)):
+                avail_set = set(batch_avail[0])
+                for av in batch_avail[1:]:
+                    avail_set &= set(av)
+            else:
+                avail_set = {"fmri", "asl", "qsm", "flair"}
+
             for mod in ["fmri", "asl", "qsm", "flair"]:
-                if mod in batch and batch[mod] is not None:
+                if mod in avail_set and mod in batch and batch[mod] is not None:
                     mod_tensor = batch[mod].to(self.device)
                     if mod == "fmri":
-                        # Plan C: dataset may return 5D fMRI (preserve_temporal_dim=True).
-                        # Normalize to 6D so the model's fMRITemporalEncoder gets a
-                        # consistent shape regardless of preserve_temporal_dim.
                         from utils.stage23_compat import normalize_fmri_batch
                         mod_tensor = normalize_fmri_batch(mod_tensor)
                     x_dict[mod] = mod_tensor
@@ -443,6 +447,10 @@ def main():
     data_list = load_data(args.json)
     print(f"Total samples: {len(data_list)}")
 
+    # Store manifest index for precomputed cache lookup
+    for i, item in enumerate(data_list):
+        item["_manifest_idx"] = i
+
     # Remap 4-class labels to 3-class (SCD+MCI merged) if needed
     if args.num_classes == 3:
         from utils.config_loader import remap_labels_3class
@@ -458,8 +466,21 @@ def main():
     )
     print(f"Train: {len(train_data)}, Val: {len(val_data)}")
 
-    train_dataset = MultiModalDataset(train_data, transform=train_transforms)
-    val_dataset = MultiModalDataset(val_data, transform=val_transforms)
+    # Precomputed cache (chunked, shared with Stage 1)
+    _npy_cache = "C:/ADynamics_npy_cache" if os.path.isdir("C:/ADynamics_npy_cache") else None
+    _precomputed_path = None
+    if _npy_cache:
+        _chunked = os.path.join(_npy_cache, "precomputed")
+        if os.path.isdir(_chunked) and os.path.exists(os.path.join(_chunked, "index.json")):
+            _precomputed_path = _chunked
+
+    fmri_t_target = int(getattr(args, "fmri_t_target", 100))
+    train_dataset = MultiModalDataset(train_data, transform=train_transforms,
+                                      precomputed_path=_precomputed_path,
+                                      fmri_t_target=fmri_t_target)
+    val_dataset = MultiModalDataset(val_data, transform=val_transforms,
+                                    precomputed_path=_precomputed_path,
+                                    fmri_t_target=fmri_t_target)
 
     from core_data.dataset import multimodal_collate_fn
     train_loader = DataLoader(
@@ -471,7 +492,8 @@ def main():
     val_loader = DataLoader(
         val_dataset, batch_size=args.batch_size, shuffle=False,
         num_workers=0, pin_memory=torch.cuda.is_available(),
-        collate_fn=multimodal_collate_fn
+        collate_fn=multimodal_collate_fn,
+        drop_last=True,  # avoid incomplete last batch with DataParallel
     )
 
     # Load model from Stage 1 checkpoint
@@ -487,7 +509,9 @@ def main():
         dropout_rate=args.dropout_rate,
         decoder_depth=args.decoder_depth,
         optional_modalities=optional_modalities,
+        use_fmri_deep=True,
         use_demographic_cond=resolve_use_demographic(args),
+        fmri_t_target=fmri_t_target,
     )
 
     print(f"Loading encoder from {args.checkpoint}")
@@ -504,13 +528,25 @@ def main():
     model = model.to(device)
     print(f"Model loaded from Stage 1 checkpoint")
 
-    # Multi-GPU: wrap encoder with DataParallel
+    # Freeze ALL encoder parameters, only train classifier head
+    frozen = 0
+    trainable = 0
+    for name, param in model.named_parameters():
+        if "classifier" in name:
+            param.requires_grad = True
+            trainable += param.numel()
+        else:
+            param.requires_grad = False
+            frozen += param.numel()
+    print(f"Frozen: {frozen:,} | Trainable: {trainable:,} ({trainable/(frozen+trainable)*100:.1f}%)")
+
+    # Multi-GPU: wrap with DataParallel
     from utils.multi_gpu import setup_data_parallel
     import torch as _torch
     print(f"[DEBUG] args.num_gpus = {args.num_gpus}, cuda.device_count = {_torch.cuda.device_count() if _torch.cuda.is_available() else 0}")
     model = setup_data_parallel(model, args.num_gpus)
 
-    # Optimizer: only classifier head
+    # Optimizer: only unfrozen parameters (classifier + fusion + optional encoders)
     optimizer = AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=args.learning_rate,

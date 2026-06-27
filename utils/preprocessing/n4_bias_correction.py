@@ -14,7 +14,7 @@ def n4_bias_correction(
     mask_nii: Optional[Union[str, Path]] = None,
     *,
     shrink_factor: int = 2,
-    bspline_fitting_distance: float = 200.0,   # 外部接口不变
+    bspline_fitting_distance: float = 200.0,   # External interface unchanged
     iters: Sequence[int] = (50, 50, 30, 20),
     tol: float = 1e-7,
     verbose: bool = True,
@@ -30,7 +30,7 @@ def n4_bias_correction(
     img = ants.image_read(str(in_nii))
     mask = ants.image_read(str(mask_nii)) if (mask_nii and mask_nii.exists()) else ants.get_mask(img)
 
-    # 兼容不同 ANTsPy 版本的参数名
+    # Compatible with different ANTsPy versions for parameter names
     kwargs = dict(
         image=img,
         mask=mask,
@@ -77,11 +77,11 @@ def n4_bias_correction_batch(
 
     nii_list = list(_iter_nii_files(in_dir, recursive))
     if verbose:
-        print(f"[N4-BATCH]Found {len(nii_list)} files under {in_dir} (recursive={recursive}).")
+        print(f"[N4-BATCH] Found {len(nii_list)} files under {in_dir} (recursive={recursive}).")
 
     for src in nii_list:
         stem = _stem_no_ext(src)
-        # 输出路径
+        # Output path
         if keep_tree:
             rel  = src.relative_to(in_dir).parent
             out_subdir = out_dir / rel
@@ -94,7 +94,7 @@ def n4_bias_correction_batch(
             if verbose: print(f"[Skip] exists: {dst}")
             continue
 
-        # 新逻辑：mask_dir 下寻找“同名文件”
+        # New logic: search for "same name file" under mask_dir
         mask_nii = None
         if mask_dir:
             same_name = mask_dir / src.name

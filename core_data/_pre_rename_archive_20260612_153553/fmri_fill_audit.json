@@ -1,0 +1,66 @@
+{
+  "source_pass1_manifest": "core_data/dataset_manifest_merged_v2_fmri_origin.json",
+  "backup_of_pass1": "core_data/dataset_manifest_merged_v2_fmri_origin.json.bak_swap1_20260612_153244",
+  "new_manifest": "core_data/dataset_manifest_merged_v2_fmri_full.json",
+  "origin_dir": "E:\\LHT_workspace\\AD\\processed_data\\fMRI\\origin",
+  "stats": {
+    "total_records": 1496,
+    "preserved_from_pass1": 335,
+    "filled_unique_match": 858,
+    "filled_ambiguous_first_match": 2,
+    "unfilled_no_match": 301,
+    "total_changed_this_pass": 860
+  },
+  "ambiguous_fills_first_3": [
+    {
+      "patient_id": "1_1_nc24liuling",
+      "n_candidates": 2,
+      "picked_first": "1_1_nc24liuling_3.5y_pa0_dup1_5-brainwave_dup1.nii.gz"
+    },
+    {
+      "patient_id": "2_0_sub",
+      "n_candidates": 103,
+      "picked_first": "2_0_sub_002_sub_002_rest_dup1.nii.gz"
+    }
+  ],
+  "unfilled_no_match_count": 301,
+  "unfilled_no_match_sample": [
+    "0_3_sub047",
+    "0_3_sub051",
+    "0_3_sub054",
+    "0_3_sub064",
+    "0_3_sub074",
+    "0_3_sub081",
+    "0_3_sub087",
+    "0_3_sub095",
+    "0_3_sub096",
+    "0_3_sub097"
+  ],
+  "first_5_fills": [
+    {
+      "patient_id": "0_2_17",
+      "fmri": "E:\\LHT_workspace\\AD\\processed_data\\fMRI\\origin\\0_2_17_han_rui_yun_0000162252_36563_dup1_012_fmri_8ch_mp_rest_dup1.nii.gz",
+      "n_candidates": 1
+    },
+    {
+      "patient_id": "0_2_32",
+      "fmri": "E:\\LHT_workspace\\AD\\processed_data\\fMRI\\origin\\0_2_32_ye_zhi_ming_0000185312_38185_dup1_009_fmri_8ch_mp_rest_dup1.nii.gz",
+      "n_candidates": 1
+    },
+    {
+      "patient_id": "1_0_AD131chenbanglu",
+      "fmri": "E:\\LHT_workspace\\AD\\processed_data\\fMRI\\origin\\1_0_AD131chenbanglu_BL_PA0_5-Brainwave.nii.gz",
+      "n_candidates": 1
+    },
+    {
+      "patient_id": "1_0_AD134wushilan",
+      "fmri": "E:\\LHT_workspace\\AD\\processed_data\\fMRI\\origin\\1_0_AD134wushilan_BL_PA0_5-Brainwave.nii.gz",
+      "n_candidates": 1
+    },
+    {
+      "patient_id": "1_0_AD135shenfengdi",
+      "fmri": "E:\\LHT_workspace\\AD\\processed_data\\fMRI\\origin\\1_0_AD135shenfengdi_BL_PA0_4-Brainwave.nii.gz",
+      "n_candidates": 1
+    }
+  ]
+}

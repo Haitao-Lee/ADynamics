@@ -50,6 +50,9 @@ def vae_kl_loss(
     Uses mean instead of sum to prevent overflow in FP16 mixed precision training
     and to produce stable, scale-invariant loss values.
 
+    Numerical stability: logvar is clamped to [-10, 10] before exp() to prevent
+    overflow (exp(10) ≈ 22026, exp(-10) ≈ 4.5e-5).
+
     Args:
         mu: Mean of latent distribution of shape [B, C, D, H, W]
         logvar: Log variance of latent distribution of shape [B, C, D, H, W]
@@ -58,6 +61,13 @@ def vae_kl_loss(
     Returns:
         Scalar KL divergence loss
     """
+    # Always compute KL in FP32 to avoid logvar.exp() overflow in FP16
+    mu = mu.float()
+    logvar = logvar.float()
+
+    # Clamp logvar for numerical stability (prevent exp overflow)
+    logvar = torch.clamp(logvar, min=-10.0, max=10.0)
+
     if reduction == "mean":
         kl_div = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
         if torch.isnan(kl_div).any() or torch.isinf(kl_div).any():
@@ -74,7 +84,7 @@ def vae_kl_loss(
 def gradient_loss(recon: Tensor, target: Tensor) -> Tensor:
     """
     Compute gradient (edge/texture) loss using Sobel filters.
-    Helps preserve fine纹理 details in reconstruction.
+    Helps preserve fine texture details in reconstruction.
 
     Args:
         recon: Reconstructed MRI [B, 1, D, H, W]
@@ -271,8 +281,8 @@ def ordinal_contrastive_loss(
     ordinal_dist_norm = ordinal_dist / max_dist  # [0, 1]
 
     # Masks
-    same_mask = torch.eq(labels_i, labels_j).float()  # 同类=1
-    diff_mask = 1.0 - same_mask  # 异类=1 (excludes self)
+    same_mask = torch.eq(labels_i, labels_j).float()  # same class = 1
+    diff_mask = 1.0 - same_mask  # different class = 1 (excludes self)
 
     # Positive loss: pull same labels together
     exp_sim = torch.exp(sim - sim.max())  # numerical stability

@@ -62,11 +62,17 @@ def _load_yaml_defaults(config_path: str) -> dict:
         (("model", "use_attention"), "use_attention"),
         (("model", "attention_heads"), "attention_heads"),
         (("model", "use_fmri_temporal"), "use_fmri_temporal"),
+        (("model", "use_fmri_deep"), "use_fmri_deep"),
         (("model", "fmri_in_channels"), "fmri_in_channels"),
         (("model", "fmri_hidden_dim"), "fmri_hidden_dim"),
         (("model", "fmri_num_pool"), "fmri_num_pool"),
         (("model", "fmri_num_transformer_layers"), "fmri_num_transformer_layers"),
         (("model", "fmri_num_heads"), "fmri_num_heads"),
+        (("model", "fmri_deep_n_soft_roi"), "fmri_deep_n_soft_roi"),
+        (("model", "fmri_deep_n_transformer_layers"), "fmri_deep_n_transformer_layers"),
+        (("model", "fmri_deep_n_heads"), "fmri_deep_n_heads"),
+        (("model", "fmri_deep_fc_compression"), "fmri_deep_fc_compression"),
+        (("model", "use_t1_centric_fusion"), "use_t1_centric_fusion"),
         (("model", "fmri_t_target"), "fmri_t_target"),
         (("model", "use_checkpointing"), "use_checkpointing"),
         (("training", "batch_size"), "batch_size"),
@@ -125,7 +131,7 @@ def parse_args():
     # Data
     parser.add_argument("--json", type=str, default="./core_data/dataset_manifest_merged_v2.json",
                         help="Path to dataset JSON manifest")
-    parser.add_argument("--output_dir", type=str, default="./checkpoints/stage1_multimodal",
+    parser.add_argument("--output_dir", type=str, default="./checkpoints/stage1",
                         help="Output directory for checkpoints")
 
     # Modality toggles (T1 is always required). Default: all 4 ON.
@@ -162,6 +168,23 @@ def parse_args():
                         help="Use fMRITemporalEncoder (preserves BOLD time series). Default ON.")
     parser.add_argument("--no_fmri_temporal", action="store_true", default=False,
                         help="Use static 3D CNN for fMRI (legacy time-averaged path).")
+    parser.add_argument("--use_fmri_deep", action="store_true", default=True,
+                        help="Use fMRIDeepEncoder (deep multi-scale + FC). RECOMMENDED. Default ON.")
+    parser.add_argument("--no_fmri_deep", action="store_true", default=False,
+                        help="Disable deep fMRI encoder (fall back to fMRITemporalEncoder or static).")
+    parser.add_argument("--fmri_deep_n_soft_roi", type=int, default=32,
+                        help="Number of learned soft-ROI factors for fMRI deep encoder.")
+    parser.add_argument("--fmri_deep_n_transformer_layers", type=int, default=3,
+                        help="Number of TransformerEncoder layers in fMRI deep encoder.")
+    parser.add_argument("--fmri_deep_n_heads", type=int, default=4,
+                        help="Number of attention heads in fMRI deep encoder Transformer.")
+    parser.add_argument("--fmri_deep_fc_compression", type=int, default=32,
+                        help="Output dim of functional connectivity head in fMRI deep encoder.")
+    parser.add_argument("--use_t1_centric_fusion", action="store_true", default=True,
+                        help="Use T1-centric fusion (T1 trunk + gated aux deltas). "
+                             "Guarantees T1+aux >= T1-only. RECOMMENDED.")
+    parser.add_argument("--no_t1_centric_fusion", action="store_true", default=False,
+                        help="Fall back to legacy concat fusion (for ablation).")
     parser.add_argument("--fmri_in_channels", type=int, default=34,
                         help="Spatial channels for fMRI temporal encoder (W axis of (D,H,W) fMRI).")
     parser.add_argument("--fmri_hidden_dim", type=int, default=128,
@@ -187,6 +210,8 @@ def parse_args():
 
     # Training
     parser.add_argument("--batch_size", type=int, default=2, help="Batch size")
+    parser.add_argument("--accumulation_steps", type=int, default=1,
+                        help="Gradient accumulation steps (effective batch = batch_size * accumulation_steps)")
     parser.add_argument("--epochs", type=int, default=300, help="Number of epochs")
     parser.add_argument("--learning_rate", type=float, default=0.0002, help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=1e-5, help="Weight decay")
@@ -229,6 +254,8 @@ def parse_args():
                         help="Use automatic mixed precision")
     parser.add_argument("--no_amp", action="store_true", default=False,
                         help="Disable AMP")
+    parser.add_argument("--no_precomputed", action="store_true", default=False,
+                        help="Disable precomputed cache, use on-the-fly transforms")
 
     # v10: KL schedule strategy and cyclical-KL params
     parser.add_argument("--kl_strategy", type=str, default="linear",
@@ -355,6 +382,10 @@ def main():
     val_transforms = get_multimodal_val_transforms()
 
     # Split data
+    # Store manifest index in each sample so precomputed cache can look up correctly
+    for i, item in enumerate(data_list):
+        item["_manifest_idx"] = i
+
     from sklearn.model_selection import train_test_split
     train_data, val_data = train_test_split(
         data_list, test_size=0.15, stratify=[d.get("label", 0) for d in data_list], random_state=42
@@ -378,12 +409,30 @@ def main():
     print(f"[Per-modality target sizes] {spatial_sizes}")
     fmri_t_target = int(getattr(args, "fmri_t_target", 200))
     print(f"[fMRI T target] {fmri_t_target}")
+    # Use npy cache on C: for ~5-10x faster data loading (pre-built from .nii.gz)
+    _npy_cache = "C:/ADynamics_npy_cache" if os.path.isdir("C:/ADynamics_npy_cache") else None
+    if _npy_cache:
+        print(f"[Data] Using npy cache: {_npy_cache}")
+
+    # Precomputed cache: use chunked loading to avoid OOM
+    # Each chunk is ~2GB, loaded on demand with LRU cache
+    _precomputed_path = getattr(args, 'precomputed_cache', None)
+    if getattr(args, 'no_precomputed', False):
+        _precomputed_path = None
+        print("[Data] Precomputed cache disabled by --no_precomputed")
+    elif _precomputed_path is None and _npy_cache:
+        _chunked = os.path.join(_npy_cache, "precomputed")
+        if os.path.isdir(_chunked) and os.path.exists(os.path.join(_chunked, "index.json")):
+            _precomputed_path = _chunked
+
     train_dataset = MultiModalDataset(
         train_data,
         transform=train_transforms,
         optional_modalities=optional_modalities,
         spatial_sizes=spatial_sizes,
         fmri_t_target=fmri_t_target,
+        npy_cache_dir=_npy_cache,
+        precomputed_path=_precomputed_path,
     )
     val_dataset = MultiModalDataset(
         val_data,
@@ -391,20 +440,17 @@ def main():
         optional_modalities=optional_modalities,
         spatial_sizes=spatial_sizes,
         fmri_t_target=fmri_t_target,
+        npy_cache_dir=_npy_cache,
+        precomputed_path=_precomputed_path,
     )
 
-    # Dataloaders
-    # num_workers=0 on Windows because PyTorch DataLoader + DataParallel
-    # + spawn-mode workers have a known compatibility issue (workers exit
-    # unexpectedly with no error message). On Linux this could be 2-4
-    # workers for ~30% speedup; on Windows the cost is a single-threaded
-    # loader and a small GPU-idle gap.
+    # Dataloaders: num_workers=0 on Windows (multi-worker + DataParallel crashes).
     from core_data.dataset import multimodal_collate_fn
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True,
         num_workers=0, pin_memory=torch.cuda.is_available(),
         collate_fn=multimodal_collate_fn,
-        drop_last=True,  # avoid uneven last batch (replication bug if batch < num_gpus)
+        drop_last=True,
     )
     val_loader = torch.utils.data.DataLoader(
         val_dataset, batch_size=args.batch_size, shuffle=False,
@@ -440,11 +486,18 @@ def main():
         attention_levels=attn_levels,
         attention_heads=args.attention_heads,
         use_fmri_temporal=use_fmri_temporal,
+        use_fmri_deep=(args.use_fmri_deep and not args.no_fmri_deep),
         fmri_in_channels=args.fmri_in_channels,
+        fmri_t_target=fmri_t_target,
         fmri_hidden_dim=args.fmri_hidden_dim,
         fmri_num_pool=args.fmri_num_pool,
         fmri_num_transformer_layers=args.fmri_num_transformer_layers,
         fmri_num_heads=args.fmri_num_heads,
+        fmri_deep_n_soft_roi=args.fmri_deep_n_soft_roi,
+        fmri_deep_n_transformer_layers=args.fmri_deep_n_transformer_layers,
+        fmri_deep_n_heads=args.fmri_deep_n_heads,
+        fmri_deep_fc_compression=args.fmri_deep_fc_compression,
+        use_t1_centric_fusion=(args.use_t1_centric_fusion and not args.no_t1_centric_fusion),
         use_demographic_cond=use_demographic,
         # OOM fix: gradient checkpointing on the decoder. 256^3 decoder
         # activations consume ~16GB of autograd-graph memory; checkpoint
@@ -472,6 +525,7 @@ def main():
 
     # Config
     config = {
+        "accumulation_steps": args.accumulation_steps,
         "cls_weight": args.cls_weight,
         "kl_weight": args.kl_weight,
         "kl_warmup_epochs": args.kl_warmup_epochs,

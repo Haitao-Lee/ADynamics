@@ -1,8 +1,13 @@
-# Cross-Validation: 5-fold stratified CV for reliable performance estimates
-# Reports mean +/- std for all metrics
-# Usage: .\run_crossval.ps1
+# run-crossval.ps1
+# ================
+# 5-fold stratified cross-validation.
+# Usage: .\run-crossval.ps1
 
-python scripts/run_cross_validation.py `
+Import-Module "$PSScriptRoot\scripts\ps\common.psm1" -Force
+Initialize-ADynamicsEnv
+$Py = Get-PythonExe
+
+& $Py scripts/run_cross_validation.py `
     --json ./core_data/dataset_manifest_merged_v2.json `
     --output_dir ./inference_results/cross_validation `
     --n_folds 5 `

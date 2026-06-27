@@ -36,6 +36,21 @@ try:
 except ImportError:  # pragma: no cover
     fMRITemporalEncoder = None  # type: ignore[assignment]
 
+# Deep fMRI encoder (the recommended replacement for fMRITemporalEncoder).
+# Has soft-ROI projection + multi-scale dilated 1D CNN + Transformer on
+# full T + multi-stat temporal pooling + functional connectivity head.
+try:
+    from models.fmri_deep_encoder import fMRIDeepEncoder
+except ImportError:  # pragma: no cover
+    fMRIDeepEncoder = None  # type: ignore[assignment]
+
+# T1-centric fusion: T1 is the trunk, auxiliary modalities are bounded
+# residual deltas. Guarantees monotonicity (T1 + aux >= T1-only).
+try:
+    from models.t1_centric_fusion import T1CentricFusion
+except ImportError:  # pragma: no cover
+    T1CentricFusion = None  # type: ignore[assignment]
+
 
 class ResidualBlock3D(nn.Module):
     """
@@ -868,9 +883,11 @@ class ModalityEncoder3D(nn.Module):
             ch, latent_channels, kernel_size=3, padding=1
         )
 
-        # Adaptive pooling to ensure fixed output size regardless of input
-        # Original latent size for 256x256x192 input is (16, 16, 12) after 4 downsamples
-        self.pool = nn.AdaptiveAvgPool3d((16, 16, 12))
+        # Adaptive pooling: compute target latent spatial size from input.
+        # With num_downsamples=4, spatial_size // 16.  (256,256,192)->(16,16,12), (192,192,192)->(12,12,12).
+        # If spatial_size is not available at construction, fall back to (16,16,12).
+        self._latent_grid = None  # set by set_spatial_size()
+        self.pool = nn.AdaptiveAvgPool3d((16, 16, 12))  # default, overridden if spatial_size known
 
     def forward(self, x: Tensor) -> Tensor:
         """
@@ -923,6 +940,10 @@ class ModalityEncoder3D(nn.Module):
         latent = self.latent_conv(h)
         latent = self.pool(latent)
         return latent
+
+    def set_latent_grid(self, grid: tuple) -> None:
+        """Update the adaptive pool target size (D, H, W) for a given spatial_size."""
+        self.pool = nn.AdaptiveAvgPool3d(grid).to(next(self.parameters()).device)
 
 
 class ModalityDropout(nn.Module):
@@ -1014,14 +1035,26 @@ class MultiModalVAE3D(nn.Module):
         attention_heads: int = 8,
         use_fmri_temporal: bool = True,
         fmri_in_channels: int = 34,
+        fmri_t_target: int = 200,
         fmri_hidden_dim: int = 128,
         fmri_num_pool: int = 3,
         fmri_num_transformer_layers: int = 2,
+        # Deep fMRI encoder options (recommended over fMRITemporalEncoder)
+        use_fmri_deep: bool = True,
+        fmri_deep_n_soft_roi: int = 32,
+        fmri_deep_n_transformer_layers: int = 3,
+        fmri_deep_n_heads: int = 4,
+        fmri_deep_fc_compression: int = 32,
         fmri_num_heads: int = 4,
         use_demographic_cond: bool = False,
         age_emb_dim: int = 16,
         use_checkpointing: bool = False,
         sex_emb_dim: int = 8,
+        # T1-centric fusion (RECOMMENDED): T1 is the trunk, aux modalities
+        # are gated residual deltas. Guarantees that adding aux can never
+        # produce a worse latent than T1-only. Default True.
+        # Set False to fall back to legacy concat fusion (for ablation).
+        use_t1_centric_fusion: bool = True,
     ) -> None:
         """
         Initialize the Multi-Modal VAE.
@@ -1080,6 +1113,11 @@ class MultiModalVAE3D(nn.Module):
         self.use_fmri_temporal = use_fmri_temporal
         self.use_demographic_cond = use_demographic_cond
         self.use_checkpointing = use_checkpointing
+        self.use_t1_centric_fusion = use_t1_centric_fusion
+
+        # Compute latent grid from spatial_size and num_downsamples (always 4)
+        _num_down = 4
+        self._latent_grid = tuple(s // (2 ** _num_down) for s in spatial_size)
 
         # Default optional modalities (T1 is always required, never in this list)
         if optional_modalities is None:
@@ -1112,6 +1150,7 @@ class MultiModalVAE3D(nn.Module):
             attention_heads=attention_heads,
             use_checkpointing=use_checkpointing,
         )
+        self.encoder_t1.set_latent_grid(self._latent_grid)
 
         # Optional modality encoders
         # 'fmri' can use either the static 3D encoder (legacy, time-averaged)
@@ -1120,8 +1159,25 @@ class MultiModalVAE3D(nn.Module):
         self.optional_dropouts = nn.ModuleDict()
 
         for mod in optional_modalities:
-            if mod == "fmri" and use_fmri_temporal and fMRITemporalEncoder is not None:
-                # New: lightweight 1D temporal encoder (preserves BOLD time)
+            if mod == "fmri" and use_fmri_deep and fMRIDeepEncoder is not None:
+                # RECOMMENDED: deep multi-scale fMRI encoder with FC head.
+                # Soft-ROI proj + multi-scale dilated 1D CNN + Transformer
+                # on full T + multi-stat pool + functional connectivity.
+                self.optional_encoders[mod] = fMRIDeepEncoder(
+                    in_d=spatial_size[0] // (256 // 64) if spatial_size[0] >= 64 else 64,
+                    in_h=spatial_size[1] // (256 // 64) if spatial_size[1] >= 64 else 64,
+                    in_w=fmri_in_channels,  # 34 (W-slices after spatial pool)
+                    in_t=fmri_t_target,  # fMRI T target from config
+                    n_soft_roi=fmri_deep_n_soft_roi,
+                    hidden_dim=64,
+                    embed_dim=latent_channels,
+                    target_grid=self._latent_grid,
+                    num_transformer_layers=fmri_deep_n_transformer_layers,
+                    num_heads=fmri_deep_n_heads,
+                    fc_compression=fmri_deep_fc_compression,
+                )
+            elif mod == "fmri" and use_fmri_temporal and fMRITemporalEncoder is not None:
+                # LEGACY: lightweight 1D temporal encoder (preserves BOLD time)
                 self.optional_encoders[mod] = fMRITemporalEncoder(
                     in_channels=fmri_in_channels,
                     hidden_dim=fmri_hidden_dim,
@@ -1130,7 +1186,7 @@ class MultiModalVAE3D(nn.Module):
                     target_t=16,
                     num_transformer_layers=fmri_num_transformer_layers,
                     num_heads=fmri_num_heads,
-                    target_grid=(16, 16, 12),  # match T1 latent grid
+                    target_grid=self._latent_grid,  # match T1 latent grid
                 )
             else:
                 # Static 3D encoder (also used for ASL/QSM/FLAIR)
@@ -1144,6 +1200,9 @@ class MultiModalVAE3D(nn.Module):
                     attention_heads=attention_heads,
                     use_checkpointing=use_checkpointing,
                 )
+            # Update latent grid for all ModalityEncoder3D instances
+            if isinstance(self.optional_encoders[mod], ModalityEncoder3D):
+                self.optional_encoders[mod].set_latent_grid(self._latent_grid)
             self.optional_dropouts[mod] = ModalityDropout(p=dropout_rate)
 
         # Number of modalities that contribute to fusion
@@ -1151,16 +1210,34 @@ class MultiModalVAE3D(nn.Module):
         self.num_modalities = 1 + len(optional_modalities)
         total_latent_channels = latent_channels * self.num_modalities
 
-        # Fusion: Concat + Linear projection to unified latent space
-        # Latent spatial size after 4 downsamples: [16, 16, 12] for 256x256x192 input
-        # For different modality sizes, we resize to this common size
+        # Fusion: T1-centric (T1 trunk + gated residual aux deltas)
+        # When all aux modalities are missing, output == t1_trunk(z_t1)
+        # -> adding aux modalities can NEVER make the latent worse than T1.
+        # See models/t1_centric_fusion.py for the full architecture.
+        self.t1_centric_fusion = T1CentricFusion(
+            latent_channels=latent_channels,
+            aux_modalities=optional_modalities,
+            zero_init_deltas=True,
+        )
+
+        # Legacy fusion (concat + 1x1 conv) - kept for ablation comparison.
+        # Used only if use_t1_centric_fusion=False.
         self.fusion_proj = nn.Sequential(
             nn.Conv3d(total_latent_channels, latent_channels * 4, kernel_size=1),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Conv3d(latent_channels * 4, latent_channels, kernel_size=1),
         )
 
-        # Log-var projection for true VAE (enables KL loss)
+        # Log-var projection for true VAE. Uses T1-only for stability:
+        # the KL term is bounded by T1's variance, not the noisy aux sum.
+        # This is critical for training stability when aux is missing.
+        self.logvar_proj_t1 = nn.Sequential(
+            nn.Conv3d(latent_channels, latent_channels * 4, kernel_size=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv3d(latent_channels * 4, latent_channels, kernel_size=1),
+        )
+
+        # Legacy logvar projection (uses concat). Kept for ablation.
         self.logvar_proj = nn.Sequential(
             nn.Conv3d(total_latent_channels, latent_channels * 4, kernel_size=1),
             nn.LeakyReLU(0.2, inplace=True),
@@ -1172,10 +1249,12 @@ class MultiModalVAE3D(nn.Module):
         # Output: [B, 1, 256, 256, 192]
         self._setup_decoder(latent_channels, decoder_depth)
 
-        # Disease classifier head
-        # Takes pooled latent features and predicts disease stage
+        # Disease classifier head (Stage 1: lightweight, provides supervision signal)
+        # Stage 2 will train a stronger dedicated classifier on the frozen encoder.
+        # Keep it simple here: just enough to provide classification supervision
+        # so the latent space learns discriminative features.
         self.classifier = nn.Sequential(
-            nn.Flatten(),
+            nn.Flatten(),                      # [B, C] (already pooled by classify())
             nn.Linear(latent_channels, 256),
             nn.LayerNorm(256),
             nn.LeakyReLU(0.2, inplace=True),
@@ -1236,40 +1315,35 @@ class MultiModalVAE3D(nn.Module):
             return z
         return F.interpolate(z, size=target_size, mode="trilinear", align_corners=False)
 
-    def encode(self, x_dict: Dict[str, Tensor]) -> Tensor:
+    def encode(self, x_dict: Dict[str, Tensor]) -> Tuple[Tensor, Dict[str, Optional[Tensor]]]:
         """
-        Encode multi-modal inputs to unified latent space.
+        Encode multi-modal inputs to T1 trunk + per-modality auxiliary latents.
 
         Args:
             x_dict: Dictionary of modality tensors, e.g.:
                 {"t1": tensor, "fmri": tensor, "asl": tensor, ...}
-                T1 is required, others are optional.
+                T1 is required, others are optional (None if missing).
 
         Returns:
-            Unified latent tensor of shape [B, latent_channels, 8, 8, 6]
+            z_t1: [B, latent_channels, 16, 16, 12] - the T1 trunk latent.
+            z_aux_dict: {mod: [B, latent_channels, 16, 16, 12] or None}
+                per-modality latents. Missing modalities are None (NOT
+                zero tensors) so the T1CentricFusion can skip them.
         """
-        latent_list = []
-
-        # T1 is required
+        # T1 is required (always present, the structural trunk)
         z_t1 = self.encoder_t1(x_dict["t1"])
-        latent_list.append(z_t1)
 
-        # Optional modalities with dropout
+        # Optional modalities: None if missing (NOT zero tensors)
+        z_aux_dict: Dict[str, Optional[Tensor]] = {}
         for mod in self.optional_modalities:
             if mod in x_dict and x_dict[mod] is not None:
-                z = self.optional_encoders[mod](x_dict[mod])
-                z = self.optional_dropouts[mod](z)  # Apply dropout during training
-                latent_list.append(z)
+                z_mod = self.optional_encoders[mod](x_dict[mod])
+                z_mod = self.optional_dropouts[mod](z_mod)  # Modality dropout
+                z_aux_dict[mod] = z_mod
             else:
-                # Modality not available, add zeros
-                z = torch.zeros_like(z_t1)
-                latent_list.append(z)
+                z_aux_dict[mod] = None  # missing -> no contribution
 
-        # Concat all latent tensors
-        z_concat = torch.cat(latent_list, dim=1)
-
-        # Project to unified latent space (returns concat for mu + logvar)
-        return z_concat
+        return z_t1, z_aux_dict
 
     def decode(self, z: Tensor) -> Tensor:
         """
@@ -1389,24 +1463,40 @@ class MultiModalVAE3D(nn.Module):
         if "sex" in x_dict:
             sex = x_dict.pop("sex")
 
-        # Encode multi-modal inputs
-        z_concat = self.encode(x_dict)
+        # Encode multi-modal inputs (T1 trunk + per-modality aux latents)
+        z_t1, z_aux_dict = self.encode(x_dict)
 
-        # True VAE: learn both mu and logvar
-        mu = self.fusion_proj(z_concat)
-        logvar = self.logvar_proj(z_concat)
-
-        # Optional demographic conditioning: additive per-channel bias on mu/logvar
-        # before reparameterization. Adds age/sex info without disturbing the
-        # T1+optional-modality visual signal.
+        # Compute demographic bias BEFORE fusion (so we can pass it to fusion
+        # or apply it after, depending on the fusion mode).
+        demo_bias = None
         if self.use_demographic_cond and age is not None and sex is not None:
-            demo_bias = self._demographic_bias(age, sex, mu.shape[0])  # [B, C]
+            demo_bias = self._demographic_bias(age, sex, z_t1.shape[0])  # [B, C]
             demo_bias = demo_bias.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)  # [B, C, 1, 1, 1]
-            mu = mu + demo_bias
-            # logvar shift is conservative (only the bias direction); keeping logvar
-            # un-shifted is also valid. We apply a soft 0.1x scale of the bias to
-            # logvar to keep gradient flow stable.
-            logvar = logvar + 0.1 * demo_bias
+
+        if self.use_t1_centric_fusion:
+            # T1-CENTRIC FUSION (RECOMMENDED): T1 is the trunk, aux
+            # modalities are gated residual deltas. When all aux are missing,
+            # the output equals t1_trunk(z_t1) (plus demo_bias) - so adding
+            # aux modalities can NEVER make the latent worse than T1-only.
+            mu = self.t1_centric_fusion(z_t1, z_aux_dict, demo_bias=demo_bias)
+            # Logvar from T1 only (more stable: KL term bounded by T1's variance)
+            logvar = self.logvar_proj_t1(z_t1)
+            if demo_bias is not None:
+                logvar = logvar + 0.1 * demo_bias
+        else:
+            # LEGACY FUSION (concat + 1x1 conv) - kept for ablation studies.
+            latent_list = [z_t1]
+            for mod in self.optional_modalities:
+                if mod in z_aux_dict and z_aux_dict[mod] is not None:
+                    latent_list.append(z_aux_dict[mod])
+                else:
+                    latent_list.append(torch.zeros_like(z_t1))
+            z_concat = torch.cat(latent_list, dim=1)
+            mu = self.fusion_proj(z_concat)
+            logvar = self.logvar_proj(z_concat)
+            if demo_bias is not None:
+                mu = mu + demo_bias
+                logvar = logvar + 0.1 * demo_bias
 
         z_sample = self.reparameterize(mu, logvar)
 
@@ -1460,6 +1550,45 @@ class MultiModalVAE3D(nn.Module):
         bias = self.demo_proj(demo)  # [B, latent_channels]
         return bias
 
+    def encode_t1_only(
+        self,
+        x_t1: Tensor,
+        age: Optional[Tensor] = None,
+        sex: Optional[Tensor] = None,
+    ) -> Tensor:
+        """
+        Encode using T1 ONLY (ignores all aux modalities).
+
+        Used by the trainer's monotonicity loss: ensures that the T1-only
+        path is always available for comparison. The output mu is exactly
+        t1_trunk(z_t1) (+ demo_bias if applicable), so the L_mono
+        "T1-only cls <= full cls" check is well-defined.
+
+        Args:
+            x_t1: T1 input tensor [B, 1, D, H, W].
+            age, sex: Optional demographics for the T1-only forward.
+        Returns:
+            mu_t1: [B, latent_channels, 16, 16, 12] - the T1-only latent.
+        """
+        z_t1 = self.encoder_t1(x_t1)
+        z_aux_empty = {mod: None for mod in self.optional_modalities}
+        demo_bias = None
+        if self.use_demographic_cond and age is not None and sex is not None:
+            demo_bias = self._demographic_bias(age, sex, z_t1.shape[0])
+            demo_bias = demo_bias.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        mu_t1 = self.t1_centric_fusion(z_t1, z_aux_empty, demo_bias=demo_bias)
+        return mu_t1
+
+    def classify_latent(self, z: Tensor) -> Tensor:
+        """Run classifier head on a latent tensor (used for L_mono).
+
+        Applies the same GAP->flatten as the main `classify` method,
+        so the L_mono path is consistent with the main classification.
+        """
+        pooled = F.adaptive_avg_pool3d(z, output_size=(1, 1, 1))
+        pooled = pooled.view(pooled.size(0), -1)  # [B, latent_channels]
+        return self.classifier(pooled)
+
     def get_latent(
         self,
         x_dict: Dict[str, Tensor],
@@ -1480,10 +1609,25 @@ class MultiModalVAE3D(nn.Module):
         Returns:
             Latent representation [B, latent_channels, 16, 16, 12]
         """
-        z_concat = self.encode(x_dict)
-        mu = self.fusion_proj(z_concat)
-        if self.use_demographic_cond and age is not None and sex is not None:
-            demo_bias = self._demographic_bias(age, sex, mu.shape[0])
-            demo_bias = demo_bias.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-            mu = mu + demo_bias
+        z_t1, z_aux_dict = self.encode(x_dict)
+        if self.use_t1_centric_fusion:
+            demo_bias = None
+            if self.use_demographic_cond and age is not None and sex is not None:
+                demo_bias = self._demographic_bias(age, sex, z_t1.shape[0])
+                demo_bias = demo_bias.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+            mu = self.t1_centric_fusion(z_t1, z_aux_dict, demo_bias=demo_bias)
+        else:
+            # Legacy concat fusion (for ablation)
+            latent_list = [z_t1]
+            for mod in self.optional_modalities:
+                if mod in z_aux_dict and z_aux_dict[mod] is not None:
+                    latent_list.append(z_aux_dict[mod])
+                else:
+                    latent_list.append(torch.zeros_like(z_t1))
+            z_concat = torch.cat(latent_list, dim=1)
+            mu = self.fusion_proj(z_concat)
+            if self.use_demographic_cond and age is not None and sex is not None:
+                demo_bias = self._demographic_bias(age, sex, mu.shape[0])
+                demo_bias = demo_bias.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+                mu = mu + demo_bias
         return mu

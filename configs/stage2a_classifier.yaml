@@ -5,13 +5,13 @@
 
 # Inputs
 input:
-  encoder_checkpoint: "./checkpoints/stage1_multimodal/vae_best.pt"
+  encoder_checkpoint: "./checkpoints/stage1/vae_best.pt"   # 5-modality, latent_channels=32
   num_classes: 4               # 4 = NC / SCD / MCI / AD (canonical, must match Stage 1)
 
 # Training
 training:
-  batch_size: 8                # TOTAL batch size (each GPU gets 4 via DataParallel scatter)
-  learning_rate: 0.0001
+  batch_size: 2                # TOTAL batch size (each GPU gets 1 via DataParallel scatter)
+  learning_rate: 0.001
   weight_decay: 0.00001
   epochs: 100
   early_stopping_patience: 30
@@ -24,8 +24,9 @@ model:
   base_channels: 16             # must match stage1 checkpoint (--base_channels 16)
   decoder_depth: 4
   in_channels: 1
-  spatial_size: [256, 256, 192]
+  spatial_size: [128, 128, 128]  # must match Stage 1
   dropout_rate: 0.2
+  fmri_t_target: 100             # must match Stage 1
 
 # Output
 output:

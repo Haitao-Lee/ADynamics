@@ -937,14 +937,28 @@ class MultiModalVAETrainer:
         # v11: track mixup application count
         n_mixup_applied = 0
 
+        # Gradient accumulation: effective_batch = batch_size * accumulation_steps
+        accumulation_steps = self.config.get("accumulation_steps", 1)
+        # Track actual accumulated batches for incomplete cycles at epoch end
+        actual_accum_count = 0
+        num_batches = len(self.train_loader)
+
         from utils.kl_schedules import (
             should_apply_mixup, mixup_latents, mixup_classification_loss,
         )
+
+        # Clear CUDA cache at epoch start to prevent async error accumulation
+        torch.cuda.empty_cache()
 
         from tqdm import tqdm
         pbar = tqdm(enumerate(self.train_loader), total=len(self.train_loader), desc="Train", leave=False)
 
         for batch_idx, batch in pbar:
+            # Zero grad at the start of each accumulation cycle
+            if batch_idx % accumulation_steps == 0:
+                self.optimizer.zero_grad(set_to_none=True)
+                actual_accum_count = 0
+
             # Get T1 (already preprocessed to 256x256x192)
             t1 = batch["t1"].to(self.device)
 
@@ -963,8 +977,18 @@ class MultiModalVAETrainer:
             )
             x_dict = {"t1": t1}
 
+            # Use available_modalities to skip zero-filled missing modalities.
+            # A modality is only passed if ALL samples in the batch have it.
+            batch_avail = batch.get("available_modalities", None)
+            if batch_avail and isinstance(batch_avail[0], (list, tuple)):
+                avail_set = set(batch_avail[0])
+                for av in batch_avail[1:]:
+                    avail_set &= set(av)
+            else:
+                avail_set = set(active_optionals)
+
             for mod in active_optionals:
-                if mod in batch and batch[mod] is not None:
+                if mod in avail_set and mod in batch and batch[mod] is not None:
                     mod_tensor = batch[mod].to(self.device)
                     if mod == "fmri":
                         mod_tensor = self._normalize_fmri_batch(mod_tensor)
@@ -993,9 +1017,25 @@ class MultiModalVAETrainer:
 
             # Forward pass
             with autocast('cuda', enabled=self.use_amp):
-                recon, cls_logits, mu, logvar = self.model(
-                    x_dict, return_components=True,
-                )
+                try:
+                    recon, cls_logits, mu, logvar = self.model(
+                        x_dict, return_components=True,
+                    )
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower():
+                        print(f"\n[TRAIN OOM] batch={batch_idx} mods={list(x_dict.keys())}")
+                        for k, v in x_dict.items():
+                            if isinstance(v, torch.Tensor):
+                                print(f"  {k}: shape={v.shape} dtype={v.dtype}")
+                        torch.cuda.empty_cache()
+                        self.optimizer.zero_grad(set_to_none=True)
+                        continue
+                    else:
+                        print(f"\n[TRAIN ERROR] batch={batch_idx} mods={list(x_dict.keys())}")
+                        for k, v in x_dict.items():
+                            if isinstance(v, torch.Tensor):
+                                print(f"  {k}: shape={v.shape} dtype={v.dtype}")
+                        raise
 
                 # v10: decide whether to apply latent mixup this batch
                 do_mixup = (mixup_alpha > 0) and (labels is not None) and should_apply_mixup(
@@ -1063,29 +1103,55 @@ class MultiModalVAETrainer:
                     lam = 1.0
 
                 # KL loss with Free Bits
+                # Cast to FP32 to prevent logvar.exp() overflow
+                mu_fp32 = mu.float()
+                logvar_fp32 = logvar.float()
+                # Clamp logvar for numerical stability (prevent exp overflow)
+                logvar_fp32 = torch.clamp(logvar_fp32, min=-10.0, max=10.0)
+
                 free_bits = self.config.get("free_bits", 0.0)
-                kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+                kl_per_dim = -0.5 * (1 + logvar_fp32 - mu_fp32.pow(2) - logvar_fp32.exp())
                 if free_bits > 0:
                     kl_per_dim = torch.clamp(kl_per_dim, min=free_bits)
                 kl_loss = kl_per_dim.mean()
 
-                # Total loss
+                # Total loss (scale by 1/accumulation_steps for gradient averaging)
                 ordinal_reg_weight = self.config.get("ordinal_reg_weight", 0.1)
-                loss = recon_loss + cls_weight * cls_loss + kl_weight * kl_loss + ordinal_reg_weight * ordinal_reg_loss
+                loss = (recon_loss + cls_weight * cls_loss + kl_weight * kl_loss + ordinal_reg_weight * ordinal_reg_loss) / accumulation_steps
+                actual_accum_count += 1
 
-            # Backward pass
+            # Backward pass (accumulate gradients)
             if self.use_amp:
                 self.scaler.scale(loss).backward()
-                self.scaler.unscale_(self.optimizer)
-                self._apply_encoder_grad_boost()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
             else:
                 loss.backward()
-                self._apply_encoder_grad_boost()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                self.optimizer.step()
+
+            # Step optimizer: complete cycle OR incomplete cycle at epoch end
+            is_complete_cycle = (batch_idx + 1) % accumulation_steps == 0
+            is_epoch_end = (batch_idx + 1) == num_batches
+            if is_complete_cycle or is_epoch_end:
+                # For incomplete cycles at epoch end, rescale gradients
+                # to compensate for the fewer accumulated batches
+                if is_epoch_end and not is_complete_cycle and actual_accum_count < accumulation_steps:
+                    # Rescale: we divided by accumulation_steps but only
+                    # accumulated actual_accum_count times, so multiply
+                    # by accumulation_steps / actual_accum_count
+                    rescale_factor = accumulation_steps / actual_accum_count
+                    for param in self.model.parameters():
+                        if param.grad is not None:
+                            param.grad.data.mul_(rescale_factor)
+
+                if self.use_amp:
+                    self.scaler.unscale_(self.optimizer)
+                    self._apply_encoder_grad_boost()
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    self._apply_encoder_grad_boost()
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.optimizer.step()
+                self.optimizer.zero_grad(set_to_none=True)
 
             # Metrics
             with torch.no_grad():
@@ -1128,7 +1194,7 @@ class MultiModalVAETrainer:
                     ) / (self._grad_norm_count + 1)
             self._grad_norm_count += 1
 
-            total_loss += loss.item()
+            total_loss += loss.item() * accumulation_steps  # unscale for logging
             total_recon_loss += recon_loss.item()
             total_cls_loss += cls_loss.item()
             total_kl_loss += kl_loss.item()
@@ -1136,10 +1202,11 @@ class MultiModalVAETrainer:
             num_batches += 1
 
             pbar.set_postfix({
-                "loss": f"{loss.item():.4f}",
+                "loss": f"{loss.item() * accumulation_steps:.4f}",
                 "recon": f"{recon_loss.item():.4f}",
                 "cls": f"{cls_loss.item():.4f}",
                 "kl": f"{kl_loss.item():.4f}",
+                "acc_step": f"{(batch_idx % accumulation_steps) + 1}/{accumulation_steps}",
             })
 
             # OOM fix: clear the autograd graph + cache AFTER all references
@@ -1189,6 +1256,8 @@ class MultiModalVAETrainer:
              per-class prediction frequency, and recon intensity stats
              (deep diagnostics for the "is the data the problem?" question).
         """
+        # Clear CUDA cache before validation to prevent fragmentation issues
+        torch.cuda.empty_cache()
         self.model.eval()
 
         total_loss = 0.0
@@ -1239,8 +1308,18 @@ class MultiModalVAETrainer:
             )
             x_dict = {"t1": t1}
 
+            # Use available_modalities to skip zero-filled missing modalities.
+            # A modality is only passed if ALL samples in the batch have it.
+            batch_avail = batch.get("available_modalities", None)
+            if batch_avail and isinstance(batch_avail[0], (list, tuple)):
+                avail_set = set(batch_avail[0])
+                for av in batch_avail[1:]:
+                    avail_set &= set(av)
+            else:
+                avail_set = set(active_optionals)
+
             for mod in active_optionals:
-                if mod in batch and batch[mod] is not None:
+                if mod in avail_set and mod in batch and batch[mod] is not None:
                     mod_tensor = batch[mod].to(self.device)
                     if mod == "fmri":
                         mod_tensor = self._normalize_fmri_batch(mod_tensor)
@@ -1260,9 +1339,24 @@ class MultiModalVAETrainer:
                 x_dict["sex"] = batch["sex"].to(self.device)
 
             with autocast('cuda', enabled=self.use_amp):
-                recon, cls_logits, mu, logvar = self.model(
-                    x_dict, return_components=True,
-                )
+                try:
+                    recon, cls_logits, mu, logvar = self.model(
+                        x_dict, return_components=True,
+                    )
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower():
+                        print(f"\n[VAL OOM] batch={batch_idx} mods={list(x_dict.keys())}")
+                        for k, v in x_dict.items():
+                            if isinstance(v, torch.Tensor):
+                                print(f"  {k}: shape={v.shape} dtype={v.dtype}")
+                        torch.cuda.empty_cache()
+                        continue
+                    else:
+                        print(f"\n[VAL ERROR] batch={batch_idx} mods={list(x_dict.keys())}")
+                        for k, v in x_dict.items():
+                            if isinstance(v, torch.Tensor):
+                                print(f"  {k}: shape={v.shape} dtype={v.dtype}")
+                        raise
 
                 recon_loss = F.l1_loss(recon, x_dict["t1"])
 
@@ -1298,7 +1392,11 @@ class MultiModalVAETrainer:
                     cls_acc = 0.0
 
                 free_bits = self.config.get("free_bits", 0.0)
-                kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+                # Cast to FP32 and clamp for numerical stability
+                mu_fp32 = mu.float()
+                logvar_fp32 = logvar.float()
+                logvar_fp32 = torch.clamp(logvar_fp32, min=-10.0, max=10.0)
+                kl_per_dim = -0.5 * (1 + logvar_fp32 - mu_fp32.pow(2) - logvar_fp32.exp())
                 if free_bits > 0:
                     kl_per_dim = torch.clamp(kl_per_dim, min=free_bits)
                 kl_loss = kl_per_dim.mean()

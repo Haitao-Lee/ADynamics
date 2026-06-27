@@ -5,13 +5,13 @@
 
 # Inputs
 input:
-  encoder_checkpoint: "./checkpoints/stage1_multimodal/vae_best.pt"
+  encoder_checkpoint: "./checkpoints/stage1/vae_best.pt"
   num_classes: 4               # 4 = NC / SCD / MCI / AD (canonical, must match Stage 1)
 
 # Training
 training:
   batch_size: 2
-  learning_rate: 0.0001
+  learning_rate: 0.0005
   weight_decay: 0.00001
   epochs: 200
   early_stopping_patience: 30
@@ -26,11 +26,12 @@ loss:
 # Model dimensions (must match Stage 1)
 model:
   latent_channels: 32
-  base_channels: 16             # must match stage1 checkpoint (--base_channels 16)
+  base_channels: 16             # must match stage1 checkpoint
   decoder_depth: 4
   in_channels: 1
-  spatial_size: [256, 256, 192]
+  spatial_size: [128, 128, 128]  # must match Stage 1
   dropout_rate: 0.2
+  fmri_t_target: 100             # must match Stage 1
 
 # Output
 output:

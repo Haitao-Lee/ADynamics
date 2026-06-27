@@ -480,6 +480,11 @@ class MultiModalDataset(Dataset):
         required_modality: str = "t1",
         optional_modalities: Optional[List[str]] = None,
         preserve_temporal_dim: bool = True,
+        use_npy_cache: bool = True,
+        npy_cache_dir: Optional[str] = None,
+        preload_in_memory: bool = False,
+        ram_dtype: str = "float16",
+        precomputed_path: Optional[str] = None,
     ) -> None:
         """
         Initialize multi-modal dataset.
@@ -504,6 +509,16 @@ class MultiModalDataset(Dataset):
             preserve_temporal_dim: If True (default), 4D fMRI keeps its time
                 dimension and is returned as 5D tensor [1, D, H, W, T] for
                 the fMRITemporalEncoder. If False, time is averaged (legacy).
+            use_npy_cache: If True (default), every .nii.gz read is cached
+                as a sibling .npy file the first time it's read, and
+                subsequent reads load the .npy directly. Skips the
+                gzip-decompress + nibabel header parse, the two biggest
+                costs in the data loader. First epoch is a bit slower
+                (writing caches), later epochs are 5-10x faster.
+            npy_cache_dir: If given, .npy files are written to this dir
+                using a hash of the original path as the filename. Useful
+                when the source data dir is read-only. If None (default),
+                the cache lives next to the original .nii.gz.
         """
         super().__init__(data=data_list, transform=transform)
         # Per-modality spatial targets. Each modality uses its own — see
@@ -518,6 +533,274 @@ class MultiModalDataset(Dataset):
         # that still reads it). New code should use spatial_sizes["t1"].
         self.target_size = self.spatial_sizes.get("t1", (192, 192, 160))
         self.preserve_temporal_dim = preserve_temporal_dim
+        # .npy cache: skip the gzip-decompress + nibabel-header cost on
+        # subsequent reads. Each cache file is a flat float32 array matching
+        # the underlying voxel data of the source .nii.gz.
+        self.use_npy_cache = use_npy_cache
+        self.npy_cache_dir = npy_cache_dir
+        if npy_cache_dir is not None:
+            os.makedirs(npy_cache_dir, exist_ok=True)
+
+        # In-RAM preload: load every sample's arrays into a dict at
+        # __init__ so __getitem__ becomes a pure dict lookup (no I/O,
+        # no nibabel parse). The fp32 .npy cache is ~211 GB which
+        # doesn't fit in 128 GB, so we cast to ram_dtype (default fp16,
+        # ~110 GB). The model trains in fp32, so __getitem__ casts
+        # back. Trades ~1ms of cast time per sample for zero disk I/O
+        # during training — keeps the GPU saturated instead of bursty
+        # 70-100% while DataLoader workers fight the disk.
+        self.preload_in_memory = preload_in_memory
+        self.ram_dtype = np.dtype(ram_dtype)
+        self._in_memory_pool: Optional[List[Dict[str, Optional[np.ndarray]]]] = None
+        if self.preload_in_memory:
+            self._preload_all()
+
+        # Precomputed cache: all transforms already applied.
+        # Supports single .pt file or chunked directory.
+        # Chunked mode uses LRU cache to avoid loading all data into RAM.
+        self._precomputed: Optional[Dict[int, Dict[str, Any]]] = None
+        self._precomputed_dir: Optional[str] = None
+        self._precomputed_index: Optional[dict] = None
+        if precomputed_path is not None:
+            if os.path.isdir(precomputed_path):
+                # Chunked precomputed cache
+                index_path = os.path.join(precomputed_path, "index.json")
+                if os.path.exists(index_path):
+                    with open(index_path) as _f:
+                        self._precomputed_index = json.load(_f)
+                    self._precomputed_dir = precomputed_path
+                    print(f"[Data] Using chunked precomputed cache: {precomputed_path} ({self._precomputed_index['ok']} samples)")
+            elif os.path.exists(precomputed_path):
+                print(f"[Data] Loading precomputed cache: {precomputed_path}")
+                self._precomputed = torch.load(precomputed_path, map_location="cpu", weights_only=False)
+                print(f"[Data] Loaded {len(self._precomputed)} precomputed samples")
+
+        # Lazy transform cache: caches each sample's transform result on first
+        # access. Epoch 1 is slow (transforms run), epoch 2+ is fast (dict lookup).
+        # Memory: ~128MB/sample × 1468 samples ≈ 187 GB (fp16) — too much for RAM.
+        # So we cache to disk instead (precomputed_path), OR use this in-memory
+        # dict for small datasets only.
+        self._lazy_cache: Optional[Dict[int, Dict[str, Any]]] = None
+
+    def _load_precomputed(self, idx: int) -> Optional[Dict[str, Any]]:
+        """Load a precomputed sample from single-file or chunked cache.
+
+        Uses _manifest_idx from the data item to look up the correct sample
+        in the precomputed cache (which is keyed by manifest index, not dataset index).
+        Falls back to idx if _manifest_idx is not set (backward compat).
+        """
+        if self._precomputed is None and self._precomputed_dir is None:
+            return None
+
+        # Map dataset index -> manifest index
+        item = self.data[idx]
+        if isinstance(item, dict) and "_manifest_idx" in item:
+            manifest_idx = item["_manifest_idx"]
+        else:
+            manifest_idx = idx
+
+        if self._precomputed is not None:
+            return self._precomputed.get(manifest_idx)
+
+        if self._precomputed_dir is not None and self._precomputed_index is not None:
+            # Chunked: find which chunk contains this manifest_idx
+            chunk_size = 50
+            chunk_start = (manifest_idx // chunk_size) * chunk_size
+            chunk_path = os.path.join(self._precomputed_dir, f"chunk_{chunk_start:05d}.pt")
+            if not os.path.exists(chunk_path):
+                return None
+            # LRU cache: avoid re-loading the same chunk from disk
+            if not hasattr(self, '_chunk_cache'):
+                self._chunk_cache: Dict[int, Dict] = {}
+                self._chunk_cache_order: list = []
+            if chunk_start not in self._chunk_cache:
+                chunk = torch.load(chunk_path, map_location="cpu", weights_only=False)
+                self._chunk_cache[chunk_start] = chunk
+                self._chunk_cache_order.append(chunk_start)
+                # Keep at most 10 chunks in memory (~20GB)
+                while len(self._chunk_cache) > 10:
+                    old = self._chunk_cache_order.pop(0)
+                    del self._chunk_cache[old]
+            return self._chunk_cache[chunk_start].get(manifest_idx)
+        return None
+
+    def _load_npy_cached(self, nifti_path: str) -> np.ndarray:
+        """
+        Load a NIfTI file as a float32 numpy array, with a .npy on-disk
+        cache to skip the gzip-decompress + nibabel-header cost on
+        subsequent reads.
+
+        Cache layout:
+          - Default: cache lives next to the .nii.gz, named
+            `<basename>.npy` (the .nii.gz extension is dropped). E.g.
+            `sub-001_T1w.nii.gz` → `sub-001_T1w.npy`.
+          - If `npy_cache_dir` is set: cache is
+            `<npy_cache_dir>/<sha1-of-path>.npy` so different paths to
+            the same file (e.g. /E: vs /D: on Windows) share a cache.
+
+        Concurrency:
+          - Read is O(1) when cache exists.
+          - First read decodes .nii.gz via nibabel, writes the cache
+            atomically (write to `<cache>.tmp`, rename) so partial
+            writes from a crashed worker don't leave a corrupt cache
+            that subsequent reads would happily load.
+
+        Returns: float32 ndarray of shape matching the source NIfTI
+        data array. Returns the same thing nibabel.get_fdata() /
+        np.asarray(img.dataobj, dtype=float32) would, but ~5-10x
+        faster on a warm cache.
+        """
+        if not self.use_npy_cache:
+            # Cache disabled — fall through to nibabel.
+            import nibabel as nib
+            img = nib.load(str(nifti_path))
+            return np.asarray(img.dataobj, dtype=np.float32)
+
+        if self.npy_cache_dir is not None:
+            import hashlib
+            # Normalize the path before hashing so that different
+            # string representations of the same file (`E:\...` vs
+            # `E:/...` vs `E:\\...`) all hash to the same key.
+            norm = os.path.normpath(nifti_path).replace(os.sep, "/")
+            h = hashlib.sha1(norm.encode("utf-8")).hexdigest()[:16]
+            cache_path = os.path.join(self.npy_cache_dir, h + ".npy")
+        else:
+            # Sibling to original: foo.nii.gz → foo.npy
+            if nifti_path.endswith(".nii.gz"):
+                cache_path = nifti_path[:-7] + ".npy"
+            elif nifti_path.endswith(".nii"):
+                cache_path = nifti_path[:-4] + ".npy"
+            else:
+                cache_path = nifti_path + ".npy"
+
+        # Fast path: cache hit
+        if os.path.exists(cache_path):
+            try:
+                arr = np.load(cache_path, mmap_mode=None)
+                if arr.dtype != np.float32:
+                    arr = arr.astype(np.float32, copy=False)
+                return arr
+            except (ValueError, OSError):
+                # Corrupt cache file — rebuild.
+                try:
+                    os.remove(cache_path)
+                except OSError:
+                    pass
+
+        # Slow path: read .nii.gz, write cache atomically.
+        import nibabel as nib
+        img = nib.load(str(nifti_path))
+        arr = np.asarray(img.dataobj, dtype=np.float32)
+        try:
+            # IMPORTANT: np.save() auto-appends ".npy" if the path doesn't
+            # already end with .npy. So `np.save("foo.npy.tmp", arr)` would
+            # write to "foo.npy.tmp.npy" — broken. We write the tmp file
+            # to a path that ALREADY ends in .npy, then atomically rename
+            # it to the final cache path.
+            tmp_path = cache_path + ".tmp.npy"
+            np.save(tmp_path, arr)
+            # Atomic rename (Windows: os.replace is atomic on same volume)
+            os.replace(tmp_path, cache_path)
+        except OSError:
+            # Cache write failure (read-only disk, etc.) — non-fatal.
+            pass
+        return arr
+
+    def _preload_all(self) -> None:
+        """
+        Walk every sample, load every existing .npy into a dict, cast to
+        `self.ram_dtype` (default fp16) to fit in RAM. Reports a memory
+        budget estimate first and aborts cleanly if it'd exceed 80% of
+        total RAM (so the system stays responsive).
+
+        Only available with use_npy_cache=True. num_workers MUST be 0
+        in the DataLoader — workers on Windows use spawn, which would
+        copy the entire pool into each worker and OOM.
+
+        Expected cost on a 128 GB host, fp16:
+            T1:    ~24 GB  (1472 × 16.5 MB)
+            fMRI:  ~77 GB  (~1200 × 64 MB)
+            ASL:   ~0.4 GB
+            QSM:   ~4.5 GB
+            FLAIR: ~3.5 GB
+            Total: ~110 GB
+        """
+        import psutil  # type: ignore
+        import time as _t
+        vm = psutil.virtual_memory()
+        avail_gb = vm.available / 1024**3
+        total_gb = vm.total / 1024**3
+        # First pass: count how many samples have each modality
+        n_samples = len(self.data)
+        n_mods_per_sample: Dict[str, int] = {m: 0 for m in ["t1"] + list(self.optional_modalities)}
+        for s in self.data:
+            for m in n_mods_per_sample:
+                p = s.get(m)
+                if isinstance(p, str) and os.path.exists(self._cache_path_for(p)):
+                    n_mods_per_sample[m] += 1
+        # Estimate size from a 1-2 sample probe (cheaper than scanning all)
+        probe_arrs = []
+        for s in self.data[:3]:
+            for m in n_mods_per_sample:
+                p = s.get(m)
+                if isinstance(p, str) and os.path.exists(self._cache_path_for(p)):
+                    probe_arrs.append(np.load(self._cache_path_for(p), mmap_mode="r"))
+        if probe_arrs:
+            bytes_per_elem = np.dtype(self.ram_dtype).itemsize
+            est_gb = sum(a.nbytes for a in probe_arrs) / len(probe_arrs) / 1024**3
+            est_gb *= n_samples
+            est_gb *= bytes_per_elem / 4.0  # adjust for dtype ratio (probe is fp32)
+        else:
+            est_gb = 0
+        # Safety: refuse if estimate > 80% of total RAM
+        if est_gb > 0.8 * total_gb:
+            raise RuntimeError(
+                f"[preload] estimated {est_gb:.1f} GB needed but only {total_gb:.0f} GB total RAM. "
+                f"Drop a modality or switch ram_dtype='float16' to 'float32' if you have more RAM."
+            )
+        print(f"[preload] loading {n_samples} samples into RAM (dtype={self.ram_dtype.name}, "
+              f"~{est_gb:.1f} GB estimated, {avail_gb:.0f} GB available)...", flush=True)
+        t0 = _t.time()
+        loaded_bytes = 0
+        n_loaded = 0
+        self._in_memory_pool = []
+        # Progress every 100 samples
+        for i, s in enumerate(self.data):
+            entry: Dict[str, Optional[np.ndarray]] = {"_t1_meta": s}  # keep raw paths
+            for m in ["t1"] + list(self.optional_modalities):
+                p = s.get(m)
+                if not isinstance(p, str) or not os.path.exists(self._cache_path_for(p)):
+                    entry[m] = None
+                    continue
+                arr = np.load(self._cache_path_for(p), mmap_mode=None)
+                if arr.dtype != self.ram_dtype:
+                    arr = arr.astype(self.ram_dtype, copy=False)
+                entry[m] = arr
+                loaded_bytes += arr.nbytes
+            self._in_memory_pool.append(entry)
+            n_loaded += 1
+            if (i + 1) % 200 == 0 or (i + 1) == n_samples:
+                dt = _t.time() - t0
+                rate = (i + 1) / max(dt, 0.01)
+                eta = (n_samples - i - 1) / max(rate, 0.01)
+                print(f"[preload] {i+1}/{n_samples}  loaded={n_loaded}  "
+                      f"bytes={loaded_bytes/1024**3:.1f} GB  "
+                      f"rate={rate:.1f}/s  eta={eta:.0f}s", flush=True)
+        dt = _t.time() - t0
+        print(f"[preload] DONE in {dt:.1f}s  ({loaded_bytes/1024**3:.1f} GB in RAM)", flush=True)
+
+    def _cache_path_for(self, nifti_path: str) -> str:
+        """Same hash logic as _load_npy_cached — exposed for _preload_all."""
+        if self.npy_cache_dir is not None:
+            import hashlib
+            norm = os.path.normpath(nifti_path).replace(os.sep, "/")
+            h = hashlib.sha1(norm.encode("utf-8")).hexdigest()[:16]
+            return os.path.join(self.npy_cache_dir, h + ".npy")
+        if nifti_path.endswith(".nii.gz"):
+            return nifti_path[:-7] + ".npy"
+        if nifti_path.endswith(".nii"):
+            return nifti_path[:-4] + ".npy"
+        return nifti_path + ".npy"
 
     def _resize_spatial_3d(self, data: np.ndarray, target_dhw: Tuple[int, int, int]) -> np.ndarray:
         """Resize a 3D numpy array (D, H, W) to (target_D, target_H, target_W)
@@ -529,7 +812,8 @@ class MultiModalDataset(Dataset):
         t = F.interpolate(t, size=target_dhw, mode="trilinear", align_corners=False)
         return t.squeeze(0).squeeze(0).numpy()
 
-    def _normalize_fmri_t(self, data: np.ndarray, training: bool = True) -> np.ndarray:
+    def _normalize_fmri_t(self, data: np.ndarray, training: bool = True,
+                           in_dtype: Optional[np.dtype] = None) -> np.ndarray:
         """Normalize a 4D fMRI (D, H, W, T) tensor:
 
         1. Resize spatial (D, H, W) to self.spatial_sizes['fmri'] (default 64,64,34).
@@ -550,13 +834,20 @@ class MultiModalDataset(Dataset):
         """
         target_dhw = tuple(self.spatial_sizes["fmri"])
         T_target = self.fmri_t_target
+        # When called from the in-RAM preload path, the input is already
+        # in fp16 (or whichever ram_dtype). Keep it in that dtype all the
+        # way through — casting to fp32 needs ~4x memory for the
+        # temporaries below, which OOMs when the 89 GB preload pool
+        # is also in RAM. The model casts to fp32 internally when it
+        # sees the tensor in `forward()`.
+        out_dtype = in_dtype if in_dtype is not None else np.float32
 
         # Step 1: spatial resize via per-volume loop (F.interpolate doesn't
         # accept 5D input with a different mode per dim).
         if data.shape[:3] != target_dhw:
             # data is (D, H, W, T). Loop over T slices.
             T_src = data.shape[3]
-            resized = np.empty((*target_dhw, T_src), dtype=np.float32)
+            resized = np.empty((*target_dhw, T_src), dtype=out_dtype)
             for t in range(T_src):
                 resized[..., t] = self._resize_spatial_3d(data[..., t], target_dhw)
             data = resized
@@ -579,9 +870,15 @@ class MultiModalDataset(Dataset):
         # Step 3: per-volume z-score
         # mean / std over (D, H, W) per timepoint, keepdims.
         mean = data.mean(axis=(0, 1, 2), keepdims=True)  # (1, 1, 1, T)
-        std = data.std(axis=(0, 1, 2), keepdims=True) + 1e-8
-        data = (data - mean) / std
-        return data.astype(np.float32)
+        std = data.std(axis=(0, 1, 2), keepdims=True).astype(out_dtype) + np.float32(1e-8)
+        data = (data - mean.astype(out_dtype)) / std
+        # Cast to fp32 at the end if we started in fp16 (model wants fp32
+        # tensors; the in-flight arithmetic on the 200 T-points stays in
+        # fp16 to halve the temporaries). The single 111 MB output cast
+        # is one allocation, not four.
+        if out_dtype != np.float32:
+            data = data.astype(np.float32, copy=False)
+        return data
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """
@@ -599,10 +896,112 @@ class MultiModalDataset(Dataset):
                 - patient_id
                 - available_modalities: list of available modality names
         """
+        # Fast path: precomputed cache (all transforms already applied)
+        if self._precomputed is not None or self._precomputed_dir is not None:
+            entry = self._load_precomputed(idx)
+            if entry is not None:
+                if "error" in entry:
+                    raise RuntimeError(f"Precomputed sample {idx} had error: {entry['error']}")
+                result = {}
+                for key, val in entry.items():
+                    if isinstance(val, torch.Tensor):
+                        t = val.float()  # cast fp16 → fp32 for model
+                        # Ensure channel dim: 3D modalities need [C,D,H,W],
+                        # fMRI 4D needs [C,D,H,W,T]. Add if missing.
+                        if key == "fmri" and t.ndim == 4:
+                            t = t.unsqueeze(0)  # [D,H,W,T] -> [1,D,H,W,T]
+                            # Truncate/pad time to fmri_t_target if needed
+                            if self.fmri_t_target and t.shape[-1] != self.fmri_t_target:
+                                T_cur = t.shape[-1]
+                                if T_cur > self.fmri_t_target:
+                                    t = t[..., :self.fmri_t_target]
+                                elif T_cur < self.fmri_t_target:
+                                    pad = torch.zeros(*t.shape[:-1], self.fmri_t_target - T_cur)
+                                    t = torch.cat([t, pad], dim=-1)
+                        elif key != "fmri" and t.ndim == 3:
+                            t = t.unsqueeze(0)  # [D,H,W] -> [1,D,H,W]
+                        result[key] = t
+                    else:
+                        result[key] = val
+                return result
+
         data_item = self.data[idx]
 
         result = {}
         available_modalities = []
+
+        # In-RAM preload fast path: data is already in self._in_memory_pool.
+        # Skip the I/O entirely. We still validate the T1 shape here so
+        # corrupted samples get the same exception as the on-disk path.
+        if self._in_memory_pool is not None:
+            entry = self._in_memory_pool[idx]
+            t1_arr = entry.get("t1")
+            t1_path = data_item.get("t1") or data_item.get(self.required_modality)
+            if t1_arr is None or t1_arr.ndim != 3 or any(s == 0 for s in t1_arr.shape):
+                raise ValueError(f"Corrupted T1 in pool idx={idx}, path={t1_path}, shape={t1_arr.shape if t1_arr is not None else None}")
+            # Cast back to fp32 (the model trains in fp32). T1 is ~33 MB
+            # so this 1 ms cast is negligible. For optional modalities we
+            # ALSO do fp16-to-fp32 here when the modality is small (ASL /
+            # QSM / FLAIR — at most 33 MB). The big one is fMRI 4D: at
+            # fp32 it would be 111 MB and the downstream _normalize_fmri_t
+            # would need 3-4 fp32 temporaries (resized, mean, std, zscore
+            # result) = ~500 MB on top of the already-89 GB pool. With the
+            # 128 GB host's pagefile commit + working-set pressure this
+            # trips _ArrayMemoryError. Solution: keep fMRI in fp16 ALL
+            # THE WAY through _normalize_fmri_t — the model casts the
+            # final tensor to fp32 internally when it sees a fp16 input.
+            result["t1"] = torch.from_numpy(t1_arr.astype(np.float32, copy=False)).unsqueeze(0)
+            for mod in self.optional_modalities:
+                arr = entry.get(mod)
+                if arr is None:
+                    result[mod] = None
+                    continue
+                if mod == "fmri" and arr.ndim == 4 and self.preserve_temporal_dim:
+                    # Keep fp16 throughout the normalization — avoids
+                    # 4x 111 MB fp32 temporaries.
+                    normalized = self._normalize_fmri_t(arr,
+                                                         training=self.transform is not None,
+                                                         in_dtype=arr.dtype)
+                    result[mod] = torch.from_numpy(normalized).unsqueeze(0)
+                    available_modalities.append(mod)
+                elif mod == "fmri" and arr.ndim == 4 and not self.preserve_temporal_dim:
+                    data_mean = arr.mean(axis=-1)
+                    data_resized = self._resize_spatial_3d(data_mean, self.spatial_sizes["fmri"])
+                    result[mod] = torch.from_numpy(data_resized).unsqueeze(0).unsqueeze(0).squeeze(0)
+                    available_modalities.append(mod)
+                elif arr.ndim == 3:
+                    data_resized = self._resize_spatial_3d(arr.astype(np.float32, copy=False),
+                                                          self.spatial_sizes.get(mod, self.target_size))
+                    result[mod] = torch.from_numpy(data_resized).unsqueeze(0)
+                    available_modalities.append(mod)
+                else:
+                    result[mod] = None
+            # Apply MONAI transforms to T1 (resize, intensity norm, etc.)
+            if self.transform is not None:
+                data_dict = self.transform({"t1": t1_path})  # transform reads t1_path via nibabel/MONAI
+                result["t1"] = data_dict["t1"]
+            else:
+                raise ValueError("Transform is required for T1 preprocessing")
+            # Label + metadata
+            result["label"] = data_item.get("label", 0)
+            result["patient_id"] = data_item.get("patient_id", f"unknown_{idx}")
+            result["available_modalities"] = available_modalities
+            # Demographics (same as the slow path)
+            raw_age = data_item.get("age", None)
+            if raw_age is None or raw_age == "":
+                age_val = 0.0
+            else:
+                try: age_val = float(raw_age)
+                except (TypeError, ValueError): age_val = 0.0
+            raw_sex = data_item.get("sex", None)
+            if raw_sex is None or raw_sex == "":
+                sex_val = 0
+            else:
+                try: sex_val = int(raw_sex)
+                except (TypeError, ValueError): sex_val = 0
+            result["age"] = torch.tensor(age_val, dtype=torch.float32)
+            result["sex"] = torch.tensor(sex_val, dtype=torch.long)
+            return result
 
         # T1 path (required) - validate before passing to MONAI transforms
         t1_path = data_item.get("t1") or data_item.get(self.required_modality)
@@ -611,9 +1010,7 @@ class MultiModalDataset(Dataset):
 
         # Validate T1 file dimensions (catch corrupted [0,0,0] files)
         try:
-            import nibabel as nib
-            t1_img = nib.load(str(t1_path))
-            t1_data = t1_img.get_fdata()
+            t1_data = self._load_npy_cached(str(t1_path))
             if t1_data.ndim != 3 or any(s == 0 for s in t1_data.shape):
                 raise ValueError(f"Corrupted T1 file: {t1_path} has shape {t1_data.shape}")
         except Exception as e:
@@ -632,10 +1029,7 @@ class MultiModalDataset(Dataset):
                 result[mod] = None
                 continue
             try:
-                import nibabel as nib
-                img = nib.load(str(path))
-                # Read as float32 to avoid 2x memory for float64 → cast.
-                data = np.asarray(img.dataobj, dtype=np.float32)
+                data = self._load_npy_cached(str(path))
                 # Skip corrupted files with zero dimensions
                 if any(s == 0 for s in data.shape):
                     print(f"[WARN] {mod} {path} has zero dim: {data.shape}")
@@ -793,8 +1187,8 @@ def multimodal_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
                 # `_normalize_fmri_batch` and the model forward.
                 # We rebuild a default from the dataset class if we can find it.
                 default_shape = {
-                    "t1": (1, 192, 192, 160),
-                    "fmri": (1, 64, 64, 34, 200),
+                    "t1": (1, 128, 128, 128),
+                    "fmri": (1, 64, 64, 34, 100),
                     "asl": (1, 64, 64, 32),
                     "qsm": (1, 128, 128, 96),
                     "flair": (1, 128, 128, 32),

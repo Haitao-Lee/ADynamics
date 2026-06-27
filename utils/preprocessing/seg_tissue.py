@@ -8,7 +8,7 @@ import SimpleITK as sitk
 import numpy as np
 
 def _strip_niigz(name: str) -> str:
-    """去掉 .nii.gz 或单独的 .nii 后缀，返回病例名。"""
+    """Remove .nii.gz or .nii suffix, return case name."""
     if name.endswith(".nii.gz"):
         return name[:-7]
     if name.endswith(".nii"):
@@ -16,14 +16,14 @@ def _strip_niigz(name: str) -> str:
     return name
 
 def _resolve_fast_cmd(user_cmd: str | None = None) -> str:
-    """寻找 fast 可执行文件路径。优先：用户指定 > PATH > $FSLDIR 推断。"""
+    """Find the fast executable path. Priority: user-specified > PATH > $FSLDIR inference."""
     if user_cmd:
         return user_cmd
     p = shutil.which("fast")
     if p:
         return p
     fsl_dir = os.environ.get("FSLDIR")
-    # 常见位置：/home/.../fsl/bin/fast 或 /home/.../fsl/share/fsl/bin/fast
+    # Common locations: /home/.../fsl/bin/fast or /home/.../fsl/share/fsl/bin/fast
     candidates = []
     if fsl_dir:
         candidates += [
@@ -34,9 +34,9 @@ def _resolve_fast_cmd(user_cmd: str | None = None) -> str:
         if os.path.isfile(c) and os.access(c, os.X_OK):
             return c
     raise FileNotFoundError(
-        "找不到 FSL FAST 可执行文件。请确保 (1) 终端能 `which fast` 找到；"
-        "(2) 在 Python 里传入 fast_cmd=绝对路径，比如 '/home/syx/fsl/share/fsl/bin/fast'；"
-        "(3) 或设置环境变量 FSLDIR 并把 $FSLDIR/bin 加入 PATH。"
+        "Cannot find FSL FAST executable. Please ensure: (1) `which fast` finds it in terminal; "
+        "(2) Pass absolute path via fast_cmd parameter, e.g., '/home/syx/fsl/share/fsl/bin/fast'; "
+        "(3) Or set FSLDIR environment variable and add $FSLDIR/bin to PATH."
     )
 
 def _compute_metrics_from_pve(pve_csf_path: Path, pve_gm_path: Path, pve_wm_path: Path) -> Dict:
@@ -78,9 +78,9 @@ def segment_tissue(in_dir: str, out_dir: str,
                    num_classes: int = 3,
                    save_bias: bool = True) -> Dict[str, Dict[str, str]]:
     """
-    批量 FSL FAST 组织分割：
-      - 每个病例各自一个子文件夹 out_dir/ASD_C_P/
-      - 计算并写入 metrics.json（PVE体积/ICV/体积分数）
+    Batch FSL FAST tissue segmentation:
+      - Each case gets its own subfolder out_dir/ASD_C_P/
+      - Computes and writes metrics.json (PVE volume/ICV/volume fractions)
     """
     in_root  = Path(in_dir)
     out_root = Path(out_dir)
@@ -88,7 +88,7 @@ def segment_tissue(in_dir: str, out_dir: str,
 
     files = sorted(in_root.glob("*.nii.gz"))
     if not files:
-        print(f"[segment_tissue] 未在 {in_root} 发现 *.nii.gz。")
+        print(f"[segment_tissue] No *.nii.gz found in {in_root}.")
         return {}
 
     fast_bin = _resolve_fast_cmd(fast_cmd)
@@ -96,24 +96,24 @@ def segment_tissue(in_dir: str, out_dir: str,
     results: Dict[str, Dict[str, str]] = {}
     base_env = os.environ.copy()
     base_env.setdefault("FSLOUTPUTTYPE", "NIFTI_GZ")
-    
+
     fsl_dir = "/home/syx/fsl"
     base_env["FSLDIR"] = fsl_dir
     base_env["FSLOUTPUTTYPE"] = "NIFTI_GZ"
-    # 确保 PATH 前面就有 fsl/bin
+    # Ensure fsl/bin is at the front of PATH
     base_env["PATH"] = f"{fsl_dir}/bin:" + base_env.get("PATH","")
-    # 关键：把 fsl/lib 加进去，避免 conda 的 libstdc++ 抢优先级
+    # Critical: add fsl/lib to avoid conda's libstdc++ taking priority
     base_env["LD_LIBRARY_PATH"] = f"{fsl_dir}/lib:" + base_env.get("LD_LIBRARY_PATH","")
-    # 避免 locale 触发奇怪的解析问题
+    # Avoid locale triggering parsing issues
     base_env["LC_ALL"] = "C"
     base_env["LANG"]   = "C"
 
     for f in files:
-        case = _strip_niigz(f.name)                 # 正确的病例名：ASD_1_1
+        case = _strip_niigz(f.name)                 # Correct case name: ASD_1_1
         case_dir = out_root / case
         case_dir.mkdir(parents=True, exist_ok=True)
 
-        out_prefix = case_dir / case                # 前缀：.../ASD_1_1/ASD_1_1
+        out_prefix = case_dir / case                # Prefix: .../ASD_1_1/ASD_1_1
         cmd = [fast_bin, "-t", str(image_type), "-n", str(num_classes), "-o", str(out_prefix)]
         if save_bias:
             cmd.insert(3, "-B")
@@ -126,10 +126,10 @@ def segment_tissue(in_dir: str, out_dir: str,
                 check=True, text=True, env=base_env
             )
         except subprocess.CalledProcessError as e:
-            print(f"[segment_tissue][错误] {case} FAST 失败：\nSTDOUT:\n{e.stdout}\nSTDERR:\n{e.stderr}")
+            print(f"[segment_tissue][ERROR] {case} FAST failed:\nSTDOUT:\n{e.stdout}\nSTDERR:\n{e.stderr}")
             continue
         except FileNotFoundError:
-            print(f"[segment_tissue][错误] 找不到 FAST 可执行：{fast_bin}")
+            print(f"[segment_tissue][ERROR] FAST executable not found: {fast_bin}")
             continue
 
         seg_path     = out_prefix.with_name(out_prefix.name + "_seg.nii.gz")
@@ -147,13 +147,13 @@ def segment_tissue(in_dir: str, out_dir: str,
         if save_bias and restore_path.exists():    out_map["restore"] = str(restore_path)
         results[case] = out_map
 
-        # 写 metrics.json
+        # Write metrics.json
         metrics_path = case_dir / "metrics.json"
         try:
             if all(p.exists() for p in (pve0_path, pve1_path, pve2_path)):
                 metrics = _compute_metrics_from_pve(pve0_path, pve1_path, pve2_path)
             else:
-                # 退化：硬标签估计
+                # Fallback: hard label estimation
                 img = sitk.ReadImage(str(seg_path))
                 seg = sitk.GetArrayFromImage(img).astype(np.int16)
                 sx, sy, sz = img.GetSpacing()
@@ -170,13 +170,13 @@ def segment_tissue(in_dir: str, out_dir: str,
                     "volume_mm3": {"GM": GM_mm3, "WM": WM_mm3, "CSF": CSF_mm3, "ICV": ICV_mm3},
                     "volume_mL":  {"GM": GM_mL, "WM": WM_mL, "CSF": CSF_mL, "ICV": ICV_mL},
                     "fractions":  {"GM": frac(GM_mm3), "WM": frac(WM_mm3), "CSF": frac(CSF_mm3)},
-                    "note": "PVE 不可用，使用硬标签估算"
+                    "note": "PVE unavailable, using hard label estimation"
                 }
             with open(metrics_path, "w") as fjson:
                 json.dump(metrics, fjson, indent=2)
         except Exception as e:
-            print(f"[segment_tissue][警告] {case} 统计 metrics 失败：{e}")
+            print(f"[segment_tissue][WARN] {case} metrics computation failed: {e}")
 
-        print(f"[segment_tissue] 完成：{case} -> {case_dir}")
+        print(f"[segment_tissue] Done: {case} -> {case_dir}")
 
     return results

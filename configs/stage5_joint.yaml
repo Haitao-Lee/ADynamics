@@ -5,7 +5,7 @@
 
 # Inputs
 input:
-  encoder_checkpoint: "./checkpoints/stage1_multimodal/vae_best.pt"
+  encoder_checkpoint: "./checkpoints/stage1/vae_best.pt"   # 5-modality, latent_channels=32
   cfm_checkpoint: "./checkpoints/stage3_cfm/cfm_best.pt"
   deform_checkpoint: "./checkpoints/stage4_def/def_best.pt"
   num_classes: 4               # 4 = NC / SCD / MCI / AD (canonical, must match Stage 1)

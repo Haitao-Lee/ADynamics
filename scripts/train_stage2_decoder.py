@@ -38,6 +38,7 @@ from torch.amp import GradScaler, autocast
 from utils.stage23_compat import (
     normalize_fmri_batch,
     resolve_optional_modalities,
+    resolve_use_demographic,
     shape_filtered_load_state_dict,
 )
 
@@ -73,6 +74,7 @@ def parse_args():
         (("training", "use_amp"), "use_amp"),
         (("loss", "recon_loss_type"), "recon_loss_type"),
         (("loss", "kl_weight"), "kl_weight"),
+        (("model", "fmri_t_target"), "fmri_t_target"),
         (("output", "dir"), "output_dir"),
         (("seed",), "seed"),
     ]
@@ -103,6 +105,8 @@ def parse_args():
                         help="Number of GPUs for DataParallel (default 2; canonical setup is 2x RTX 3090)")
     parser.add_argument("--early_stopping", type=int, default=30)
     parser.add_argument("--no_amp", action="store_true", default=False)
+    parser.add_argument("--fmri_t_target", type=int, default=100,
+                        help="fMRI temporal target (must match Stage 1)")
     parser.add_argument("--use_amp", action="store_true", default=False,
                         help="Enable AMP (default OFF for canonical 2x RTX 3090 setup; "
                              "YAML use_amp: false maps to --no_amp via set_defaults)")
@@ -235,8 +239,18 @@ class DecoderTrainer:
         for batch_idx, batch in pbar:
             t1 = batch["t1"].to(self.device)
             x_dict = {"t1": t1}
+
+            # Use available_modalities to skip zero-filled missing modalities
+            batch_avail = batch.get("available_modalities", None)
+            if batch_avail and isinstance(batch_avail[0], (list, tuple)):
+                avail_set = set(batch_avail[0])
+                for av in batch_avail[1:]:
+                    avail_set &= set(av)
+            else:
+                avail_set = {"fmri", "asl", "qsm", "flair"}
+
             for mod in ["fmri", "asl", "qsm", "flair"]:
-                if mod in batch and batch[mod] is not None:
+                if mod in avail_set and mod in batch and batch[mod] is not None:
                     mod_tensor = batch[mod].to(self.device)
                     if mod == "fmri":
                         mod_tensor = normalize_fmri_batch(mod_tensor)
@@ -301,8 +315,18 @@ class DecoderTrainer:
         for batch_idx, batch in pbar:
             t1 = batch["t1"].to(self.device)
             x_dict = {"t1": t1}
+
+            # Use available_modalities to skip zero-filled missing modalities
+            batch_avail = batch.get("available_modalities", None)
+            if batch_avail and isinstance(batch_avail[0], (list, tuple)):
+                avail_set = set(batch_avail[0])
+                for av in batch_avail[1:]:
+                    avail_set &= set(av)
+            else:
+                avail_set = {"fmri", "asl", "qsm", "flair"}
+
             for mod in ["fmri", "asl", "qsm", "flair"]:
-                if mod in batch and batch[mod] is not None:
+                if mod in avail_set and mod in batch and batch[mod] is not None:
                     mod_tensor = batch[mod].to(self.device)
                     if mod == "fmri":
                         mod_tensor = normalize_fmri_batch(mod_tensor)
@@ -415,6 +439,10 @@ def main():
     data_list = load_data(args.json)
     print(f"Total samples: {len(data_list)}")
 
+    # Store manifest index for precomputed cache lookup
+    for i, item in enumerate(data_list):
+        item["_manifest_idx"] = i
+
     # Remap 4-class labels to 3-class (SCD+MCI merged) if needed
     if args.num_classes == 3:
         from utils.config_loader import remap_labels_3class
@@ -430,22 +458,38 @@ def main():
     )
     print(f"Train: {len(train_data)}, Val: {len(val_data)}")
 
-    train_dataset = MultiModalDataset(train_data, transform=train_transforms)
-    val_dataset = MultiModalDataset(val_data, transform=val_transforms)
+    # Precomputed cache (chunked)
+    _npy_cache = "C:/ADynamics_npy_cache" if os.path.isdir("C:/ADynamics_npy_cache") else None
+    _precomputed_path = None
+    if _npy_cache:
+        _chunked = os.path.join(_npy_cache, "precomputed")
+        if os.path.isdir(_chunked) and os.path.exists(os.path.join(_chunked, "index.json")):
+            _precomputed_path = _chunked
+
+    fmri_t_target = int(getattr(args, "fmri_t_target", 100))
+    train_dataset = MultiModalDataset(train_data, transform=train_transforms,
+                                      precomputed_path=_precomputed_path,
+                                      fmri_t_target=fmri_t_target)
+    val_dataset = MultiModalDataset(val_data, transform=val_transforms,
+                                    precomputed_path=_precomputed_path,
+                                    fmri_t_target=fmri_t_target)
 
     from core_data.dataset import multimodal_collate_fn
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True,
         num_workers=0, pin_memory=torch.cuda.is_available(),
-        collate_fn=multimodal_collate_fn
+        collate_fn=multimodal_collate_fn,
+        drop_last=True,
     )
     val_loader = DataLoader(
         val_dataset, batch_size=args.batch_size, shuffle=False,
         num_workers=0, pin_memory=torch.cuda.is_available(),
-        collate_fn=multimodal_collate_fn
+        collate_fn=multimodal_collate_fn,
+        drop_last=True,
     )
 
     # Load model from Stage 1 checkpoint
+    fmri_t_target = int(getattr(args, "fmri_t_target", 100))
     model = MultiModalVAE3D(
         spatial_size=MULTI_MODAL_SPATIAL_SIZES["t1"],
         in_channels=1,
@@ -454,10 +498,10 @@ def main():
         num_classes=args.num_classes,
         dropout_rate=args.dropout_rate,
         decoder_depth=args.decoder_depth,
-        # Match Stage 1 modality toggles so the encoder architecture aligns
-        # with the loaded checkpoint. Mismatches cause
-        # shape_filtered_load to silently drop most keys.
         optional_modalities=resolve_optional_modalities(args),
+        use_fmri_deep=True,
+        use_demographic_cond=resolve_use_demographic(args),
+        fmri_t_target=fmri_t_target,
     )
 
     print(f"Loading model from {args.checkpoint}")
