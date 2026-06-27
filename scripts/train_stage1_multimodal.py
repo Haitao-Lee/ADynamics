@@ -409,8 +409,13 @@ def main():
     print(f"[Per-modality target sizes] {spatial_sizes}")
     fmri_t_target = int(getattr(args, "fmri_t_target", 200))
     print(f"[fMRI T target] {fmri_t_target}")
-    # Use npy cache on C: for ~5-10x faster data loading (pre-built from .nii.gz)
-    _npy_cache = "C:/ADynamics_npy_cache" if os.path.isdir("C:/ADynamics_npy_cache") else None
+    # Use npy cache for ~5-10x faster data loading (pre-built from .nii.gz)
+    # Default: ./npy_cache (local to ADynamics), fallback: C:/ADynamics_npy_cache
+    _npy_cache = None
+    for _cache_candidate in ["./npy_cache", "C:/ADynamics_npy_cache"]:
+        if os.path.isdir(_cache_candidate):
+            _npy_cache = _cache_candidate
+            break
     if _npy_cache:
         print(f"[Data] Using npy cache: {_npy_cache}")
 

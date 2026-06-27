@@ -4,11 +4,13 @@ Processes one sample at a time to avoid memory issues.
 
 Usage:
     python scripts/precompute_cache.py
+    python scripts/precompute_cache.py --cache_dir E:/LHT_workspace/AD/ADynamics/npy_cache
 
 Output:
-    C:/ADynamics_npy_cache/precomputed_XXXX.pt  (one file per 100 samples)
-    C:/ADynamics_npy_cache/precomputed_index.json  (manifest of all chunks)
+    <cache_dir>/precomputed/chunk_XXXXX.pt  (one file per 50 samples)
+    <cache_dir>/precomputed/index.json      (manifest of all chunks)
 """
+import argparse
 import gc
 import hashlib
 import json
@@ -128,8 +130,17 @@ def process_sample(item: dict, spatial_sizes: dict, cache_dir: str, t_target: in
 
 
 def main():
-    json_path = "./core_data/dataset_manifest_merged_v2.json"
-    cache_dir = "C:/ADynamics_npy_cache"
+    parser = argparse.ArgumentParser(description="Precompute multi-modal dataset cache")
+    parser.add_argument("--cache_dir", type=str, default="./npy_cache",
+                        help="Cache directory (default: ./npy_cache)")
+    parser.add_argument("--manifest", type=str, default="./core_data/dataset_manifest_merged_v2.json",
+                        help="Path to dataset manifest JSON")
+    parser.add_argument("--fmri_t_target", type=int, default=200,
+                        help="fMRI time dimension target")
+    args = parser.parse_args()
+
+    json_path = args.manifest
+    cache_dir = args.cache_dir
     output_dir = os.path.join(cache_dir, "precomputed")
     os.makedirs(output_dir, exist_ok=True)
 
@@ -137,10 +148,12 @@ def main():
         manifest = json.load(f)
     items = manifest if isinstance(manifest, list) else manifest.get("samples", list(manifest.values()))
     print(f"Manifest: {len(items)} samples")
+    print(f"Cache dir: {cache_dir}")
 
     spatial_sizes = dict(MULTI_MODAL_SPATIAL_SIZES)
     print(f"Spatial sizes: {spatial_sizes}")
 
+    t_target = args.fmri_t_target
     chunk_size = 50
     chunks = []
     t0 = time.time()
@@ -162,7 +175,7 @@ def main():
         chunk = {}
         for i in range(start, end):
             try:
-                result = process_sample(items[i], spatial_sizes, cache_dir)
+                result = process_sample(items[i], spatial_sizes, cache_dir, t_target=t_target)
                 if result is not None:
                     chunk[i] = result
                     ok += 1
@@ -187,7 +200,8 @@ def main():
         gc.collect()
 
     # Save index
-    index = {"chunks": chunks, "total": len(items), "ok": ok, "errors": errors}
+    index = {"chunks": chunks, "total": len(items), "ok": ok, "errors": errors,
+             "spatial_sizes": {k: list(v) for k, v in spatial_sizes.items()}}
     index_path = os.path.join(output_dir, "index.json")
     with open(index_path, "w") as f:
         json.dump(index, f, indent=2)
