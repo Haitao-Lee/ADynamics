@@ -7,8 +7,8 @@
 
 param(
     [int]$Epochs            = 300,
-    [int]$BatchSize         = 2,
-    [int]$AccumulationSteps = 2,
+    [int]$BatchSize         = 8,
+    [int]$AccumulationSteps = 1,
     [int]$NumGPUs           = 2
 )
 

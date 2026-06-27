@@ -159,24 +159,31 @@ def get_val_transforms(
 
 
 # Multi-modal transform sizes.
-# Sizes were derived from the actual data shape survey (June 2026):
-#   T1    actual (197, 233, 189) → (256, 256, 192) — MUST match decoder
-#         output (the VAE's internal latent grid is (16,16,12) and
-#         decoder_depth=4 → 16x upsample to (256,256,192)). Resize/crop
-#         the real T1 to that size so the recon loss has matching shapes.
-#   fMRI  actual (64, 64, 34, T)  → (64, 64, 34)    — 3D part; T=200 separately
-#   ASL   actual (128, 128, 32)   → (64, 64, 32)    — perfusion, half-res
-#   QSM   actual (256, 256, 124)  → (128, 128, 96)  — venous detail, half D/H
-#   FLAIR actual (256, 256, 22)   → (128, 128, 32)  — slice-thin, upsample W
+# Design goal: all 3D modalities share the same spatial size so that the
+# 4x downsampling (stride-2 each stage) produces [B, C, 8, 8, 8] for every
+# modality, matching the T1 latent grid exactly. This eliminates the need
+# for AdaptiveAvgPool3d interpolation on auxiliary modalities.
+#
+#   T1    (128, 128, 128) → 4x downsample → (8, 8, 8) ✓ identity pool
+#   fMRI  (64, 64, 34)    → fMRIDeepEncoder handles its own spatial/temporal
+#   ASL   (128, 128, 128) → 4x downsample → (8, 8, 8) ✓ identity pool
+#   QSM   (128, 128, 128) → 4x downsample → (8, 8, 8) ✓ identity pool
+#   FLAIR (128, 128, 128) → 4x downsample → (8, 8, 8) ✓ identity pool
+#
+# fMRI keeps its native resolution because fMRIDeepEncoder has a dedicated
+# architecture (soft-ROI projection + dilated 1D CNN + Transformer) that
+# operates on the full (D, H, W, T) tensor and interpolates to the latent
+# grid internally.
+#
 # Per-modality resize happens in MultiModalDataset._resize_spatial_3d;
 # this dict drives the MONAI transform for T1 only (which is the only
 # modality that needs intensity normalization + crop).
 MULTI_MODAL_SPATIAL_SIZES = {
-    "t1":   (128, 128, 128),
-    "fmri": (64, 64, 34),
-    "asl":  (64, 64, 32),
-    "qsm":  (128, 128, 96),
-    "flair": (128, 128, 32),
+    "t1":    (128, 128, 128),
+    "fmri":  (64, 64, 34),       # fMRIDeepEncoder native (3D spatial part)
+    "asl":   (128, 128, 128),    # unified: was (64, 64, 32), severe Z-loss
+    "qsm":   (128, 128, 128),    # unified: was (128, 128, 96), mild Z-loss
+    "flair": (128, 128, 128),    # unified: was (128, 128, 32), severe Z-loss
 }
 
 

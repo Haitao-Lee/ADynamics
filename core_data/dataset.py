@@ -447,26 +447,24 @@ class MultiModalDataset(Dataset):
         >>> print(sample.keys())  # ['t1', 'fmri', 'asl', 'qsm', 'flair', 'label', 'patient_id', 'available']
     """
 
-    # Default per-modality spatial target sizes, derived from real data survey:
-    #   T1    actual (197, 233, 189) → target (256, 256, 192) — must match
-    #         the decoder output (the VAE's internal latent grid is hard-
-    #         coded to (16,16,12) and decoder_depth=4 → 16x upsample to
-    #         (256,256,192)). T1 is padded/cropped to that size so the
-    #         reconstruction loss has matching shapes.
-    #   fMRI  actual (64, 64, 34, T)  → target (64, 64, 34, 200) — keeps
-    #         native spatial (BOLD is 3.5mm), trims/pads T to 200.
-    #   ASL   actual (128, 128, 32)   → target (64, 64, 32)   — perfusion
-    #         spatial is coarse, halve for memory.
-    #   QSM   actual (256, 256, 124)  → target (128, 128, 96) — venous
-    #         detail worth keeping, halve D/H to free memory.
-    #   FLAIR actual (256, 256, 22)   → target (128, 128, 32) — only 22
-    #         slices, upsample W to 32 and halve D/H.
+    # Default per-modality spatial target sizes.
+    # Design goal: all 3D modalities share the same spatial size (128, 128, 128)
+    # so that 4x downsampling produces [B, C, 8, 8, 8] for every modality,
+    # matching the T1 latent grid exactly. This eliminates AdaptiveAvgPool3d
+    # interpolation on auxiliary modalities, which previously caused severe
+    # information loss (e.g., FLAIR 32→2→8 layers, ASL 32→2→8 layers).
+    #
+    #   T1    (128, 128, 128) — structural backbone
+    #   fMRI  (64, 64, 34)    — fMRIDeepEncoder has dedicated architecture
+    #   ASL   (128, 128, 128) — unified: was (64, 64, 32)
+    #   QSM   (128, 128, 128) — unified: was (128, 128, 96)
+    #   FLAIR (128, 128, 128) — unified: was (128, 128, 32)
     DEFAULT_SPATIAL_SIZES: Dict[str, Tuple[int, int, int]] = {
-        "t1":   (256, 256, 192),
-        "fmri": (64, 64, 34),       # 3D part of 4D fMRI
-        "asl":  (64, 64, 32),
-        "qsm":  (128, 128, 96),
-        "flair": (128, 128, 32),
+        "t1":    (128, 128, 128),
+        "fmri":  (64, 64, 34),       # fMRIDeepEncoder native (3D spatial part)
+        "asl":   (128, 128, 128),    # unified cube
+        "qsm":   (128, 128, 128),    # unified cube
+        "flair": (128, 128, 128),    # unified cube
     }
     # fMRI-specific temporal target (number of BOLD volumes to keep)
     DEFAULT_FMRI_T_TARGET: int = 200
@@ -884,14 +882,16 @@ class MultiModalDataset(Dataset):
         """
         Get a multi-modal sample.
 
-        Each modality is resized to its own target size (not forced to T1's).
-        fMRI is additionally normalized in time (trim/pad to T=200) and
-        per-volume z-scored to kill BOLD drift.
+        All 3D modalities (T1, ASL, QSM, FLAIR) share the same spatial size
+        (128, 128, 128) so that 4x downsampling produces identical latent grids
+        without AdaptiveAvgPool3d interpolation. fMRI keeps (64, 64, 34) with
+        its own temporal handling via fMRIDeepEncoder.
 
         Returns:
             Dictionary containing:
-                - t1: preprocessed T1 tensor (resize to spatial_sizes['t1'])
-                - other modalities: per-modality-sized tensors
+                - t1: preprocessed T1 tensor [1, 128, 128, 128]
+                - asl/qsm/flair: tensors [1, 128, 128, 128] (or None if missing)
+                - fmri: tensor [1, 64, 64, 34, T] (or None if missing)
                 - label: disease stage
                 - patient_id
                 - available_modalities: list of available modality names
@@ -902,6 +902,25 @@ class MultiModalDataset(Dataset):
             if entry is not None:
                 if "error" in entry:
                     raise RuntimeError(f"Precomputed sample {idx} had error: {entry['error']}")
+
+                # One-time shape validation: detect stale cache (old spatial sizes)
+                if not getattr(self, '_precomputed_validated', False):
+                    self._precomputed_validated = True
+                    for mod, expected_size in self.spatial_sizes.items():
+                        if mod == "fmri":
+                            continue  # fMRI has special handling
+                        val = entry.get(mod)
+                        if val is not None and isinstance(val, torch.Tensor):
+                            # Shape is [D,H,W] or [1,D,H,W]
+                            shape = val.shape
+                            spatial = shape[-3:] if len(shape) >= 3 else shape
+                            if tuple(spatial) != expected_size:
+                                print(f"[WARN] Precomputed cache shape mismatch for {mod}: "
+                                      f"got {tuple(spatial)}, expected {expected_size}. "
+                                      f"Cache may be stale. Rebuild with scripts/precompute_cache.py "
+                                      f"or pass --no_precomputed to skip the cache.")
+                                break
+
                 result = {}
                 for key, val in entry.items():
                     if isinstance(val, torch.Tensor):
