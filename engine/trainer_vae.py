@@ -1125,10 +1125,21 @@ class MultiModalVAETrainer:
                 actual_accum_count += 1
 
             # Backward pass (accumulate gradients)
-            if self.use_amp:
-                self.scaler.scale(loss).backward()
-            else:
-                loss.backward()
+            try:
+                if self.use_amp:
+                    self.scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    # Backward OOM: free memory, skip this batch, continue
+                    print(f"\n[TRAIN OOM backward] batch={batch_idx} — skipping")
+                    del loss, recon, cls_logits, mu, logvar
+                    torch.cuda.empty_cache()
+                    self.optimizer.zero_grad(set_to_none=True)
+                    continue
+                else:
+                    raise
 
             # Step optimizer: complete cycle OR incomplete cycle at epoch end
             is_complete_cycle = (batch_idx + 1) % accumulation_steps == 0
