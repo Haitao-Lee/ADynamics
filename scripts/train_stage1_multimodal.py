@@ -235,6 +235,9 @@ def parse_args():
                         help="Scale factor for encoder gradients (default 1.0; with fMRI fix, no boost needed)")
     parser.add_argument("--ordinal_reg_weight", type=float, default=0.1,
                         help="Weight for ordinal regression loss on latent mean")
+    parser.add_argument("--cls_loss_type", type=str, default="ordinal_ce",
+                        choices=["ordinal_ce", "standard_ce"],
+                        help="Classification loss type (default: ordinal_ce)")
 
     # Hardware
     parser.add_argument("--num_gpus", type=int, default=2,
@@ -541,6 +544,7 @@ def main():
         "ssim_weight": args.ssim_weight,
         "encoder_grad_boost": args.encoder_grad_boost,
         "ordinal_reg_weight": args.ordinal_reg_weight,
+        "cls_loss_type": args.cls_loss_type,
         "num_classes": args.num_classes,
         "use_amp": use_amp,
         "use_fmri_temporal": use_fmri_temporal,

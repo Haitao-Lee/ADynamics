@@ -1228,14 +1228,36 @@ class MultiModalVAE3D(nn.Module):
             nn.Conv3d(latent_channels * 4, latent_channels, kernel_size=1),
         )
 
-        # Log-var projection for true VAE. Uses T1-only for stability:
-        # the KL term is bounded by T1's variance, not the noisy aux sum.
-        # This is critical for training stability when aux is missing.
-        self.logvar_proj_t1 = nn.Sequential(
+        # Log-var: T1-centric fusion for uncertainty estimation.
+        # Base logvar from T1 trunk (same stability as before).
+        # Optional aux modalities contribute gated deltas (same pattern as mu
+        # fusion). Zero-init deltas → starts as T1-only, aux only contribute
+        # after training shows they reduce uncertainty.
+        # Invariant: when all aux are missing, logvar = logvar_base(z_t1).
+        self.logvar_base = nn.Sequential(
             nn.Conv3d(latent_channels, latent_channels * 4, kernel_size=1),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Conv3d(latent_channels * 4, latent_channels, kernel_size=1),
         )
+
+        # Per-modality logvar delta networks (zero-init output)
+        self.logvar_delta_nets = nn.ModuleDict()
+        self.logvar_gate_nets = nn.ModuleDict()
+        for mod in self.optional_modalities:
+            self.logvar_delta_nets[mod] = nn.Sequential(
+                nn.Conv3d(latent_channels, latent_channels, kernel_size=1),
+                nn.GELU(),
+                nn.Conv3d(latent_channels, latent_channels, kernel_size=1),
+            )
+            # Scalar gate in [0, 1]
+            self.logvar_gate_nets[mod] = nn.Sequential(
+                nn.Linear(latent_channels + 1, 32),
+                nn.GELU(),
+                nn.Linear(32, 1),
+            )
+            # Zero-init delta output so aux starts with no contribution
+            nn.init.zeros_(self.logvar_delta_nets[mod][-1].weight)
+            nn.init.zeros_(self.logvar_delta_nets[mod][-1].bias)
 
         # Legacy logvar projection (uses concat). Kept for ablation.
         self.logvar_proj = nn.Sequential(
@@ -1479,8 +1501,23 @@ class MultiModalVAE3D(nn.Module):
             # the output equals t1_trunk(z_t1) (plus demo_bias) - so adding
             # aux modalities can NEVER make the latent worse than T1-only.
             mu = self.t1_centric_fusion(z_t1, z_aux_dict, demo_bias=demo_bias)
-            # Logvar from T1 only (more stable: KL term bounded by T1's variance)
-            logvar = self.logvar_proj_t1(z_t1)
+
+            # T1-CENTRIC LOGVAR: base from T1 + gated deltas from aux.
+            # Same invariant as mu: when all aux are missing, logvar = base(z_t1).
+            # Aux modalities learn to reduce uncertainty when they provide
+            # complementary information.
+            logvar = self.logvar_base(z_t1)
+            for mod in self.optional_modalities:
+                z_mod = z_aux_dict.get(mod)
+                if z_mod is not None:
+                    delta = self.logvar_delta_nets[mod](z_mod)
+                    # Gate: pool z_mod → [B, C], append availability flag
+                    z_pooled = F.adaptive_avg_pool3d(z_mod, 1).flatten(1)  # [B, C]
+                    avail = torch.ones(z_mod.shape[0], 1, device=z_mod.device)
+                    gate = torch.sigmoid(self.logvar_gate_nets[mod](
+                        torch.cat([z_pooled, avail], dim=-1)
+                    ))  # [B, 1]
+                    logvar = logvar + gate.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1) * delta
             if demo_bias is not None:
                 logvar = logvar + 0.1 * demo_bias
         else:

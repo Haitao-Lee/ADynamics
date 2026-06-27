@@ -1092,10 +1092,14 @@ class MultiModalVAETrainer:
                     # Standard path
                     recon_loss = F.l1_loss(recon, x_dict["t1"])
                     if labels is not None:
-                        cls_loss = ordinal_cross_entropy_loss(
-                        cls_logits, labels, num_classes=num_classes,
-                        class_weights=class_weights,
-                    )
+                        cls_loss_type = self.config.get("cls_loss_type", "ordinal_ce")
+                        if cls_loss_type == "standard_ce":
+                            cls_loss = F.cross_entropy(cls_logits, labels, weight=class_weights)
+                        else:
+                            cls_loss = ordinal_cross_entropy_loss(
+                                cls_logits, labels, num_classes=num_classes,
+                                class_weights=class_weights,
+                            )
                         ordinal_reg_loss = ordinal_regression_loss(mu, labels, num_classes=num_classes)
                     else:
                         cls_loss = torch.tensor(0.0, device=self.device)
@@ -1361,10 +1365,14 @@ class MultiModalVAETrainer:
                 recon_loss = F.l1_loss(recon, x_dict["t1"])
 
                 if labels is not None:
-                    cls_loss = ordinal_cross_entropy_loss(
-                        cls_logits, labels, num_classes=num_classes,
-                        class_weights=class_weights,
-                    )
+                    cls_loss_type = self.config.get("cls_loss_type", "ordinal_ce")
+                    if cls_loss_type == "standard_ce":
+                        cls_loss = F.cross_entropy(cls_logits, labels, weight=class_weights)
+                    else:
+                        cls_loss = ordinal_cross_entropy_loss(
+                            cls_logits, labels, num_classes=num_classes,
+                            class_weights=class_weights,
+                        )
                     ordinal_reg_loss = ordinal_regression_loss(mu, labels, num_classes=num_classes)
                     preds = cls_logits.argmax(dim=1)
                     cls_acc = (preds == labels).float().mean().item()

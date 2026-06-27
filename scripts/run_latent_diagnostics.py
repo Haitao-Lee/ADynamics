@@ -109,12 +109,10 @@ def load_data(json_path: str, num_classes: int, max_samples: int) -> List[dict]:
 def _encode_mu_logvar(model, x_dict):
     """Helper: get the FUSED mu, logvar [B, C, D, H, W] from MultiModalVAE3D.
 
-    `model.encode(x_dict)` returns the concat latent [B, 5*32, D, H, W]
-    before fusion. We need mu, logvar (after the 1x1 conv fusion proj).
+    Uses model.forward() which handles both T1-centric and legacy fusion.
     """
-    z_concat = model.encode(x_dict)  # [B, 5*32, D, H, W]
-    mu = model.fusion_proj(z_concat)  # [B, 32, D, H, W]
-    logvar = model.logvar_proj(z_concat)
+    with torch.no_grad():
+        _, mu, logvar = model(x_dict, return_components=False)
     return mu, logvar
 
 
@@ -251,8 +249,12 @@ def gradient_norm_per_module(model, dataloader, device, num_classes: int = 4):
             top = "optional_encoders"
         elif "fusion_proj" in name:
             top = "fusion_proj"
+        elif "logvar_base" in name or "logvar_delta" in name or "logvar_gate" in name:
+            top = "logvar_fusion"
         elif "logvar_proj" in name:
             top = "logvar_proj"
+        elif "t1_centric_fusion" in name:
+            top = "t1_centric_fusion"
         elif "decoder" in name:
             top = "decoder"
         elif "classifier" in name:

@@ -83,7 +83,7 @@ def vae_kl_loss(
 
 def gradient_loss(recon: Tensor, target: Tensor) -> Tensor:
     """
-    Compute gradient (edge/texture) loss using Sobel filters.
+    Compute gradient (edge/texture) loss using central differences.
     Helps preserve fine texture details in reconstruction.
 
     Args:
@@ -93,23 +93,15 @@ def gradient_loss(recon: Tensor, target: Tensor) -> Tensor:
     Returns:
         Scalar gradient loss
     """
-    # Sobel kernels for 3D: depth, height, width
-    # Use smooth+gradient approach via 3x3x3 averaging - gradient difference
-    kernel_size = 3
-    pad = kernel_size // 2
-
-    # Simple 3D gradient via central differences (avoids needing scipy)
-    def gradient_diff(x):
-        # D gradientqing
+    def central_diff(x: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+        # Central differences along D, H, W
         g_d = x[:, :, 2:, 1:-1, 1:-1] - x[:, :, :-2, 1:-1, 1:-1]
-        # H gradient
         g_h = x[:, :, 1:-1, 2:, 1:-1] - x[:, :, 1:-1, :-2, 1:-1]
-        # W gradient
         g_w = x[:, :, 1:-1, 1:-1, 2:] - x[:, :, 1:-1, 1:-1, :-2]
         return g_d, g_h, g_w
 
-    recon_d, recon_h, recon_w = gradient_diff(recon)
-    target_d, target_h, target_w = gradient_diff(target)
+    recon_d, recon_h, recon_w = central_diff(recon)
+    target_d, target_h, target_w = central_diff(target)
 
     loss = (F.l1_loss(recon_d, target_d) +
             F.l1_loss(recon_h, target_h) +
@@ -117,35 +109,96 @@ def gradient_loss(recon: Tensor, target: Tensor) -> Tensor:
     return loss / 3.0
 
 
-def ssim_loss(recon: Tensor, target: Tensor, window_size: int = 11) -> Tensor:
-    """
-    Compute SSIM loss for structural similarity preservation.
-    SSIM is more sensitive to structural/texture changes than L1/L2.
+def _gaussian_kernel1d(size: int, sigma: float, device: torch.device, dtype: torch.dtype) -> Tensor:
+    """Create 1D Gaussian kernel."""
+    coords = torch.arange(size, dtype=dtype, device=device) - (size - 1) / 2.0
+    g = torch.exp(-0.5 * (coords / sigma) ** 2)
+    return g / g.sum()
 
-    Uses MONAI's SSIMLoss if available, otherwise falls back to simple SSIM.
+
+def _gaussian_kernel3d(window_size: int, sigma: float, n_channels: int,
+                       device: torch.device, dtype: torch.dtype) -> Tensor:
+    """Create 3D isotropic Gaussian kernel for depthwise conv."""
+    k1d = _gaussian_kernel1d(window_size, sigma, device, dtype)
+    k3d = k1d[:, None, None] * k1d[None, :, None] * k1d[None, None, :]
+    # Expand to [C_out, C_in, D, H, W] for groups=n_channels (depthwise)
+    kernel = k3d.unsqueeze(0).unsqueeze(0).expand(n_channels, 1, -1, -1, -1).contiguous()
+    return kernel
+
+
+def ssim_loss(
+    recon: Tensor,
+    target: Tensor,
+    window_size: int = 7,
+    sigma: float = 1.5,
+    data_range: float = 1.0,
+    reduction: str = "mean",
+) -> Tensor:
+    """
+    Windowed Structural Similarity (SSIM) loss for 3D volumes.
+
+    Proper implementation using local statistics computed via Gaussian
+    weighting within sliding windows. This captures local texture/structure
+    quality, unlike global mean/variance which reduces to a single number
+    per volume.
+
+    SSIM(x,y) = (2*mu_x*mu_y + C1)(2*sigma_xy + C2) /
+                ((mu_x^2 + mu_y^2 + C1)(sigma_x^2 + sigma_y^2 + C2))
 
     Args:
-        recon: Reconstructed MRI [B, 1, D, H, W]
-        target: Target MRI [B, 1, D, H, W]
-        window_size: Window size for SSIM computation
+        recon: Reconstructed MRI [B, C, D, H, W]
+        target: Target MRI [B, C, D, H, W]
+        window_size: Size of the Gaussian window. Default: 7
+        sigma: Standard deviation of Gaussian kernel. Default: 1.5
+        data_range: Value range of the input (for C1, C2 scaling).
+                    Default: 1.0 (sigmoid-activated outputs)
+        reduction: "mean" | "sum" | "none". Default: "mean"
 
     Returns:
-        Scalar SSIM loss (1 - SSIM so minimizing it maximizes SSIM)
+        SSIM loss = 1 - mean(SSIM). Minimizing maximizes SSIM.
     """
-    # Use fallback only - MONAI SSIMLoss has issues with 3D tensors
-    C1 = 0.01 ** 2
-    C2 = 0.03 ** 2
+    assert recon.shape == target.shape, \
+        f"Shape mismatch: recon {recon.shape} vs target {target.shape}"
+    assert recon.ndim == 5, f"Expected 5D input [B,C,D,H,W], got {recon.ndim}D"
 
-    mu_recon = recon.mean(dim=(-1, -2, -3), keepdim=True)
-    mu_target = target.mean(dim=(-1, -2, -3), keepdim=True)
-    var_recon = recon.var(dim=(-1, -2, -3), keepdim=True)
-    var_target = target.var(dim=(-1, -2, -3), keepdim=True)
+    # Stability constants (scaled by data range, per Wang et al. 2004)
+    C1 = (0.01 * data_range) ** 2
+    C2 = (0.03 * data_range) ** 2
 
-    cov = ((recon - mu_recon) * (target - mu_target)).mean(dim=(-1, -2, -3), keepdim=True)
+    n_channels = recon.shape[1]
+    kernel = _gaussian_kernel3d(window_size, sigma, n_channels,
+                                device=recon.device, dtype=recon.dtype)
+    pad = window_size // 2
 
-    ssim_val = ((2 * mu_recon * mu_target + C1) * (2 * cov + C2) /
-                ((mu_recon ** 2 + mu_target ** 2 + C1) * (var_recon + var_target + C2)))
-    return 1.0 - ssim_val.mean()
+    # Local means via Gaussian-weighted depthwise conv
+    mu_recon = F.conv3d(recon, kernel, padding=pad, groups=n_channels)
+    mu_target = F.conv3d(target, kernel, padding=pad, groups=n_channels)
+
+    # Local variances and covariance
+    mu_recon_sq = mu_recon * mu_recon
+    mu_target_sq = mu_target * mu_target
+    mu_cross = mu_recon * mu_target
+
+    var_recon = F.conv3d(recon * recon, kernel, padding=pad, groups=n_channels) - mu_recon_sq
+    var_target = F.conv3d(target * target, kernel, padding=pad, groups=n_channels) - mu_target_sq
+    cov = F.conv3d(recon * target, kernel, padding=pad, groups=n_channels) - mu_cross
+
+    # Clamp variances to avoid negative values from numerical error
+    var_recon = var_recon.clamp(min=0)
+    var_target = var_target.clamp(min=0)
+
+    # SSIM map
+    ssim_map = ((2 * mu_cross + C1) * (2 * cov + C2)) / \
+               ((mu_recon_sq + mu_target_sq + C1) * (var_recon + var_target + C2))
+
+    if reduction == "mean":
+        return 1.0 - ssim_map.mean()
+    elif reduction == "sum":
+        return 1.0 - ssim_map.sum()
+    elif reduction == "none":
+        return 1.0 - ssim_map
+    else:
+        raise ValueError(f"Unknown reduction: {reduction}")
 
 
 def ordinal_cross_entropy_loss(

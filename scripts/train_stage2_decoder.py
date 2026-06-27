@@ -203,10 +203,14 @@ class DecoderTrainer:
     def _freeze_encoder(self) -> None:
         """Freeze encoder parameters, keep decoder trainable."""
         frozen_count = 0
+        # Keys that identify non-decoder (encoder-side) parameters.
+        # Updated for T1-centric logvar: logvar_base, logvar_delta_nets,
+        # logvar_gate_nets replace the old logvar_proj_t1.
+        _freeze_keys = ["encoder", "fusion_proj", "logvar_proj", "logvar_base",
+                        "logvar_delta", "logvar_gate", "t1_centric_fusion",
+                        "classifier", "demo", "age_mlp", "sex_emb"]
         for name, param in self.model.named_parameters():
-            # Freeze encoder, fusion, logvar, and classifier
-            # Keep decoder trainable
-            if any(k in name for k in ["encoder", "fusion_proj", "logvar_proj", "classifier"]):
+            if any(k in name for k in _freeze_keys):
                 param.requires_grad = False
                 frozen_count += param.numel()
             else:
