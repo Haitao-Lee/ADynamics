@@ -24,6 +24,5 @@ $Py = Get-PythonExe
     --batch_size $BatchSize `
     --accumulation_steps $AccumulationSteps `
     --epochs $Epochs `
-    --no_amp `
     --use_checkpointing `
     --fmri_t_target 60

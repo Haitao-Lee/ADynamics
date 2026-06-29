@@ -123,7 +123,9 @@ training:
   early_stopping_patience: 50
   save_interval: 50
   num_gpus: 2                   # 2x RTX 3090
-  use_amp: false               # AMP caused NaN in VAE loss (KL+recon scale mismatch)
+  use_amp: true                # Enabled: fp16 convolutions for 30-40% speedup.
+                                # KL loss already casts mu/logvar to fp32 internally.
+                                # GradScaler handles dynamic loss scaling.
 
 # Loss weights
 loss:
