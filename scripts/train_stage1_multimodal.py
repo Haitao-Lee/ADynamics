@@ -195,7 +195,7 @@ def parse_args():
                         help="TransformerEncoder depth for fMRI temporal modeling.")
     parser.add_argument("--fmri_num_heads", type=int, default=4,
                         help="Multi-head attention heads in the fMRI transformer.")
-    parser.add_argument("--fmri_t_target", type=int, default=200,
+    parser.add_argument("--fmri_t_target", type=int, default=60,
                         help="Number of BOLD timepoints to normalize fMRI to. "
                              "T>target → middle segment (training: random); "
                              "T<target → zero-pad at end.")
@@ -406,11 +406,11 @@ def main():
           f"demographic={use_demographic}  t1_only={bool(getattr(args, 't1_only', False))}")
     # Per-modality target sizes from MULTI_MODAL_SPATIAL_SIZES (one entry
     # per modality; the dataset enforces these in _resize_spatial_3d for
-    # 3D modalities and _normalize_fmri_t for 4D fMRI). fMRI's T=200
-    # is read from args.fmri_t_target with a 200 default.
+    # 3D modalities and _normalize_fmri_t for 4D fMRI). fMRI's T=60
+    # is read from args.fmri_t_target with a 60 default.
     spatial_sizes = dict(MULTI_MODAL_SPATIAL_SIZES)
     print(f"[Per-modality target sizes] {spatial_sizes}")
-    fmri_t_target = int(getattr(args, "fmri_t_target", 200))
+    fmri_t_target = int(getattr(args, "fmri_t_target", 60))
     print(f"[fMRI T target] {fmri_t_target}")
     # Use npy cache for ~5-10x faster data loading (pre-built from .nii.gz)
     # Default: ./npy_cache (local to ADynamics), fallback: C:/ADynamics_npy_cache

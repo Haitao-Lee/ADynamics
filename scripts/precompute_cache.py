@@ -135,7 +135,7 @@ def main():
                         help="Cache directory (default: ./npy_cache)")
     parser.add_argument("--manifest", type=str, default="./core_data/dataset_manifest_merged_v2.json",
                         help="Path to dataset manifest JSON")
-    parser.add_argument("--fmri_t_target", type=int, default=200,
+    parser.add_argument("--fmri_t_target", type=int, default=60,
                         help="fMRI time dimension target")
     args = parser.parse_args()
 

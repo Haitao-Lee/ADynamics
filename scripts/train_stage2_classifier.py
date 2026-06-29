@@ -83,7 +83,7 @@ def parse_args():
     parser.add_argument("--num_classes", type=int, default=4,
                         help="Number of disease classes (3: NC/SCD+MCI/AD, 4: NC/SCD/MCI/AD)")
     parser.add_argument("--dropout_rate", type=float, default=0.2)
-    parser.add_argument("--fmri_t_target", type=int, default=100,
+    parser.add_argument("--fmri_t_target", type=int, default=60,
                         help="fMRI temporal target (must match Stage 1)")
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=100)
@@ -509,7 +509,7 @@ def main():
         if os.path.isdir(_chunked) and os.path.exists(os.path.join(_chunked, "index.json")):
             _precomputed_path = _chunked
 
-    fmri_t_target = int(getattr(args, "fmri_t_target", 100))
+    fmri_t_target = int(getattr(args, "fmri_t_target", 60))
     train_dataset = MultiModalDataset(train_data, transform=train_transforms,
                                       precomputed_path=_precomputed_path,
                                       fmri_t_target=fmri_t_target)

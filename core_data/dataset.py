@@ -467,7 +467,11 @@ class MultiModalDataset(Dataset):
         "flair": (128, 128, 128),    # unified cube
     }
     # fMRI-specific temporal target (number of BOLD volumes to keep)
-    DEFAULT_FMRI_T_TARGET: int = 200
+    # Literature: ≥60 volumes (≈2-3 min at TR=3s) is bare minimum for
+    # deep-learning classification of rs-fMRI (Van Dijk 2010, Meier 2024).
+    # ADNI3 basic protocol: ~200 volumes at TR=3s. T=60 captures central
+    # ~3 min — sufficient for the fMRIDeepEncoder's learned features.
+    DEFAULT_FMRI_T_TARGET: int = 60
 
     def __init__(
         self,
@@ -815,7 +819,7 @@ class MultiModalDataset(Dataset):
         """Normalize a 4D fMRI (D, H, W, T) tensor:
 
         1. Resize spatial (D, H, W) to self.spatial_sizes['fmri'] (default 64,64,34).
-        2. Resample T to self.fmri_t_target (default 200):
+        2. Resample T to self.fmri_t_target (default 60):
            - T > target: take the middle segment (deterministic, keeps
              steady-state BOLD; drops calibration frames at start/end).
            - T < target: zero-pad at the end.

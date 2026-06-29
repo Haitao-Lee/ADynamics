@@ -103,9 +103,12 @@ model:
   use_t1_centric_fusion: true
   # fMRI BOLD timepoint normalization: samples with T>target take the
   # middle segment (training: random segment, eval: middle); samples
-  # with T<target zero-pad at the end. Default 200 covers ~95% of files
-  # in the data survey. Per-volume z-score (over D,H,W) is applied to
-  # kill BOLD drift — see core_data/dataset.py:_normalize_fmri_t.
+  # with T<target zero-pad at the end. T=60 ≈ 3 min at TR=3s (ADNI3):
+  # sufficient for deep-learning rs-fMRI classification (≥60 volumes
+  # is the bare minimum per Van Dijk 2010, Meier 2024). Reducing from
+  # 200 → 60 saves ~70% fMRI memory, enabling larger batch sizes.
+  # Per-volume z-score (over D,H,W) is applied to kill BOLD drift —
+  # see core_data/dataset.py:_normalize_fmri_t.
   fmri_t_target: 60
   # OOM fix: gradient checkpointing on the decoder. 256^3 decoder
   # activations account for ~16GB of autograd-graph memory; wrapping

@@ -26,7 +26,7 @@ model:
   in_channels: 1
   spatial_size: [128, 128, 128]  # must match Stage 1
   dropout_rate: 0.2
-  fmri_t_target: 100             # must match Stage 1
+  fmri_t_target: 60              # must match Stage 1
 
 # Output
 output:

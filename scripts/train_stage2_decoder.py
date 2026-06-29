@@ -105,7 +105,7 @@ def parse_args():
                         help="Number of GPUs for DataParallel (default 2; canonical setup is 2x RTX 3090)")
     parser.add_argument("--early_stopping", type=int, default=30)
     parser.add_argument("--no_amp", action="store_true", default=False)
-    parser.add_argument("--fmri_t_target", type=int, default=100,
+    parser.add_argument("--fmri_t_target", type=int, default=60,
                         help="fMRI temporal target (must match Stage 1)")
     parser.add_argument("--use_amp", action="store_true", default=False,
                         help="Enable AMP (default OFF for canonical 2x RTX 3090 setup; "
@@ -474,7 +474,7 @@ def main():
         if os.path.isdir(_chunked) and os.path.exists(os.path.join(_chunked, "index.json")):
             _precomputed_path = _chunked
 
-    fmri_t_target = int(getattr(args, "fmri_t_target", 100))
+    fmri_t_target = int(getattr(args, "fmri_t_target", 60))
     train_dataset = MultiModalDataset(train_data, transform=train_transforms,
                                       precomputed_path=_precomputed_path,
                                       fmri_t_target=fmri_t_target)
@@ -497,7 +497,7 @@ def main():
     )
 
     # Load model from Stage 1 checkpoint
-    fmri_t_target = int(getattr(args, "fmri_t_target", 100))
+    fmri_t_target = int(getattr(args, "fmri_t_target", 60))
     model = MultiModalVAE3D(
         spatial_size=MULTI_MODAL_SPATIAL_SIZES["t1"],
         in_channels=1,

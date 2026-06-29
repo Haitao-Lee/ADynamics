@@ -1035,7 +1035,7 @@ class MultiModalVAE3D(nn.Module):
         attention_heads: int = 8,
         use_fmri_temporal: bool = True,
         fmri_in_channels: int = 34,
-        fmri_t_target: int = 200,
+        fmri_t_target: int = 60,
         fmri_hidden_dim: int = 128,
         fmri_num_pool: int = 3,
         fmri_num_transformer_layers: int = 2,
