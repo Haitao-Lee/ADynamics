@@ -936,6 +936,7 @@ class MultiModalVAETrainer:
 
         # v11: track mixup application count
         n_mixup_applied = 0
+        n_skipped_batches = 0  # track skipped batches for diagnostics
 
         # Gradient accumulation: effective_batch = batch_size * accumulation_steps
         accumulation_steps = self.config.get("accumulation_steps", 1)
@@ -1023,6 +1024,7 @@ class MultiModalVAETrainer:
                                 print(f"  {k}: shape={v.shape} dtype={v.dtype}")
                         torch.cuda.empty_cache()
                         self.optimizer.zero_grad(set_to_none=True)
+                        n_skipped_batches += 1
                         continue
                     else:
                         print(f"\n[TRAIN ERROR] batch={batch_idx} mods={list(x_dict.keys())}")
@@ -1125,12 +1127,14 @@ class MultiModalVAETrainer:
                 else:
                     loss.backward()
             except RuntimeError as e:
-                if "out of memory" in str(e).lower():
-                    # Backward OOM: free memory, skip this batch, continue
-                    print(f"\n[TRAIN OOM backward] batch={batch_idx} — skipping")
+                err_msg = str(e).lower()
+                if "out of memory" in err_msg or "cuda" in err_msg:
+                    # Backward OOM / CUDA error: free memory, skip this batch
+                    print(f"\n[TRAIN OOM backward] batch={batch_idx} — skipping ({e})")
                     del loss, recon, cls_logits, mu, logvar
                     torch.cuda.empty_cache()
                     self.optimizer.zero_grad(set_to_none=True)
+                    n_skipped_batches += 1
                     continue
                 else:
                     raise
@@ -1246,6 +1250,12 @@ class MultiModalVAETrainer:
         ema = self.cls_loss_ema
         ema = 0.9 * ema + 0.1 * (total_cls_loss / max(1, num_batches))
         self.cls_loss_ema = ema
+
+        # Report skipped batches (diagnostic for crashes / OOM)
+        if n_skipped_batches > 0:
+            print(f"\n[TRAIN] Epoch {self.current_epoch}: "
+                  f"skipped {n_skipped_batches}/{num_batches} batches "
+                  f"(OOM/CUDA errors)")
 
         return {
             "loss": total_loss / num_batches,
@@ -1616,8 +1626,26 @@ class MultiModalVAETrainer:
             # v10: dispatch to selected KL strategy
             self.current_kl_weight, _ = get_kl_weight(epoch, self.config)
 
-            train_metrics = self.train_epoch()
-            val_metrics = self.validate_epoch()
+            try:
+                train_metrics = self.train_epoch()
+                val_metrics = self.validate_epoch()
+            except RuntimeError as e:
+                err_msg = str(e).lower()
+                if "out of memory" in err_msg or "cuda" in err_msg:
+                    print(f"\n[EPOCH {epoch} CRASH] {e}")
+                    print("  Skipping this epoch. Consider reducing batch_size.")
+                    torch.cuda.empty_cache()
+                    epochs_without_improvement += 1
+                    continue
+                else:
+                    raise
+            except Exception as e:
+                # Catch-all: data loading errors, corrupted cache, etc.
+                print(f"\n[EPOCH {epoch} UNEXPECTED ERROR] {type(e).__name__}: {e}")
+                print("  Skipping this epoch. Check data integrity.")
+                torch.cuda.empty_cache()
+                epochs_without_improvement += 1
+                continue
 
             if self.scheduler is not None:
                 self.scheduler.step()
